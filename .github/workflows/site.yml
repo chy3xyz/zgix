@@ -9,8 +9,6 @@
 # Zig comes from zigup (the same installer the local toolchain uses):
 # setup-zig actions lag behind the 0.17 builds index, the official
 # download URL is not always populated yet, and the repo's devenv pin
-# predates nixpkgs' zig_0_17 attribute. zigup resolves "0.17.0" from
-# ziglang.org/builds on the runner's clean network.
 
 name: site
 
@@ -42,15 +40,15 @@ jobs:
           repository: chy3xyz/zdoc
           path: zdoc
 
-      # zigup installs to $XDG_DATA_HOME/zigup (default ~/.local/share/zigup).
-      - name: Install zig (zigup, same installer as the local toolchain)
+      # ziglang.org serves the 0.17.0 release tarball (a local fake-IP
+      # resolver had been masking it); a direct download is the fewest
+      # moving parts. GITHUB_PATH only applies to later steps, so the
+      # same-step `zig version` needs PATH set by hand.
+      - name: Install zig
         run: |
-          curl -sSfL -o /tmp/zigup.tgz \
-            https://github.com/marler8997/zigup/releases/latest/download/zigup-x86_64-linux.tar.gz
-          tar -xzf /tmp/zigup.tgz -C /usr/local/bin zigup
-          zigup fetch 0.17.0
-          echo "$HOME/.local/share/zigup/0.17.0/files" >> "$GITHUB_PATH"
-          zig version
+          curl -sSfL https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz | sudo tar xJ -C /opt
+          echo /opt/zig-x86_64-linux-0.17.0 >> "$GITHUB_PATH"
+          PATH=/opt/zig-x86_64-linux-0.17.0:$PATH zig version
 
       # -Dno-git-version: zdoc's build refuses zon versions not ahead of
       # its last git tag without it (its maintainers' bump ritual).
