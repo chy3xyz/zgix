@@ -1,0 +1,24 @@
+---
+.title = "zgix — a zero-allocation L4/L7 edge proxy in Zig",
+.layout = "index.shtml",
+---
+
+zgix is built on the TigerBeetle I/O model — completion-based, with
+caller-owned completions — and held to TigerStyle: **all memory is reserved
+at startup, and the request-serving path allocates nothing.** One thread
+owns one event loop and every pool; scale-out is N independent processes
+behind `SO_REUSEPORT`, never threads sharing memory.
+
+Every limit is a compile-time constant, and the memory, file-descriptor and
+ring-depth budgets are closed-form functions of them — printed at startup
+and asserted against `RLIMIT_NOFILE` before a port is bound. When a
+resource runs out, zgix sheds the newest work with a defined answer: a
+static `503` from constant memory, never a crash, never an unbounded queue.
+
+Correctness rests on a deterministic simulator: the serving path runs
+against virtual sockets and a virtual clock under a seeded adversarial
+backend — partial reads down to one byte, resets at every point, delayed
+and black-holed connects. A live gate then runs the real binary against a
+real origin on every change and asserts that N requests produce exactly N
+access-log lines, that counters reconcile, that memory does not move, and
+that `SIGTERM` drains cleanly.

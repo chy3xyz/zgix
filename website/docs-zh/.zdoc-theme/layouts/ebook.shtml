@@ -1,0 +1,61 @@
+<extend template="base_bare.shtml">
+<head id="head">
+</head>
+<!-- A book: the root page is the cover, every other page is a chapter.
+     The chapter list is the same tree the documentation sidebar uses, so
+     `01-` prefixes and `order` decide the reading order. Previous and next
+     walk that list. There is no page outline; a chapter is read straight
+     through. -->
+<div class="layout layout--bare" id="main">
+<div class="ebook">
+	<header class="ebook__bar">
+		<a class="ebook__home" href="$site.index().link()" :text="$site.title"></a>
+		<details class="ebook__contents">
+			<summary>Contents</summary>
+			<ul class="sidebar__list">
+				<li :loop="$site.sidebar()">
+					<ctx :if="$loop.it.is_link">
+						<a class="$loop.it.class" href="$loop.it.link()" :text="$loop.it.title"></a>
+					</ctx>
+					<ctx :if="$loop.it.is_link.not()">
+						<span class="$loop.it.class" :text="$loop.it.title"></span>
+					</ctx>
+				</li>
+			</ul>
+		</details>
+	</header>
+
+	<article class="doc ebook__body" :html="$page.content()"></article>
+	<ctx :if="$page.footnotes?()">
+		<section class="doc__footnotes">
+			<ol :loop="$if">
+				<li id="$loop.it.def_id">
+					<ctx :html="$loop.it.html()"></ctx>
+					<ctx :loop="$loop.it.ref_ids">
+						<a class="footnote-backref" href="$loop.it.prefix('#')" :html="$loop.idx"></a>
+					</ctx>
+				</li>
+			</ol>
+		</section>
+	</ctx>
+
+	<nav class="ebook__turn">
+		<ctx :if="$page.prevChapter?()">
+			<a class="ebook__prev" href="$if.link()">
+				<span class="ebook__turn-label">Previous</span>
+				<span class="ebook__turn-title" :text="$if.title"></span>
+			</a>
+		</ctx>
+		<ctx :if="$page.nextChapter?()">
+			<a class="ebook__next" href="$if.link()">
+				<span class="ebook__turn-label">Next</span>
+				<span class="ebook__turn-title" :text="$if.title"></span>
+			</a>
+		</ctx>
+	</nav>
+
+	<footer class="doc__footer">
+		<p class="doc__powered">Built with <a href="https://github.com/chy3xyz/zdoc">zdoc</a></p>
+	</footer>
+</div>
+</div>

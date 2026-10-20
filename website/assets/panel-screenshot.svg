@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="750" viewBox="0 0 1200 750" font-family="ui-monospace, Menlo, Consolas, monospace">
+  <defs>
+    <style>
+      .bg { fill: #0d1117; }
+      .surface { fill: #161b22; }
+      .surface2 { fill: #1c2129; }
+      .line { stroke: #30363d; stroke-width: 1; fill: none; }
+      .ink { fill: #e6edf3; }
+      .muted { fill: #8b949e; }
+      .accent { fill: #58a6ff; }
+      .green { fill: #3fb950; }
+      .amber { fill: #d29922; }
+      .red { fill: #f85149; }
+      .t-title { font-size: 15px; font-weight: 700; }
+      .t-label { font-size: 11px; }
+      .t-num { font-size: 12px; }
+      .bar { fill: #58a6ff; opacity: 0.75; }
+      .bar2 { fill: #3fb950; opacity: 0.65; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1200" height="750" rx="12"/>
+
+  <!-- top bar -->
+  <rect class="surface2" width="1200" height="52" rx="12"/>
+  <rect class="surface2" x="0" y="26" width="1200" height="26"/>
+  <rect class="line" x="0" y="52" width="1200" height="1"/>
+  <circle class="red" cx="26" cy="26" r="6"/>
+  <circle class="amber" cx="46" cy="26" r="6"/>
+  <circle class="green" cx="66" cy="26" r="6"/>
+  <text class="ink t-label" x="90" y="31">zgix panel — http://127.0.0.1:9100</text>
+  <text class="accent t-label" x="1040" y="31">● live</text>
+
+  <!-- left nav -->
+  <rect class="line" x="190" y="52" width="1" height="698"/>
+  <text class="accent t-title" x="28" y="92">zgix</text>
+  <rect class="accent" x="0" y="112" width="3" height="30"/>
+  <text class="ink t-label" x="28" y="132">概览 overview</text>
+  <text class="muted t-label" x="28" y="170">站点 sites</text>
+  <text class="muted t-label" x="28" y="208">应用 apps</text>
+  <text class="muted t-label" x="28" y="246">关于 about</text>
+
+  <!-- h3 listener table -->
+  <text class="ink t-label" x="214" y="88">H3 LISTENERS</text>
+  <rect class="surface" x="214" y="100" width="700" height="96" rx="8"/>
+  <rect class="line" x="214" y="132" width="700" height="1"/>
+  <rect class="line" x="214" y="164" width="700" height="1"/>
+  <text class="muted t-label" x="230" y="122">bind</text>
+  <text class="muted t-label" x="480" y="122">sessions</text>
+  <text class="muted t-label" x="600" y="122">requests</text>
+  <text class="muted t-label" x="730" y="122">parked</text>
+  <text class="ink t-label" x="230" y="154">0.0.0.0:4443 (udp)</text>
+  <text class="green t-num" x="480" y="154">17</text>
+  <text class="ink t-num" x="600" y="154">12,884</text>
+  <text class="ink t-num" x="730" y="154">3</text>
+  <text class="ink t-label" x="230" y="186">0.0.0.0:8443 (udp)</text>
+  <text class="green t-num" x="480" y="186">4</text>
+  <text class="ink t-num" x="600" y="186">1,102</text>
+  <text class="ink t-num" x="730" y="186">1</text>
+
+  <!-- verdict bars -->
+  <text class="ink t-label" x="214" y="240">H3 VERDICTS</text>
+  <rect class="surface" x="214" y="252" width="340" height="180" rx="8"/>
+  <text class="muted t-label" x="230" y="280">h3_responses</text>
+  <rect class="bar2" x="230" y="288" width="270" height="14" rx="3"/>
+  <text class="muted t-label" x="230" y="326">h3_bad_gateway</text>
+  <rect class="bar" x="230" y="334" width="46" height="14" rx="3"/>
+  <text class="muted t-label" x="230" y="372">h3_no_route</text>
+  <rect class="bar" x="230" y="380" width="18" height="14" rx="3"/>
+  <text class="muted t-label" x="230" y="418">h3_shed_busy</text>
+  <rect class="bar" x="230" y="400" width="6" height="14" rx="3"/>
+
+  <!-- pool gauges -->
+  <text class="ink t-label" x="574" y="240">POOLS</text>
+  <rect class="surface" x="574" y="252" width="340" height="180" rx="8"/>
+  <text class="muted t-label" x="590" y="280">conn_slots</text>
+  <rect class="surface2" x="590" y="288" width="220" height="10" rx="3"/>
+  <rect class="green" x="590" y="288" width="34" height="10" rx="3"/>
+  <text class="ink t-num" x="820" y="298">42 / 1386</text>
+  <text class="muted t-label" x="590" y="326">relay_buffers</text>
+  <rect class="surface2" x="590" y="334" width="220" height="10" rx="3"/>
+  <rect class="green" x="590" y="334" width="21" height="10" rx="3"/>
+  <text class="ink t-num" x="820" y="344">17 / 1386</text>
+  <text class="muted t-label" x="590" y="372">upstream_slots</text>
+  <rect class="surface2" x="590" y="380" width="220" height="10" rx="3"/>
+  <rect class="green" x="590" y="380" width="48" height="10" rx="3"/>
+  <text class="ink t-num" x="820" y="390">9 / 1311</text>
+  <text class="muted t-label" x="590" y="418">tls_engines</text>
+  <rect class="surface2" x="590" y="400" width="220" height="10" rx="3"/>
+  <rect class="amber" x="590" y="400" width="120" height="10" rx="3"/>
+  <text class="ink t-num" x="820" y="410">640 / 1024</text>
+
+  <!-- raw scrape -->
+  <text class="ink t-label" x="214" y="472">RAW SCRAPE</text>
+  <rect class="surface" x="214" y="484" width="700" height="220" rx="8"/>
+  <text class="muted t-label" x="230" y="510">zgix_info{version="0.9.0"} 1</text>
+  <text class="muted t-label" x="230" y="532">zgix_listener_info{bind="0.0.0.0:443",kind="http",routes="12"} 1</text>
+  <text class="muted t-label" x="230" y="554">zgix_cluster_responses{cluster="api",class="2xx"} 4182</text>
+  <text class="muted t-label" x="230" y="576">zgix_cluster_duration_seconds_bucket{cluster="api",le="0.005"} 3910</text>
+  <text class="muted t-label" x="230" y="598">zgix_endpoint_healthy{cluster="api",endpoint="10.0.0.2:8080"} 0</text>
+  <text class="muted t-label" x="230" y="620"># zgix_access_log</text>
+  <text class="muted t-label" x="230" y="642"># {"time":"2026-10-20T09:14:22Z","kind":"http","status":200,...}</text>
+  <text class="muted t-label" x="230" y="664"># {"time":"2026-10-20T09:14:22Z","kind":"http","status":101,...}</text>
+  <rect class="accent" x="230" y="676" width="7" height="13"/>
+</svg>

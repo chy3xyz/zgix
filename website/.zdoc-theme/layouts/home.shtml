@@ -1,0 +1,54 @@
+<extend template="base_bare.shtml">
+<head id="head">
+</head>
+<!-- A home page: a hero, its call-to-action buttons, feature cards, and
+     then the page's own Markdown. Rendered when the frontmatter says
+     `layout: home`; a page without a hero renders as an ordinary doc page. -->
+<div class="layout--bare" id="main">
+<div class="home">
+	<div :if="$page.hero.present">
+		<!-- `:loop` repeats an element's children once per item rather than
+		     repeating the element itself, so each loop is written as a
+		     container with the repeated markup inside it.
+
+		     An attribute whose value starts with `$` is parsed as a single
+		     expression, which means `class="a $x"` is not valid -- the
+		     template language cannot concatenate. That is why the brand
+		     button is styled by element type rather than by a `$loop.it.theme`
+		     interpolation, and why the theme only distinguishes the first
+		     action. -->
+		<section class="hero">
+			<h1 class="hero__name" :text="$page.hero.name"></h1>
+			<p class="hero__text" :text="$page.hero.text"></p>
+			<p class="hero__tagline" :text="$page.hero.tagline"></p>
+			<div class="hero__actions" :loop="$page.hero.actions()">
+				<a class="hero__action"
+					href="$loop.it.link()"
+					:text="$loop.it.text"></a>
+			</div>
+		</section>
+
+		<section class="features">
+			<div :loop="$page.features" class="feature-grid">
+				<article class="feature">
+					<h2 class="feature__title" :text="$loop.it.title"></h2>
+					<p class="feature__details" :text="$loop.it.details"></p>
+				</article>
+			</div>
+		</section>
+	</div>
+
+	<!-- The body is kept, not discarded: a home page is still a page, and
+	     whatever the author wrote under the frontmatter is part of it. -->
+	<article class="doc doc--home" :html="$page.content()"></article>
+
+	<!-- The same attribution the doc footer carries. A landing page is the
+	     first thing a reader sees and often the only page they read, so
+	     leaving it uncredited would be the one page where the credit is
+	     most visible by its absence. No date line: the hero already fills
+	     the space above it. -->
+	<footer class="doc__footer doc__footer--home">
+		<p class="doc__powered">Built with <a href="https://github.com/chy3xyz/zdoc">zdoc</a></p>
+	</footer>
+</div>
+</div>

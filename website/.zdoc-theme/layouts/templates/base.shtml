@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="$site.localeCode()">
+	<head id="head">
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1">
+		<title :text="$page.title"></title>
+		<!-- Sharing cards.
+		     A `<meta>` carries its value in `content`, and `:text` sets an
+		     element's text rather than an attribute -- so these use an
+		     attribute whose value is exactly one `$` expression. That works
+		     because the template language parses such an attribute as a single
+		     script expression; what it cannot do is concatenate, which is why
+		     no `content="a $x"` form appears anywhere in the theme.
+
+		     The description group is conditional: most pages in a documentation
+		     tree have no description, and a card with an empty description
+		     looks broken rather than minimal. -->
+		<ctx :if="$page.hasDescription()">
+			<meta name="description" content="$page.description">
+			<meta property="og:title" content="$page.title">
+			<meta property="og:description" content="$page.description">
+			<meta property="og:type" content="article">
+		</ctx>
+		<meta property="og:site_name" content="$site.title">
+		<link rel="stylesheet" href="$site.asset('zdoc.css').link()">
+		<script defer src="$site.asset('zdoc.js').link()"></script>
+		<!-- Mermaid is only needed by pages that actually contain a diagram.
+		     The loader is generated at build time so it can point at a
+		     vendored bundle when one is configured, and at the CDN otherwise. -->
+		<script type="module" src="$site.asset('mermaid.js').link()"></script>
+		<!-- Tabs and highlighted lines are upgraded in the browser so the
+		     renderer can keep emitting plain markup: `::: tabs` and
+		     `::: code-group` arrive as `.block.tabs` containers whose direct
+		     headings label the panels, and a fence's `{1,3-5}` arrives as
+		     `data-highlight` on the `<pre>`. This runs on `DOMContentLoaded`
+		     and before the KaTeX listener below, so a label containing math is
+		     still plain text when it becomes a button. -->
+		<script>
+			document.addEventListener('DOMContentLoaded', function () {
+				var tabSeq = 0;
+				var tabGroups = [];
+
+				function currentHashId() {
+					var hash = window.location.hash;
+					if (hash.length < 2) return '';
+					try {
+						return decodeURIComponent(hash.slice(1));
+					} catch (err) {
+						return hash.slice(1);
+					}
+				}
+
+				function selectFromHash() {
+					var id = currentHashId();
+					if (!id) return;
+					for (var g = 0; g < tabGroups.length; g++) {
+						if (tabGroups[g].activate(id)) return;
+					}
+				}
+
+				// Tab ids must be unique even when the content already uses
+				// `zdoc-tabs-N` for something else.
+				function tabBase() {
+					var base;
+					do {
+						tabSeq += 1;
+						base = 'zdoc-tabs-' + tabSeq;
+					} while (document.getElementById(base + '-tab-0') ||
+						document.getElementById(base + '-panel-0'));
+					return base;
+				}
+
+				function buildTabs(block) {
+					var headings = [];
+					for (var child = block.firstElementChild; child; child = child.nextElementSibling) {
+						if (/^H[1-6]$/.test(child.tagName)) headings.push(child);
+					}
+					// A block without headings has no labels; leave it alone.
+					if (headings.length === 0) return;
+
+					var base = tabBase();
+					var list = document.createElement('div');
+					list.className = 'tabs__list';
+					list.setAttribute('role', 'tablist');
+
+					var panels = document.createElement('div');
+					panels.className = 'tabs__panels';
+					// Place the list where the headings began, so content that
+					// precedes the first heading stays above the tab bar.
+					block.insertBefore(list, headings[0]);
+
+					var tabs = [];
+					var panelEls = [];
+					var headingIds = [];
+
+					function select(index, focus, updateHash) {
+						for (var k = 0; k < tabs.length; k++) {
+							tabs[k].setAttribute('aria-selected', k === index ? 'true' : 'false');
+							tabs[k].tabIndex = k === index ? 0 : -1;
+							panelEls[k].hidden = k !== index;
+						}
+						if (focus) tabs[index].focus();
+						if (updateHash && headingIds[index]) {
+							try {
+								// `replaceState` moves the fragment without
+								// scrolling; `location.hash` would jump.
+								history.replaceState(history.state, '',
+									'#' + encodeURIComponent(headingIds[index]));
+							} catch (err) {
+								// Updating the fragment is a convenience only.
+							}
+						}
+					}
+
+					for (var i = 0; i < headings.length; i++) {
+						var heading = headings[i];
+						var next = headings[i + 1] || null;
+						var headingId = heading.id || '';
+
+						var panel = document.createElement('div');
+						// Moving the heading's id to the panel keeps existing
+						// deep links working after the heading is removed.
+						panel.id = headingId || (base + '-panel-' + i);
+						panel.setAttribute('role', 'tabpanel');
+						if (i !== 0) panel.hidden = true;
+
+						// The heading and everything after it up to the next
+						// heading form one panel; the heading itself becomes
+						// the label rather than staying in the panel body.
+						var node = heading.nextSibling;
+						while (node && node !== next) {
+							var after = node.nextSibling;
+							panel.appendChild(node);
+							node = after;
+						}
+						var label = heading.textContent.trim();
+						block.removeChild(heading);
+
+						var tab = document.createElement('button');
+						tab.type = 'button';
+						tab.id = base + '-tab-' + i;
+						tab.setAttribute('role', 'tab');
+						tab.setAttribute('aria-controls', panel.id);
+						tab.setAttribute('aria-selected', i === 0 ? 'true' : 'false');
+						tab.tabIndex = i === 0 ? 0 : -1;
+						tab.textContent = label;
+						panel.setAttribute('aria-labelledby', tab.id);
+
+						tabs.push(tab);
+						panelEls.push(panel);
+						headingIds.push(headingId);
+						list.appendChild(tab);
+						panels.appendChild(panel);
+					}
+
+					block.appendChild(panels);
+
+					for (var t = 0; t < tabs.length; t++) {
+						(function (index) {
+							tabs[index].addEventListener('click', function () {
+								select(index, true, true);
+							});
+						})(t);
+					}
+
+					// Roving tabindex: only the selected tab is reachable with
+					// Tab, so the arrow keys walk the list without adding stops.
+					list.addEventListener('keydown', function (event) {
+						var key = event.key;
+						if (key !== 'ArrowLeft' && key !== 'ArrowRight' &&
+							key !== 'Home' && key !== 'End') return;
+
+						var current = 0;
+						for (var k = 0; k < tabs.length; k++) {
+							if (tabs[k].getAttribute('aria-selected') === 'true') {
+								current = k;
+								break;
+							}
+						}
+
+						var next = current;
+						if (key === 'ArrowRight') next = (current + 1) % tabs.length;
+						else if (key === 'ArrowLeft') next = (current - 1 + tabs.length) % tabs.length;
+						else if (key === 'Home') next = 0;
+						else if (key === 'End') next = tabs.length - 1;
+
+						event.preventDefault();
+						select(next, true, true);
+					});
+
+					// A hash that names one of the original heading ids selects
+					// that panel. Hashes that name anything else are ignored,
+					// so links outside the tab block keep working untouched.
+					tabGroups.push({
+						activate: function (id) {
+							for (var k = 0; k < headingIds.length; k++) {
+								if (headingIds[k] !== '' && headingIds[k] === id) {
+									select(k, false, false);
+									return true;
+								}
+							}
+							return false;
+						}
+					});
+				}
+
+				function parseRanges(spec) {
+					var ranges = [];
+					var parts = spec.split(',');
+					for (var i = 0; i < parts.length; i++) {
+						var match = /^\s*(\d+)\s*(?:-\s*(\d+)\s*)?$/.exec(parts[i]);
+						if (!match) continue;
+						var start = parseInt(match[1], 10);
+						var end = match[2] ? parseInt(match[2], 10) : start;
+						if (start < 1 || end < 1) continue;
+						if (end < start) {
+							var swap = start;
+							start = end;
+							end = swap;
+						}
+						ranges.push({ start: start, end: end });
+					}
+					return ranges;
+				}
+
+				function isMarked(ranges, line) {
+					for (var i = 0; i < ranges.length; i++) {
+						if (line >= ranges[i].start && line <= ranges[i].end) return true;
+					}
+					return false;
+				}
+
+				// Split highlighted code into one fragment per source line.
+				// Text nodes are cut at `\n`; every element open at the cut is
+				// shallow-cloned onto the next line, so tree-sitter spans
+				// survive even when a span wraps a line ending. Cloning rather
+				// than reading `textContent` is what keeps the syntax classes.
+				function splitLines(root) {
+					var lines = [document.createDocumentFragment()];
+					var line = 0;
+					var open = [];
+					var clones = [];
+
+					function parent() {
+						return clones.length ? clones[clones.length - 1] : lines[line];
+					}
+
+					function nextLine() {
+						line += 1;
+						lines[line] = document.createDocumentFragment();
+						clones = [];
+						for (var i = 0; i < open.length; i++) {
+							var clone = open[i].cloneNode(false);
+							if (clones.length) {
+								clones[clones.length - 1].appendChild(clone);
+							} else {
+								lines[line].appendChild(clone);
+							}
+							clones.push(clone);
+						}
+					}
+
+					function visit(node) {
+						if (node.nodeType === 3) {
+							var parts = node.data.split('\n');
+							for (var i = 0; i < parts.length; i++) {
+								if (i > 0) nextLine();
+								if (parts[i].length) {
+									parent().appendChild(document.createTextNode(parts[i]));
+								}
+							}
+							return;
+						}
+						if (node.nodeType !== 1) return;
+
+						var clone = node.cloneNode(false);
+						parent().appendChild(clone);
+						open.push(node);
+						clones.push(clone);
+						for (var child = node.firstChild; child; child = child.nextSibling) {
+							visit(child);
+						}
+						open.pop();
+						clones.pop();
+					}
+
+					for (var child = root.firstChild; child; child = child.nextSibling) {
+						visit(child);
+					}
+					return lines;
+				}
+
+				function highlightLines(pre) {
+					// Rendered code is always inside `<code>`, but a hand-written
+					// page may put the source directly in the `<pre>`.
+					var code = pre.querySelector('code');
+					var source = code || pre;
+					if (source.querySelector('.code-line')) return;
+
+					var ranges = parseRanges(pre.getAttribute('data-highlight') || '');
+					var lines = splitLines(source);
+					var text = source.textContent;
+					// A final newline terminates the last line rather than
+					// starting an empty one, so do not emit a trailing
+					// `.code-line` for it.
+					if (text.length && text.charAt(text.length - 1) === '\n' &&
+						lines.length > 1 && lines[lines.length - 1].textContent === '') {
+						lines.pop();
+					}
+					var out = document.createDocumentFragment();
+
+					for (var i = 0; i < lines.length; i++) {
+						var span = document.createElement('span');
+						span.className = 'code-line' +
+							(isMarked(ranges, i + 1) ? ' is-highlighted' : '');
+						span.appendChild(lines[i]);
+						out.appendChild(span);
+					}
+
+					while (source.firstChild) source.removeChild(source.firstChild);
+					source.appendChild(out);
+				}
+
+				var tabBlocks = document.querySelectorAll(
+					'.doc .block.tabs, .ebook__body .block.tabs, .doc__footnotes .block.tabs'
+				);
+				for (var t = 0; t < tabBlocks.length; t++) {
+					try {
+						buildTabs(tabBlocks[t]);
+					} catch (err) {
+						// A malformed block keeps its original, readable markup.
+					}
+				}
+
+				// Deep links are resolved once every block exists, and again
+				// whenever the fragment changes later. A hash naming anything
+				// outside a tab block is left alone.
+				selectFromHash();
+				window.addEventListener('hashchange', selectFromHash);
+
+				var highlighted = document.querySelectorAll('pre[data-highlight]');
+				for (var p = 0; p < highlighted.length; p++) {
+					try {
+						highlightLines(highlighted[p]);
+					} catch (err) {
+						// A block that cannot be divided stays as plain code.
+					}
+				}
+			});
+		</script>
+		<!-- Math is rendered in the browser: the renderer emits `=mathtex`
+		     fences as inert `<script type="math/tex">` elements and leaves
+		     inline `$...$` as plain text. KaTeX comes from a CDN, so both the
+		     loader and the call below are guarded -- without the CDN the TeX
+		     source stays visible instead of the page failing. The `defer`
+		     scripts run in order and finish before `DOMContentLoaded`, which
+		     is when the inline script does its work. -->
+		<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.47/dist/katex.min.css">
+		<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.47/dist/katex.min.js"></script>
+		<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.47/dist/contrib/auto-render.min.js"></script>
+		<script>
+			document.addEventListener('DOMContentLoaded', function () {
+				// Math lives in the article and its footnotes; scanning those
+				// alone keeps `$` in navigation and search chrome from being
+				// read as TeX.
+				var scopes = document.querySelectorAll('.doc, .doc__footnotes');
+				if (scopes.length === 0) scopes = [document.body];
+
+				// A `=mathtex` fence cannot be rendered where it stands: a
+				// script element has no layout. Render into a span first and
+				// only then swap the script out. When KaTeX is missing, or a
+				// formula defeats it, show the raw TeX rather than hiding it.
+				for (var s = 0; s < scopes.length; s++) {
+					var blocks = scopes[s].querySelectorAll('script[type="math/tex"]');
+					for (var i = 0; i < blocks.length; i++) {
+						var block = blocks[i];
+						var span = document.createElement('span');
+						span.className = 'math math-display';
+						try {
+							if (!window.katex) throw new Error('katex unavailable');
+							katex.render(block.textContent, span, {
+								displayMode: true,
+								throwOnError: false
+							});
+							block.replaceWith(span);
+						} catch (err) {
+							var fallback = document.createElement('pre');
+							fallback.className = 'math math-fallback';
+							fallback.textContent = block.textContent;
+							block.replaceWith(fallback);
+						}
+					}
+				}
+
+				if (!window.renderMathInElement) return;
+				var options = {
+					delimiters: [
+						{ left: '$$', right: '$$', display: true },
+						{ left: '\\[', right: '\\]', display: true },
+						{ left: '$', right: '$', display: false },
+						{ left: '\\(', right: '\\)', display: false }
+					],
+					throwOnError: false,
+					// Code samples and diagram sources are text, not math.
+					ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code', 'option'],
+					// Do not re-scan KaTeX's own output.
+					ignoredClasses: ['katex', 'katex-display', 'no-math']
+				};
+				for (var j = 0; j < scopes.length; j++) {
+					try {
+						renderMathInElement(scopes[j], options);
+					} catch (err) {
+						// A malformed expression must not stop the rest of the page.
+					}
+				}
+			});
+		</script>
+		<!-- Where zdoc.js fetches the search index from. Written here rather
+		     than derived in the script, because the script cannot know the
+		     site's URL prefix. -->
+		<meta name="zdoc-search-index" content="$site.searchIndex()">
+		<super>
+	</head>
+	<body id="body">
+		<!-- Only reachable on a narrow screen; see the media query. The label
+		     names the control for a screen reader, which never sees the icon. -->
+		<button id="nav-toggle" class="nav-toggle" type="button"
+			aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false">
+			<span class="nav-toggle__bar"></span>
+			<span class="nav-toggle__bar"></span>
+			<span class="nav-toggle__bar"></span>
+		</button>
+		<div class="nav-scrim" id="nav-scrim" hidden></div>
+		<div class="layout">
+			<nav class="sidebar" id="sidebar">
+				<a class="sidebar__title" href="$site.index().link()" :text="$site.title"></a>
+				<div class="search" id="search">
+					<!-- The combobox roles are what let a screen reader follow
+					     the result list as the reader arrows through it; the
+					     list is empty until they type, so it starts collapsed. -->
+					<input id="search-input" class="search__input" type="search"
+						placeholder="Search" autocomplete="off" spellcheck="false"
+						role="combobox" aria-expanded="false" aria-controls="search-results"
+						aria-autocomplete="list" aria-label="Search the documentation">
+					<kbd class="search__hint" aria-hidden="true">/</kbd>
+					<ul id="search-results" class="search__results" role="listbox"
+						aria-label="Search results" hidden></ul>
+					<p id="search-status" class="search__status" role="status" aria-live="polite"></p>
+				</div>
+				<super>
+			</nav>
+<main class="content" id="main">
+				<article class="doc" :html="$page.content()"></article>
+				<ctx :if="$page.footnotes?()">
+					<section class="doc__footnotes">
+						<ol :loop="$if">
+							<li id="$loop.it.def_id">
+								<ctx :html="$loop.it.html()"></ctx>
+								<ctx :loop="$loop.it.ref_ids">
+									<a class="footnote-backref" href="$loop.it.prefix('#')" :html="$loop.idx"></a>
+								</ctx>
+							</li>
+						</ol>
+					</section>
+				</ctx>
+				<footer class="doc__footer">
+				<!-- A page's age says whether its advice still holds. The
+				     string is empty when the content is not in a git
+				     repository, which leaves the element empty rather than
+				     printing a placeholder.
+
+				     The footer itself is unconditional even though this line
+				     is not: it also carries the attribution, and an
+				     attribution that appears only for git-backed trees would
+				     be a worse advertisement than none.
+
+				     `:if` on the `<p>` would still emit the empty element,
+				     so the conditional wraps it in a `<ctx>` -- the same
+				     wrapper the description group uses above. -->
+				<ctx :if="$page.hasLastUpdated()">
+					<p class="doc__updated">Last updated: <time :text="$page.lastUpdated()"></time></p>
+				</ctx>
+				<!-- The link a reader can follow to attribute the tool. Kept as
+				     a real href rather than plain text: an attribution nobody
+				     can act on does not advertise anything. -->
+				<p class="doc__powered">Built with <a href="https://github.com/chy3xyz/zdoc">zdoc</a></p>
+			</footer>
+			</main>
+			<aside class="toc" id="toc">
+				<div class="toc__title">On this page</div>
+				<super>
+			</aside>
+		</div>
+	</body>
+</html>

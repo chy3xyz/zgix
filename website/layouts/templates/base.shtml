@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head id="head">
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1">
+		<meta name="color-scheme" content="dark">
+		<meta name="description" content="zgix — a zero-allocation L4/L7 edge proxy with experimental HTTP/3, written in Zig.">
+		<title :text="$page.title"></title>
+		<link rel="stylesheet" href="$site.asset('style.css').link()">
+		<super>
+	</head>
+	<body id="body">
+		<header class="nav">
+			<a class="logo" href="$site.page('').link()"><span class="logo-mark">zgix</span><span class="logo-cursor">_</span></a>
+			<nav>
+				<a href="/docs/">Docs</a>
+				<a href="/docs/zh/">中文文档</a>
+				<a href="https://github.com/chy3xyz/zgix">GitHub</a>
+			</nav>
+		</header>
+		<super>
+		<footer class="foot">
+			<div class="foot-row">
+				<span class="foot-brand">zgix<span class="logo-cursor">_</span></span>
+				<nav>
+					<a href="/docs/">Documentation</a>
+					<a href="/docs/zh/">中文文档</a>
+					<a href="https://github.com/chy3xyz/zgix">GitHub</a>
+					<a href="https://github.com/chy3xyz/zgix/blob/main/LICENSE">MIT</a>
+				</nav>
+			</div>
+			<p class="foot-note">Zero allocation after startup. Every limit a compile-time constant. © 2026 zgix contributors.</p>
+		</footer>
+	</body>
+</html>

@@ -1,0 +1,78 @@
+<extend template="base.shtml">
+<head id="head">
+</head>
+<body id="body">
+	<section class="hero">
+		<div class="hero-copy">
+			<p class="kicker">L4/L7 edge proxy · zig 0.17 · io_uring</p>
+			<h1>zgix</h1>
+			<p class="tagline">A zero-allocation L4/L7 edge proxy with experimental HTTP/3, written in Zig. Every pool reserved at startup — the serving path allocates nothing, and exhaustion sheds load at a defined rung of the ladder.</p>
+			<div class="actions">
+				<a class="btn" href="/docs/">Read the docs</a>
+				<a class="btn ghost" href="https://github.com/chy3xyz/zgix">GitHub</a>
+			</div>
+		</div>
+		<div class="term" role="img" aria-label="installing and checking a zgix config in a terminal">
+			<div class="term-bar">
+				<span class="term-dot"></span>
+				<span class="term-dot"></span>
+				<span class="term-dot"></span>
+				<span class="term-title">zsh — edge</span>
+			</div>
+			<pre class="term-body"><code><span class="p">$</span> git clone https://github.com/chy3xyz/zgix
+<span class="p">$</span> cd zgix &amp;&amp; zig build -Doptimize=ReleaseSafe
+<span class="p">$</span> ./zig-out/bin/zgix --check config.json
+<span class="ok">config.json: valid, and this box can start it</span>
+<span class="p">$</span> ./zig-out/bin/zgix config.json
+<span class="dim"># 1 listener(s), 1 cluster(s) — budget printed, fds asserted</span>
+
+<span class="dim"># one-line install ships with the first release:</span>
+<span class="dim"># curl -fsSL https://zgix.click/install.sh | sh</span></code></pre>
+		</div>
+	</section>
+
+	<section class="features">
+		<div class="feature">
+			<h3>Zero-allocation serving</h3>
+			<p>All memory is reserved at startup; the request path allocates nothing. Pool sizes are closed-form functions of compile-time constants, printed in the banner and asserted against <code>RLIMIT_NOFILE</code>.</p>
+		</div>
+		<div class="feature">
+			<h3>HTTP/3 over QUIC</h3>
+			<p>Experimental <code>h3_listeners</code> terminate QUIC-TLS and proxy each request over a pooled plaintext-or-TLS HTTP/1.1 leg — observed like the TCP path, verdict counters and access log included.</p>
+		</div>
+		<div class="feature">
+			<h3>SNI multi-tenant TLS</h3>
+			<p>Terminate TLS 1.3 with up to 16 certificate pairs per listener — or relay blind by SNI, so one <code>:443</code> fronts many TLS services without zgix ever holding key material.</p>
+		</div>
+		<div class="feature">
+			<h3>WebSocket tunnels</h3>
+			<p>An opt-in upgrade relay with its own bounded tunnel pool. Long-lived sessions pin their own buffers and can never starve HTTP of relay slots or upstream leases.</p>
+		</div>
+		<div class="feature">
+			<h3>Declarative JSON config</h3>
+			<p>One file, unknown fields refused, <code>--check</code> prices memory and fds before a port is bound. No config reload: replace the process behind <code>SO_REUSEPORT</code> instead.</p>
+		</div>
+		<div class="feature">
+			<h3>Prometheus-grade observability</h3>
+			<p><code>zgix_*</code> counter families, per-endpoint health gauges, RED histograms, a JSON access log, a bounded log tail on the scrape — and a bundled control panel that reads it all.</p>
+		</div>
+	</section>
+
+	<section class="showcase">
+		<div class="showcase-copy">
+			<p class="kicker">observability</p>
+			<h2>Watch it run</h2>
+			<p>The admin endpoint serves one Prometheus scrape at a time from a slot reserved outside the data-path pools. Counters, pool gauges, per-endpoint verdicts and a 128-line access-log tail — the bundled panel turns the scrape into 概览 / 站点 / 应用 / 关于 views.</p>
+			<pre class="mini-term"><code><span class="p">$</span> curl -s 127.0.0.1:9100/metrics | head
+<span class="dim">zgix_info{version="0.9.0"} 1</span>
+<span class="dim">zgix_conn_slots_in_use 42</span>
+<span class="dim">zgix_cluster_responses{cluster="api",class="2xx"} 4182</span></code></pre>
+		</div>
+		<figure class="showcase-shot">
+			<img src="$site.asset('panel-screenshot.svg').link()" width="1200" height="750" alt="Wireframe of the zgix control panel: h3 listener table, pool gauges and verdict distribution">
+			<figcaption>Control panel (screenshot pending — wireframe placeholder)</figcaption>
+		</figure>
+	</section>
+
+	<section class="closing prose" :html="$page.content()"></section>
+</body>

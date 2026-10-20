@@ -10,3 +10,4 @@ result-*
 devenv.local.nix
 .claude/worktrees
 __pycache__/
+website/public/
