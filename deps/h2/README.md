@@ -34,7 +34,7 @@ stay in the consumer.
   removes them for a consumer that has made that argument — see
   [`src/assert.zig`](src/assert.zig) for why this is not `std.debug.assert`.
 * Bytes in, frames and header fields out — no reader, writer or `std.Io` in the
-  seam. Its two consumers, [zgix](https://github.com/zoxy-io/zgix) (reverse
+  seam. Its two consumers, [zgix](https://github.com/chy3xyz/zgix) (reverse
   proxy, libxev completion callbacks) and
   [zrk](https://github.com/zoxy-io/zrk) (load generator, zio green threads
   through `std.Io`), do not share a runtime, so a reader in a signature would
@@ -115,5 +115,5 @@ as working instructions, including the review and benchmark gates.
 
 ## Context
 
-* zoxy-io/zgix#173 — HTTP/2 support in the proxy (slices #272 HPACK, #273 frame codec).
+* zoxy-io/zoxy#173 — HTTP/2 support in the proxy (slices #272 HPACK, #273 frame codec).
 * zoxy-io/zrk#21 — HTTP/2 support in the load generator.

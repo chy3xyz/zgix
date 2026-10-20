@@ -41,7 +41,7 @@ and the **proxy-specific deltas**. When in doubt, read the original.
   propagate on the first occurrence, because retrying it changes nothing but
   burns the CPU the rest of the process needs to recover. Never `catch continue`
   over a whole error set — name the retryable members. This is
-  [#222](https://github.com/zoxy-io/zgix/issues/222): a `while (true) … catch
+  [#222](https://github.com/zoxy-io/zoxy/issues/222): a `while (true) … catch
   continue` sized for a once-in-2^32 bad scalar met a persistently full heap and
   spun at 100% CPU forever, taking both listeners and the admin plane with it.
   The shed rung that should have handled it (`shed_tls_crypto`) was unreachable

@@ -75,7 +75,7 @@ const boundaries = [_]Boundary{
 /// its own `}`, the three `config.zig` object loops — which says so at the
 /// site with the marker below and a reason.
 ///
-/// The rule exists because of zoxy-io/zgix#222: a `p256.KeyPair.
+/// The rule exists because of zoxy-io/zoxy#222: a `p256.KeyPair.
 /// generate` retried `while (true) ... catch continue` on the assumption
 /// that its error was a once-in-2^32 bad scalar. When the error became a
 /// persistent one instead (the fixed libcrypto heap full), the retry spun

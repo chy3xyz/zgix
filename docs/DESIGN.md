@@ -9,7 +9,7 @@ limits (the kernel's per-socket buffers are outside that form — §5).
 
 Simplicity is prioritized over feature-richness. The coding rules live in
 [`docs/TIGER_STYLE.md`](TIGER_STYLE.md). The previous iteration of this
-project ([zoxy-io/zgix@main](https://github.com/zoxy-io/zgix)) shipped an
+project ([zoxy-io/zoxy@main](https://github.com/zoxy-io/zoxy)) shipped an
 L7-only, share-nothing, thread-per-core proxy directly on `io_uring`; its
 measured lessons — paid for with implementation time and simulator seeds —
 are folded into the relevant sections below as constraints, not

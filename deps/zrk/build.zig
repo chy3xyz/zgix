@@ -86,7 +86,7 @@ pub fn build(b: *std.Build) void {
     //
     // `sanitize_c = .off` for the vendored C moved there with it, which is
     // where it belongs: it is a property of building OpenSSL, not of building
-    // zrk. See zssl's build.zig, and zoxy-io/zgix#283 for what shipped without
+    // zrk. See zssl's build.zig, and zoxy-io/zoxy#283 for what shipped without
     // it.
     const zssl = b.dependency("zssl", .{
         .target = target,
