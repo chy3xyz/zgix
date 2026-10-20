@@ -25,6 +25,9 @@ const Io = @import("io/io.zig");
 const Pool = @import("mem/Pool.zig").Pool;
 const parser = @import("http/parser.zig");
 const proxy = @import("http/proxy.zig");
+const compress_module = @import("http/compress.zig");
+const rate_limit = @import("rate_limit.zig");
+const conn_limit = @import("conn_limit.zig");
 const router = @import("http/router.zig");
 const filter = @import("http/filter.zig");
 const proxy_protocol = @import("net/proxy_protocol.zig");
@@ -32,9 +35,13 @@ const client_hello = @import("net/client_hello.zig");
 const sni_router = @import("net/sni_router.zig");
 const relay = @import("net/relay.zig");
 const shed = @import("shed.zig");
+const ClusterTls = @import("tls/ClusterTls.zig");
 const Credentials = @import("tls/Credentials.zig");
+const CredentialSet = @import("tls/CredentialSet.zig");
 const Tickets = @import("tls/Tickets.zig");
 const TlsEngine = @import("tls/Engine.zig");
+const TrustStore = @import("tls/TrustStore.zig");
+const UpstreamTls = @import("tls/UpstreamTls.zig");
 const upstream_module = @import("net/upstream.zig");
 
 const assert = std.debug.assert;
@@ -84,6 +91,23 @@ pub fn Server(comptime IoType: type) type {
         /// acquire is synchronous: a render needs the bytes now.
         upstream_head_buffers: Pool(upstream_module.HeadBuffer),
         upstream_head_pressure: bool,
+        /// The listener-level per-client token buckets (§7), allocated
+        /// once from `limits.rate_limit_entries` and never grown. Empty
+        /// exactly when no listener configures `rate_limit`, which is
+        /// what keeps the feature free to a deployment that did not ask
+        /// for it. Lookups are bounded open addressing — see
+        /// `rate_limit.Table.admit`.
+        rate_limit: rate_limit.Table,
+        /// The per-client concurrent-connection counters (§7), allocated
+        /// once from `limits.conn_limit_entries` and never grown. Empty
+        /// exactly when no listener configures `conn_limit`.
+        conn_limit: conn_limit.Table,
+        /// The one shared gzip state, or null when no listener enabled
+        /// compression. Rendering is synchronous on the loop thread, so
+        /// one 230 KiB engine serves every response; `out` is copied
+        /// into the connection's head buffer before the next request can
+        /// touch it.
+        compressor: ?*compress_module.Compressor,
         /// Live L4 relayed connections per endpoint (§7), the other half
         /// of `upstream_module.Load`. The pool cannot hold this: an L4
         /// connection leases no upstream slot, so it is the server —
@@ -103,7 +127,18 @@ pub fn Server(comptime IoType: type) type {
         /// under the Io seam and the loader is not. Empty until then, and
         /// empty for the whole process on a deployment with no `tls`
         /// block anywhere.
-        tls_credentials: []const ?Credentials,
+        tls_credentials: []const ?CredentialSet,
+        /// The per-cluster upstream TLS runtimes, indexed by cluster, or
+        /// empty until `setClusterTls` hands them over. Loaded by `main`
+        /// (file IO stays outside this module); borrowed for the process
+        /// lifetime, because every engine built for a cluster points into
+        /// its runtime's trust store and client credentials.
+        cluster_tls: []const ?ClusterTls.Runtime = &.{},
+        /// Called after SIGHUP reopens the access log. The application
+        /// owns file I/O, so certificate reload lives there; this hook is
+        /// the only path from the loop to it. Null in an embedder that
+        /// does not rotate certificates.
+        sighup_hook: ?SighupHook = null,
         /// The §4 TLS engine pool: one engine per session being
         /// handshaked or terminated, drawn at admission on a listener
         /// that terminates and returned at teardown. Empty — reserving
@@ -114,6 +149,13 @@ pub fn Server(comptime IoType: type) type {
         /// against a conn slot's ~1.7: a deployment pays for the TLS it
         /// serves concurrently, not for every slot it could admit (§5).
         tls_engines: Pool(TlsEngine),
+        /// The §4 client-side counterpart: one upstream TLS engine per
+        /// origin connection a TLS-configured cluster dials, acquired with
+        /// the upstream slot and returned at its release. Sized to
+        /// `limits.upstream_slots` when any cluster has a `tls` block and
+        /// zero otherwise — the same shape as `tls_engines`, so a
+        /// plaintext-only deployment reserves nothing.
+        upstream_tls_engines: Pool(UpstreamTls),
         /// The §4 session-ticket sealing keys — two slots, rotated, and
         /// process-lifetime by design: a ticket is a bearer credential
         /// for a resumed session, so the key that opens one never reaches
@@ -363,6 +405,15 @@ pub fn Server(comptime IoType: type) type {
         /// default in a hand-written bridge.
         pub const InitOptions = config_module.Config.Limits;
 
+        /// The application's SIGHUP work after the log sink reopens. Kept
+        /// as a callback because reading certificate files is the
+        /// application's, not this module's (§13), and the loop is the
+        /// only thing that sees the signal.
+        pub const SighupHook = struct {
+            context: *anyopaque,
+            reload: *const fn (context: *anyopaque) void,
+        };
+
         const ListenerState = struct {
             server: *Self,
             listener: IoType.Listener,
@@ -382,6 +433,9 @@ pub fn Server(comptime IoType: type) type {
             /// admitted L7 connection so `routeRequest` can evaluate
             /// policy.
             request_filters: []const filter.Rule,
+            /// The listener's WAF-lite denylist (null = none), carried like
+            /// the filter tables so the request path asks its own socket.
+            waf: ?filter.Waf,
             /// The listener's #175 response filter rules, handed over the
             /// same way so the response re-render can apply its edits.
             response_filters: []const filter.ResponseRule,
@@ -393,15 +447,34 @@ pub fn Server(comptime IoType: type) type {
             /// The listener's #237 keep-alive request cap (#305), carried
             /// for the same reason as the caps beside it.
             keepalive_requests: u32,
+            /// The listener's per-client token bucket (§7), or null.
+            rate_limit: ?rate_limit.Policy,
+            /// The listener's concurrent-connection cap per client (§7),
+            /// or null. Copied like the bucket so admission reads one
+            /// field, not the config.
+            conn_limit_max: ?u32,
+            /// `compress.min_bytes`, or null. Copied like the rest so
+            /// the response render reads one field, not the config.
+            compress_min_bytes: ?u32,
             /// The listener's §7 client-address forwarding mode (null = off),
             /// handed over the same way: trust depends on what is in front
             /// of this socket, so it cannot live on the cluster.
             forwarded: ?config_module.Config.Listener.Forwarded,
+            /// Companion headers the same block writes (§7). Copied
+            /// beside the mode so the render states the listener's
+            /// decision without reaching back to the config.
+            forwarded_real_ip: bool,
+            forwarded_proto: bool,
             /// The listener's #300 opt-in: whether the pages this proxy
             /// renders itself name why they refused. Per listener for the
             /// same reason as `forwarded` — what may be said on the wire
             /// depends on who is in front of this socket.
             proxy_status: bool,
+            /// The listener's `Alt-Svc` advertisement (RFC 7838), or null.
+            /// Carried like `proxy_status` so the response render asks
+            /// the connection, not the listener index; borrowed from the
+            /// config's arena, never copied.
+            h3_advertise: ?[]const u8,
             /// Whether this listener binds a socket file (#303), so
             /// admission knows there is no peer address to ask for.
             /// Copied like everything else here rather than reached back
@@ -415,12 +488,12 @@ pub fn Server(comptime IoType: type) type {
             /// Copied from config so admission forks without reaching back
             /// through the listener index (§6, §7).
             protocol: config_module.Config.Listener.Protocol,
-            /// This listener's certificate chain and signing key (§4), or
-            /// null on a plaintext socket. Borrowed from the startup-lived
-            /// table `setTlsCredentials` handed over, and shared by every
-            /// engine this listener drives — a chain and a libcrypto key
-            /// are parsed once per listener, never per connection.
-            credentials: ?*const Credentials,
+            /// This listener's SNI credential set (§4), or null on a
+            /// plaintext socket. Borrowed from the startup-lived table
+            /// `setTlsCredentials` handed over, and shared by every
+            /// engine this listener drives — the chains and libcrypto
+            /// keys are parsed once per listener, never per connection.
+            credentials: ?*const CredentialSet,
             accepting: bool,
         };
 
@@ -558,7 +631,15 @@ pub fn Server(comptime IoType: type) type {
             try server.streams.init(arena, constants.streamSlotsFor(options.conn_slots));
             assert(server.streams.capacity() == server.conns.capacity());
             try server.relay_buffers.init(arena, options.relay_buffers);
-            try wireRelayHalves(arena, server.relay_buffers.slots, options.relay_buffer_bytes);
+            // A TLS origin can yield more than one record's plaintext in
+            // one step; both halves are widened together so either
+            // direction's transform has room. `Config` owns the closed
+            // form that `budget.zig` prices.
+            try wireRelayHalves(
+                arena,
+                server.relay_buffers.slots,
+                config.effectiveRelayBufferBytes(),
+            );
             try server.initTunnelBuffers(arena, &options);
             // One index space, derived once and shared by every
             // endpoint-keyed table so they cannot disagree about a key.
@@ -568,10 +649,20 @@ pub fn Server(comptime IoType: type) type {
             try server.upstream_head_buffers.init(arena, options.upstream_head_buffers);
             try server.initHeadBuffers(arena, &options);
             try server.initTlsEngines(arena, &options);
+            try server.initUpstreamTlsEngines(arena);
+            try server.initClientTables(arena, options);
             server.l4_inflight = try arena.alloc(u16, keys.count);
             @memset(server.l4_inflight, 0);
             server.listeners = try arena.alloc(ListenerState, config.listeners.len);
             server.listeners_count = @intCast(config.listeners.len);
+            // One shared compressor, reserved only when a listener asked
+            // for compression (§5). `Compressor` owns its history and out
+            // buffers inline; the arena slot is inert until then.
+            server.compressor = if (config.hasCompression()) blk: {
+                const compressor = try arena.create(compress_module.Compressor);
+                compressor.* = .{};
+                break :blk compressor;
+            } else null;
             // Empty until `setTlsCredentials`, which is before `start` when
             // there is anything to hand over and never otherwise.
             server.tls_credentials = &.{};
@@ -588,20 +679,54 @@ pub fn Server(comptime IoType: type) type {
             try server.health.init(arena, server, keys, options.head_buffer_bytes);
         }
 
+        /// The two client-keyed tables (§7), each one arena slice sized by
+        /// the operator and priced by `constants`. Split from `init` for
+        /// the length limit; the asserts are the seam between the banner's
+        /// terms and what was actually reserved — a table wider or
+        /// narrower than the printed number would make §5's total a
+        /// prediction that is sometimes wrong.
+        fn initClientTables(
+            server: *Self,
+            arena: std.mem.Allocator,
+            options: InitOptions,
+        ) error{OutOfMemory}!void {
+            server.rate_limit = try rate_limit.Table.init(arena, options.rate_limit_entries);
+            assert(server.rate_limit.entries.len == options.rate_limit_entries);
+            assert(constants.rateLimitTableBytes(options.rate_limit_entries) ==
+                @as(u64, server.rate_limit.entries.len) * @sizeOf(rate_limit.Entry));
+            server.conn_limit = try conn_limit.Table.init(arena, options.conn_limit_entries);
+            assert(server.conn_limit.entries.len == options.conn_limit_entries);
+            assert(constants.connLimitTableBytes(options.conn_limit_entries) ==
+                @as(u64, server.conn_limit.entries.len) * @sizeOf(conn_limit.Entry));
+        }
+
         /// The §5 upstream head slab wiring and the serving path's two
         /// canonicalization scratches — split from `init` for the length
         /// limit, called once right after the upstream head pool exists.
+        /// The width of one upstream head buffer: the operator's head
+        /// limit, widened to one wire record when a cluster dials TLS,
+        /// because a single drive step can yield a whole record's
+        /// plaintext into this buffer. `Config` owns the closed form so
+        /// `budget.zig` prices exactly this width.
+        fn upstreamHeadBytesFor(config: *const config_module.Config) u32 {
+            return config.effectiveUpstreamHeadBufferBytes();
+        }
+
         fn initHeadBuffers(
             server: *Self,
             arena: std.mem.Allocator,
             options: *const InitOptions,
         ) error{OutOfMemory}!void {
             assert(server.upstream_head_buffers.slots.len == options.upstream_head_buffers);
-            // The pool's slab, wired once: `Pool` never touches `data`,
-            // so the wiring survives every acquire/release cycle.
+            // With an upstream TLS cluster the slab must hold one full
+            // record's plaintext: the origin's response head and the first
+            // body bytes may arrive in the same record, and a buffer sized
+            // only for the head would refuse the answer. `budget.zig`
+            // prices this same width.
+            const head_bytes = upstreamHeadBytesFor(server.config);
             const upstream_head_slab = try arena.alloc(
                 u8,
-                @as(usize, options.upstream_head_buffers) * options.head_buffer_bytes,
+                @as(usize, options.upstream_head_buffers) * head_bytes,
             );
             // Deliberately not faulted in: pages become resident as
             // exchanges actually use them, so the printed §5 total is a
@@ -611,7 +736,7 @@ pub fn Server(comptime IoType: type) type {
             // fresh page is never observed.
             for (server.upstream_head_buffers.slots, 0..) |*head_buffer, index| {
                 head_buffer.data =
-                    upstream_head_slab[index * options.head_buffer_bytes ..][0..options.head_buffer_bytes];
+                    upstream_head_slab[index * head_bytes ..][0..head_bytes];
             }
             // The serving path's canonicalization scratches (see the
             // fields): sized only where a head can exist to canonicalize.
@@ -738,7 +863,13 @@ pub fn Server(comptime IoType: type) type {
             assert(options.tunnels <= options.conn_slots);
             try server.tunnel_buffers.init(arena, options.tunnels);
             assert(server.tunnel_buffers.slots.len == options.tunnels);
-            try wireRelayHalves(arena, server.tunnel_buffers.slots, options.relay_buffer_bytes);
+            // Same element and same width as the shared pool; `budget.zig`
+            // prices both at the effective relay width.
+            try wireRelayHalves(
+                arena,
+                server.tunnel_buffers.slots,
+                server.config.effectiveRelayBufferBytes(),
+            );
         }
 
         /// The §4 engine pool and the one slab its plaintext destinations
@@ -784,6 +915,33 @@ pub fn Server(comptime IoType: type) type {
                 );
             }
             assert(server.tls_engines.slots.len == options.tls_engines);
+        }
+
+        /// The §4 upstream TLS engine pool: one slot per upstream
+        /// connection when any cluster dials TLS, and empty otherwise.
+        /// Unlike `initTlsEngines` there is no companion slab — an
+        /// `UpstreamTls` keeps its record, flight and outbox buffers
+        /// inline — so the pool's own slot array is the reservation.
+        fn initUpstreamTlsEngines(
+            server: *Self,
+            arena: std.mem.Allocator,
+        ) error{OutOfMemory}!void {
+            comptime assert(@sizeOf(UpstreamTls) <= constants.upstream_tls_engine_bytes_max);
+            var count: u32 = 0;
+            for (server.config.clusters) |cluster| {
+                if (cluster.tls != null) {
+                    count = server.config.limits.upstream_slots;
+                    break;
+                }
+            }
+            try server.upstream_tls_engines.init(arena, count);
+            // The two pools are one-to-one whenever a cluster dials TLS
+            // (`budget.zig` sizes them so), which is what lets a parked
+            // slot keep its engine without ever being unable to check one
+            // out. The wiring also gives `UpstreamPool.release` the one
+            // path that can hand an engine back after a direct release.
+            server.upstreams.ownTlsEnginePool(&server.upstream_tls_engines);
+            assert(server.upstream_tls_engines.slots.len == count);
         }
 
         /// The #140 capture table, sized by the config's named headers
@@ -884,9 +1042,34 @@ pub fn Server(comptime IoType: type) type {
         ///
         /// The table must outlive the server: every engine on a listener
         /// borrows that listener's entry for the session's life.
-        pub fn setTlsCredentials(server: *Self, credentials: []const ?Credentials) void {
+        pub fn setTlsCredentials(server: *Self, credentials: []const ?CredentialSet) void {
             assert(credentials.len == server.config.listeners.len);
             server.tls_credentials = credentials;
+            // `ListenerState` caches the pointer at `start`; a reload must
+            // move it too, or every new handshake keeps the old
+            // generation while the swap looks successful.
+            for (server.listeners[0..server.listeners_count], 0..) |*state, index| {
+                state.credentials = server.credentialsFor(index);
+            }
+        }
+
+        /// Hand over the per-cluster upstream TLS runtimes before `start`
+        /// (§4). Same split as `setTlsCredentials`: loading them reads
+        /// files, so `main` does it and this holds the table.
+        ///
+        /// An empty table is the no-upstream-TLS deployment; otherwise it
+        /// must be one entry per cluster, because a cluster index is what
+        /// `acquireUpstreamTlsEngine` draws from.
+        pub fn setClusterTls(server: *Self, runtimes: []const ?ClusterTls.Runtime) void {
+            assert(runtimes.len == 0 or runtimes.len == server.config.clusters.len);
+            server.cluster_tls = runtimes;
+        }
+
+        /// Install the application's certificate-reload callback. Called
+        /// after the access log reopens on SIGHUP; must be set before
+        /// `start` if rotation is wanted.
+        pub fn setSighupHook(server: *Self, hook: SighupHook) void {
+            server.sighup_hook = hook;
         }
 
         /// This listener's credentials, or null where it is plaintext or
@@ -894,7 +1077,7 @@ pub fn Server(comptime IoType: type) type {
         /// pointer is to the entry rather than to a copy: a `Credentials`
         /// holds a libcrypto key object, and two copies pointing at one
         /// key would be two owners of something with a single `deinit`.
-        fn credentialsFor(server: *Self, index: usize) ?*const Credentials {
+        fn credentialsFor(server: *Self, index: usize) ?*const CredentialSet {
             if (index >= server.tls_credentials.len) return null;
             if (server.tls_credentials[index]) |*entry| return entry;
             return null;
@@ -1025,6 +1208,12 @@ pub fn Server(comptime IoType: type) type {
             for (server.config.error_pages) |page| {
                 @memcpy(page.keep_date, now);
                 @memcpy(page.close_date, now);
+                // The gzip variants own separate `Date` slots and are
+                // selected on the same serving path, so a listener whose
+                // first static answer is compressed must not send the
+                // placeholder.
+                if (page.gzip_keep) |variant| @memcpy(variant.date, now);
+                if (page.gzip_close) |variant| @memcpy(variant.date, now);
             }
             // A `respond` action's page is shared with every other
             // reference to the same body and status (#159), so a page
@@ -1036,6 +1225,8 @@ pub fn Server(comptime IoType: type) type {
                             .respond => |page| {
                                 @memcpy(page.keep_date, now);
                                 @memcpy(page.close_date, now);
+                                if (page.gzip_keep) |variant| @memcpy(variant.date, now);
+                                if (page.gzip_close) |variant| @memcpy(variant.date, now);
                             },
                             else => {},
                         }
@@ -1092,10 +1283,17 @@ pub fn Server(comptime IoType: type) type {
                     .upgrades = listener_config.upgrades,
                     .max_body_bytes = listener_config.max_body_bytes,
                     .keepalive_requests = listener_config.keepalive_requests,
+                    .rate_limit = listener_config.rate_limit,
+                    .conn_limit_max = listener_config.conn_limit_max,
+                    .compress_min_bytes = listener_config.compress_min_bytes,
                     .request_filters = listener_config.request_filters,
+                    .waf = listener_config.waf,
                     .response_filters = listener_config.response_filters,
                     .forwarded = listener_config.forwarded,
+                    .forwarded_real_ip = listener_config.forwarded_real_ip,
+                    .forwarded_proto = listener_config.forwarded_proto,
                     .proxy_status = listener_config.proxy_status,
+                    .h3_advertise = listener_config.h3_advertise,
                     .proxy_protocol = listener_config.proxy_protocol,
                     .unix_bind = listener_config.bind_address == .unix,
                     .protocol = listener_config.protocol,
@@ -1509,7 +1707,10 @@ pub fn Server(comptime IoType: type) type {
         fn onSignal(server: *Self, signal: Io.Signal) void {
             switch (signal) {
                 .terminate => server.beginDrain(),
-                .reopen_log => server.access_log.requestReopen(),
+                .reopen_log => {
+                    server.access_log.requestReopen();
+                    if (server.sighup_hook) |hook| hook.reload(hook.context);
+                },
             }
         }
 
@@ -1595,8 +1796,12 @@ pub fn Server(comptime IoType: type) type {
             // but not to this enumeration is a leak nothing would report.
             assert(server.tunnel_buffers.isFullyReleased());
             // beginDrain reaped every parked slot synchronously and no
-            // conn is left to lease one, so the pool must be empty.
+            // conn is left to lease one, so the pool must be empty — and
+            // with it every engine those slots held, because a slot's
+            // engine rides its release. A non-empty engine pool here is a
+            // leaked session whose slot already looked released.
             assert(server.upstreams.isFullyReleased());
+            assert(server.upstream_tls_engines.isFullyReleased());
             // Every conn released its ring buffer on the way out, so the
             // in-use count the server owns must have followed to zero —
             // and every released or parked upstream let go of its head.
@@ -1692,6 +1897,10 @@ pub fn Server(comptime IoType: type) type {
                 server.relay_buffers.isFullyReleased() and
                 server.tunnel_buffers.isFullyReleased() and
                 server.upstreams.isFullyReleased() and
+                // An engine rides an upstream slot, so a slot pool that
+                // drained while its engine pool did not is the leak this
+                // pairing exists to catch.
+                server.upstream_tls_engines.isFullyReleased() and
                 server.upstream_head_buffers.isFullyReleased() and
                 server.head_buffers_in_use == 0 and
                 server.admin.isQuiescent() and
@@ -2028,12 +2237,19 @@ pub fn Server(comptime IoType: type) type {
             conn.routes = listener.routes;
             conn.sni_routes = listener.sni_routes;
             conn.request_filters = listener.request_filters;
+            conn.waf = listener.waf;
             conn.response_filters = listener.response_filters;
             conn.upgrades = listener.upgrades;
             conn.max_body_bytes = listener.max_body_bytes;
             conn.keepalive_requests = listener.keepalive_requests;
+            conn.rate_limit = listener.rate_limit;
+            conn.conn_limit_max = listener.conn_limit_max;
+            conn.compress_min_bytes = listener.compress_min_bytes;
             conn.forwarded = listener.forwarded;
+            conn.forwarded_real_ip = listener.forwarded_real_ip;
+            conn.forwarded_proto = listener.forwarded_proto;
             conn.proxy_status = listener.proxy_status;
+            conn.h3_advertise = listener.h3_advertise;
             // The exchange's starting cluster, from the same listener and
             // for the same reason as the tables above — the L7 path
             // overwrites it at routing once the head parses (§7).
@@ -2192,9 +2408,9 @@ pub fn Server(comptime IoType: type) type {
         /// a whole request or panics, so two calls would buy nothing.
         pub fn acquireTlsEngine(
             server: *Self,
-            credentials: *const Credentials,
+            credentials: *const CredentialSet,
         ) AcquireEngineError!*TlsEngine {
-            assert(credentials.chain.len >= 1);
+            assert(credentials.entries.len >= 1);
             const engine = server.tls_engines.acquire() orelse
                 return error.EnginesExhausted;
             var seeds: [64]u8 = undefined;
@@ -2202,7 +2418,8 @@ pub fn Server(comptime IoType: type) type {
             engine.init(&.{
                 .x25519_seed = seeds[0..32].*,
                 .random = seeds[32..64].*,
-                .credentials = credentials,
+                .credentials = CredentialSet.defaultCredentials(credentials),
+                .credential_selector = CredentialSet.selector(credentials),
                 // Only once a key is installed: before that the engine
                 // would offer resumption it could not honour, and every
                 // ticket it opened would be one it never sealed.
@@ -2230,6 +2447,59 @@ pub fn Server(comptime IoType: type) type {
         pub fn releaseTlsEngine(server: *Self, engine: *TlsEngine) void {
             engine.deinit();
             server.tls_engines.release(engine);
+        }
+
+        /// A client-side TLS engine for one upstream connection (§4),
+        /// initialized against the cluster's trust store, SNI name and
+        /// optional mTLS identity.
+        ///
+        /// Key material comes through the Io seam for the same reason the
+        /// listener engine's does: a seeded run has to replay the same
+        /// handshake, and zssl draws no entropy itself.
+        pub fn acquireUpstreamTlsEngine(
+            server: *Self,
+            cluster_index: u16,
+        ) AcquireEngineError!*UpstreamTls {
+            assert(cluster_index < server.cluster_tls.len);
+            assert(server.cluster_tls[cluster_index] != null);
+            const runtime = if (server.cluster_tls[cluster_index]) |*entry|
+                entry
+            else
+                unreachable;
+            const engine = server.upstream_tls_engines.acquire() orelse
+                return error.EnginesExhausted;
+            var seeds: [64]u8 = undefined;
+            server.io.fillRandom(&seeds);
+            // Local only for the call: `UpstreamTls.init` copies the
+            // context into the engine's own slot, so the pointer zssl
+            // keeps never outlives this frame.
+            var trust_context: ?TrustStore.Context = null;
+            if (runtime.trust) |*store| {
+                trust_context = .{
+                    .store = store,
+                    .server_name = runtime.server_name,
+                    .now_sec = @intCast(server.nowUnix()),
+                };
+            }
+            engine.init(&.{
+                .client_random = seeds[0..32].*,
+                .x25519_private = seeds[32..64].*,
+                .server_name = runtime.server_name,
+                .trust = if (trust_context) |*context| context else null,
+                .client_credentials = if (runtime.client_credentials) |*credentials|
+                    &credentials.inner
+                else
+                    null,
+            });
+            return engine;
+        }
+
+        /// The release pair, at the upstream slot's teardown. The engine
+        /// holds a session's keys, so it lives exactly as long as the
+        /// leased connection and is never returned mid-exchange.
+        pub fn releaseUpstreamTlsEngine(server: *Self, engine: *UpstreamTls) void {
+            engine.deinit();
+            server.upstream_tls_engines.release(engine);
         }
 
         /// The ring pair (§5): the bind side is the seam's — the kernel
@@ -2656,7 +2926,7 @@ pub fn Server(comptime IoType: type) type {
                 // origin never receives, so it stays uncounted.
                 conn.stream.log.bytes_in += leftover_len;
                 const direction = &conn.stream.directions[
-                    @intFromEnum(StreamType.Direction.client_to_upstream)
+                    @backingInt(StreamType.Direction.client_to_upstream)
                 ];
                 assert(direction.phase == .idle);
                 direction.phase = .receiving;
@@ -2817,7 +3087,7 @@ pub fn Server(comptime IoType: type) type {
             // to the backend.
             conn.stream.log.bytes_in += conn.stream.head_len;
             const direction = &conn.stream.directions[
-                @intFromEnum(StreamType.Direction.client_to_upstream)
+                @backingInt(StreamType.Direction.client_to_upstream)
             ];
             assert(direction.phase == .idle);
             direction.phase = .receiving;
@@ -3108,7 +3378,7 @@ pub fn Server(comptime IoType: type) type {
             // At the buffer's front, which is where `sendSlice` reads a
             // TLS direction's pending window from.
             const direction = &conn.stream.directions[
-                @intFromEnum(StreamType.Direction.client_to_upstream)
+                @backingInt(StreamType.Direction.client_to_upstream)
             ];
             assert(direction.phase == .idle);
             direction.phase = .receiving;
@@ -3184,7 +3454,7 @@ pub fn Server(comptime IoType: type) type {
                 .v2 => proxy_protocol.writeV2(&header_buffer, client_address, &local_address),
             };
             const direction = &conn.stream.directions[
-                @intFromEnum(StreamType.Direction.client_to_upstream)
+                @backingInt(StreamType.Direction.client_to_upstream)
             ];
             const staging = conn.stream.relay_buffer.?.client_to_upstream;
             const framed = direction.framed_len;
@@ -3407,7 +3677,10 @@ pub fn Server(comptime IoType: type) type {
             }
             // The leased upstream slot rides the same release rule: its
             // socket (if any) was closed by the caller, so the slot is
-            // inert (§5). Parking replaces this with reuse later.
+            // inert (§5). A slot that could be reused parked in
+            // `finishExchange` instead; reaching teardown means this one
+            // could not, and `releaseUpstream` returns a TLS engine with
+            // it either way.
             if (conn.stream.upstream) |leased| {
                 server.releaseUpstream(leased);
                 conn.stream.upstream = null;
@@ -3430,6 +3703,17 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.tunnel_buffer == null);
             assert(conn.stream.upstream == null);
             assert(conn.charged_endpoint == stream_module.LogState.endpoint_none);
+            // Return the client's connection count last, after every
+            // resource that could have kept this connection alive is
+            // gone: the count is the admission decision, so it must not
+            // drop below the cap while this slot is still occupied.
+            if (conn.conn_limit_counted) {
+                conn.conn_limit_counted = false;
+                if (conn.client_address) |address| {
+                    var client = address;
+                    server.conn_limit.release(&client);
+                }
+            }
         }
 
         /// Public for the relay: a completion delivered during teardown
@@ -3528,6 +3812,13 @@ pub fn Server(comptime IoType: type) type {
         pub fn logExchange(server: *Self, conn: *ConnType) void {
             if (server.access_log.sink == null) return;
             if (conn.stream.log.emitted) return;
+            // The matched route asked for no line. Mark the unit emitted
+            // so the teardown fallback does not reconsider it; counters
+            // and metrics took their own path and are untouched.
+            if (conn.stream.log.suppressed) {
+                conn.stream.log.emitted = true;
+                return;
+            }
             // Nothing was asked of this connection: an L7 slot that idled
             // out between requests, or one reaped before its first byte.
             // The monotonic stamp is the one that answers this, because it
@@ -3851,6 +4142,13 @@ pub fn Server(comptime IoType: type) type {
             if (leased.head_buffer != null) {
                 server.releaseUpstreamHeadBuffer(leased);
             }
+            // The upstream TLS engine rides the slot: `acquire` leaves it
+            // null and the dial side fills it in, so this one conditional
+            // covers both a plaintext exchange and a TLS one.
+            if (leased.tls) |engine| {
+                server.releaseUpstreamTlsEngine(engine);
+                leased.tls = null;
+            }
             server.upstreams.release(leased);
             server.updateUpstreamPressure();
         }
@@ -4137,6 +4435,24 @@ pub fn Server(comptime IoType: type) type {
                 server.storeDeadline(conn, server.config.idle_timeout_ms);
                 server.armDeadline(conn);
                 Proxy.beginExpiry(server, conn);
+                return;
+            }
+            if (conn.state == .l7_dialing and conn.stream.l7.pending_verdict == .none and
+                conn.stream.l7.upstream_tls_phase != .none)
+            {
+                // The connect is done and the upstream TLS handshake is in
+                // flight: exactly one data op is armed on the upstream
+                // socket (a send of staged ciphertext or a recv for the
+                // next flight). Force it the same way the exchange verdict
+                // does and let the completion answer 504, rather than
+                // asserting the connect bit this branch no longer holds.
+                assert(!conn.stream.armed.connect);
+                assert(conn.stream.armed.data_client_to_upstream or
+                    conn.stream.armed.data_upstream_to_client);
+                conn.stream.l7.pending_verdict = .gateway_timeout;
+                server.storeDeadline(conn, server.config.idle_timeout_ms);
+                server.armDeadline(conn);
+                server.io.shutdown(conn.stream.upstream_socket.?, .both);
                 return;
             }
             if (conn.state == .l7_dialing and conn.stream.l7.pending_verdict == .none) {

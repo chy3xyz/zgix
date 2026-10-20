@@ -1,8 +1,9 @@
 //! Per-listener TLS credentials (DESIGN.md §4): a PEM certificate chain
 //! and its private key, parsed once at startup into a form the engines of
-//! that listener share. One Credentials serves every handshake on the
-//! listener — the cert chain and the libcrypto signing key are built here,
-//! not per connection.
+//! that listener share. One Credentials is one entry in the listener's
+//! set; `CredentialSet` owns the set and selects an entry by SNI, so the
+//! chain and the libcrypto signing key are still built once, never per
+//! connection.
 //!
 //! ECDSA only. zssl's CertificateVerify offers no Ed25519 scheme, and RSA
 //! is excluded by the on-loop handshake budget: an RSA sign is ~1–2 ms,

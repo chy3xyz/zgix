@@ -20,6 +20,14 @@ processes behind `SO_REUSEPORT`, never threads sharing memory.
   for client stickiness
 - **Health checks** — active TCP or HTTP probes, per cluster
 - **Observability** — a Prometheus endpoint and a JSON access log
+- **HTTP/3** — experimental QUIC listeners (`h3_listeners`) proxying through a
+  plaintext-or-TLS HTTP/1.1 leg, observed like the TCP path: global
+  `zoxy_h3_*` counters (one verdict bucket per request, no-route
+  included) plus per-listener rows on the admin `/metrics` scrape;
+  host+path-prefix route table to plaintext or TLS clusters, with the upstream
+  leg keep-alive pooled (one parked connection per endpoint, reaped idle); an
+  `http` listener can advertise the UDP port per listener with `h3_advertise`
+  (`Alt-Svc`, RFC 7838)
 - **Bounded by construction** — every limit is a compile-time constant, and
   memory, file descriptors and ring depth are closed-form functions of them,
   printed at startup
@@ -82,13 +90,13 @@ topology; read the nightly report rather than any number quoted here.
 
 ### Requirements
 
-- **Zig 0.16** (pinned by [devenv](devenv.nix): `zig_0_16` + `zls`).
+- **Zig 0.17** (pinned by [devenv](devenv.nix): `zig_0_17` + `zls`).
 
 With [devenv](https://devenv.sh), `.envrc` activates the same shell
 automatically on `cd`:
 
 ```sh
-devenv shell                    # zig 0.16, zls, kcov
+devenv shell                    # zig 0.17, zls, kcov
 zig build                       # build zig-out/bin/zoxy
 zig build ci                    # the per-change gate: tests + lint + simulation + smoke
 zig build test                  # unit tests
@@ -97,6 +105,8 @@ zig build smoke                 # live gate: the real binary against a real orig
 zig build schema                # emit zig-out/config.schema.json
 zig build run -- config/example.json
 zig build bench                 # loopback bands: direct vs zoxy vs haproxy
+zig build h3-check              # experimental: compile/test the HTTP/3 stack
+zig build h3-serve              # standalone interop server (zoxy itself uses h3_listeners)
 ```
 
 Correctness rests on a deterministic simulator: the serving path is written

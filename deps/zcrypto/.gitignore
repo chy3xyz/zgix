@@ -1,0 +1,20 @@
+zig-cache/
+zig-out/
+.zig-cache/
+zig-pkg/
+*.o
+*.a
+*.exe
+*.log
+zig-out/**
+test_output.log
+libzcrypto.a
+CLAUDE.md
+tasks/
+.scratch/
+
+# Lab addresses for dev/platform_matrix.sh -- deployment detail, not source.
+dev/platform_hosts.conf
+# Written by dev/platform_matrix.sh so a remote host, which has no repository,
+# can still record which tree it built. Removed again once the snapshot is made.
+.zcrypto-origin

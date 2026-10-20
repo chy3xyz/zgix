@@ -1,0 +1,683 @@
+//! QUIC-specific cryptographic operations
+//! Implements RFC 9001 - Using TLS to Secure QUIC
+//! Optimized for high-performance packet processing
+
+const std = @import("std");
+const crypto = std.crypto;
+const testing = std.testing;
+
+const DerivedQuicKeys = struct {
+    key: [32]u8,
+    iv: [12]u8,
+    hp: [32]u8,
+};
+
+fn deriveQuicKeys(secret: *const [32]u8, cipher_suite: QuicCrypto.CipherSuite) !DerivedQuicKeys {
+    var derived: DerivedQuicKeys = .{
+        .key = std.mem.zeroes([32]u8),
+        .iv = std.mem.zeroes([12]u8),
+        .hp = std.mem.zeroes([32]u8),
+    };
+
+    const key_len = cipher_suite.keySize();
+    const hp_len: usize = switch (cipher_suite) {
+        .aes_128_gcm => 16,
+        .aes_256_gcm => 32,
+        .chacha20_poly1305 => 32,
+    };
+
+    QuicCrypto.HKDF.expandLabel(secret, QuicLabels.key, "", derived.key[0..key_len]);
+    QuicCrypto.HKDF.expandLabel(secret, QuicLabels.iv, "", &derived.iv);
+    QuicCrypto.HKDF.expandLabel(secret, QuicLabels.hp, "", derived.hp[0..hp_len]);
+
+    return derived;
+}
+
+pub const QuicCrypto = struct {
+    pub const Error = error{
+        InvalidKey,
+        InvalidNonce,
+        DecryptionFailed,
+        InsufficientBuffer,
+        UnsupportedCipher,
+    };
+
+    pub const CipherSuite = enum {
+        aes_128_gcm,
+        aes_256_gcm,
+        chacha20_poly1305,
+
+        pub fn keySize(self: CipherSuite) usize {
+            return switch (self) {
+                .aes_128_gcm => 16,
+                .aes_256_gcm => 32,
+                .chacha20_poly1305 => 32,
+            };
+        }
+
+        pub fn nonceSize(self: CipherSuite) usize {
+            return switch (self) {
+                .aes_128_gcm, .aes_256_gcm => 12,
+                .chacha20_poly1305 => 12,
+            };
+        }
+
+        pub fn tagSize(_: CipherSuite) usize {
+            return 16; // All QUIC AEAD ciphers use 16-byte tags
+        }
+    };
+
+    /// HKDF implementation for QUIC key derivation (RFC 5869)
+    pub const HKDF = struct {
+        pub fn extract(salt: []const u8, ikm: []const u8, prk: []u8) void {
+            std.debug.assert(prk.len == 32); // SHA-256 output size
+            crypto.auth.hmac.sha2.HmacSha256.create(prk[0..32], ikm, salt);
+        }
+
+        pub fn expand(prk: []const u8, info: []const u8, okm: []u8) void {
+            const n = (okm.len + 31) / 32; // Ceiling division for SHA-256
+            var t: [32]u8 = undefined;
+            var offset: usize = 0;
+
+            for (0..n) |i| {
+                var hmac = crypto.auth.hmac.sha2.HmacSha256.init(prk);
+                if (i > 0) {
+                    hmac.update(&t);
+                }
+                hmac.update(info);
+                hmac.update(&[_]u8{@intCast(i + 1)});
+                hmac.final(&t);
+
+                const copy_len = @min(32, okm.len - offset);
+                @memcpy(okm[offset .. offset + copy_len], t[0..copy_len]);
+                offset += copy_len;
+            }
+        }
+
+        /// QUIC-specific HKDF-Expand-Label (RFC 8446 Section 7.1)
+        pub fn expandLabel(secret: []const u8, label: []const u8, context: []const u8, out: []u8) void {
+            var info_buffer: [256]u8 = undefined;
+            var info_len: usize = 0;
+
+            // length (2 bytes)
+            info_buffer[info_len] = @intCast(out.len >> 8);
+            info_buffer[info_len + 1] = @intCast(out.len & 0xFF);
+            info_len += 2;
+
+            // label with "tls13 " prefix
+            const quic_label = "tls13 ";
+            info_buffer[info_len] = @intCast(quic_label.len + label.len);
+            info_len += 1;
+            @memcpy(info_buffer[info_len .. info_len + quic_label.len], quic_label);
+            info_len += quic_label.len;
+            @memcpy(info_buffer[info_len .. info_len + label.len], label);
+            info_len += label.len;
+
+            // context
+            info_buffer[info_len] = @intCast(context.len);
+            info_len += 1;
+            if (context.len > 0) {
+                @memcpy(info_buffer[info_len .. info_len + context.len], context);
+                info_len += context.len;
+            }
+
+            std.debug.assert(secret.len == 32);
+            crypto.kdf.hkdf.HkdfSha256.expand(out, info_buffer[0..info_len], secret[0..32].*);
+        }
+    };
+
+    /// Header protection for QUIC packets (RFC 9001 Section 5.4)
+    pub const HeaderProtection = struct {
+        cipher: CipherSuite,
+        key: [32]u8,
+
+        pub fn init(cipher: CipherSuite, key: []const u8) HeaderProtection {
+            const expected_len: usize = switch (cipher) {
+                .aes_128_gcm => 16,
+                .aes_256_gcm => 32,
+                .chacha20_poly1305 => 32,
+            };
+            std.debug.assert(key.len == expected_len);
+            var stored_key = std.mem.zeroes([32]u8);
+            @memcpy(stored_key[0..key.len], key);
+            return HeaderProtection{
+                .cipher = cipher,
+                .key = stored_key,
+            };
+        }
+
+        /// Generate protection mask from sample
+        pub fn createMask(self: HeaderProtection, sample: []const u8, mask: []u8) Error!void {
+            std.debug.assert(sample.len >= 16);
+            std.debug.assert(mask.len >= 5);
+
+            switch (self.cipher) {
+                .aes_128_gcm, .aes_256_gcm => {
+                    // AES-ECB encryption of sample
+                    var aes_mask: [16]u8 = undefined;
+                    if (self.cipher == .aes_128_gcm) {
+                        const aes = crypto.core.aes.Aes128.initEnc(self.key[0..16].*);
+                        aes.encrypt(&aes_mask, sample[0..16]);
+                    } else {
+                        const aes = crypto.core.aes.Aes256.initEnc(self.key[0..32].*);
+                        aes.encrypt(&aes_mask, sample[0..16]);
+                    }
+                    @memcpy(mask[0..5], aes_mask[0..5]);
+                },
+                .chacha20_poly1305 => {
+                    const counter = std.mem.readInt(u32, sample[0..4], .little);
+                    // RFC 9001 section 5.4.4 defines the mask as ChaCha20
+                    // applied to five zero bytes, so the input has to be zeroed.
+                    // It was `undefined` here and passed as both source and
+                    // destination, which made the mask the keystream XOR
+                    // whatever the stack held: not the RFC mask, so not
+                    // interoperable, and not even stable between two calls in
+                    // the same process once the safety fill is gone. That is
+                    // what broke the round trip in ReleaseFast.
+                    var chacha_mask: [64]u8 = @splat(0);
+                    const key_array: [32]u8 = self.key[0..32].*;
+                    const nonce_array: [12]u8 = sample[4..16].*;
+                    crypto.stream.chacha.ChaCha20IETF.xor(&chacha_mask, &chacha_mask, counter, key_array, nonce_array);
+                    @memcpy(mask[0..5], chacha_mask[0..5]);
+                },
+            }
+        }
+
+        /// Apply header protection to packet
+        pub fn apply(self: HeaderProtection, packet: []u8, sample_offset: usize) Error!void {
+            if (sample_offset + 16 > packet.len) return Error.InsufficientBuffer;
+
+            var mask: [5]u8 = undefined;
+            try self.createMask(packet[sample_offset .. sample_offset + 16], &mask);
+
+            // Apply mask to first byte and packet number
+            const mask_bits: u8 = if (packet[0] & 0x80 != 0) 0x0F else 0x1F;
+            const pn_length = (packet[0] & 0x03) + 1;
+            packet[0] ^= mask[0] & mask_bits;
+
+            for (0..pn_length) |i| {
+                if (1 + i < packet.len) {
+                    packet[1 + i] ^= mask[1 + i];
+                }
+            }
+        }
+
+        /// Remove header protection from packet
+        pub fn remove(self: HeaderProtection, packet: []u8, sample_offset: usize) Error!void {
+            // Same operation as apply (XOR is its own inverse)
+            try self.apply(packet, sample_offset);
+        }
+    };
+
+    /// Zero-copy AEAD operations for QUIC packet protection
+    pub const AEAD = struct {
+        cipher: CipherSuite,
+        key: [32]u8,
+
+        pub fn init(cipher: CipherSuite, key: []const u8) AEAD {
+            std.debug.assert(key.len == cipher.keySize());
+            var stored_key = std.mem.zeroes([32]u8);
+            @memcpy(stored_key[0..key.len], key);
+            return AEAD{
+                .cipher = cipher,
+                .key = stored_key,
+            };
+        }
+
+        /// Encrypt in-place with authentication
+        pub fn sealInPlace(self: AEAD, nonce: []const u8, plaintext: []u8, aad: []const u8, tag: []u8) Error!usize {
+            std.debug.assert(nonce.len == self.cipher.nonceSize());
+            std.debug.assert(tag.len >= self.cipher.tagSize());
+
+            switch (self.cipher) {
+                .aes_128_gcm => {
+                    const key_array: [16]u8 = self.key[0..16].*;
+                    const nonce_array: [12]u8 = nonce[0..12].*;
+                    crypto.aead.aes_gcm.Aes128Gcm.encrypt(plaintext, tag[0..16], plaintext, aad, nonce_array, key_array);
+                },
+                .aes_256_gcm => {
+                    const key_array: [32]u8 = self.key[0..32].*;
+                    const nonce_array: [12]u8 = nonce[0..12].*;
+                    crypto.aead.aes_gcm.Aes256Gcm.encrypt(plaintext, tag[0..16], plaintext, aad, nonce_array, key_array);
+                },
+                .chacha20_poly1305 => {
+                    const key_array: [32]u8 = self.key[0..32].*;
+                    const nonce_array: [12]u8 = nonce[0..12].*;
+                    crypto.aead.chacha_poly.ChaCha20Poly1305.encrypt(plaintext, tag[0..16], plaintext, aad, nonce_array, key_array);
+                },
+            }
+
+            return plaintext.len;
+        }
+
+        /// Decrypt in-place with authentication
+        pub fn openInPlace(self: AEAD, nonce: []const u8, ciphertext: []u8, aad: []const u8, tag: []const u8) Error!usize {
+            std.debug.assert(nonce.len == self.cipher.nonceSize());
+            std.debug.assert(tag.len >= self.cipher.tagSize());
+
+            switch (self.cipher) {
+                .aes_128_gcm => {
+                    const key_array: [16]u8 = self.key[0..16].*;
+                    const nonce_array: [12]u8 = nonce[0..12].*;
+                    const tag_array: [16]u8 = tag[0..16].*;
+                    crypto.aead.aes_gcm.Aes128Gcm.decrypt(ciphertext, ciphertext, tag_array, aad, nonce_array, key_array) catch {
+                        return Error.DecryptionFailed;
+                    };
+                },
+                .aes_256_gcm => {
+                    const key_array: [32]u8 = self.key[0..32].*;
+                    const nonce_array: [12]u8 = nonce[0..12].*;
+                    const tag_array: [16]u8 = tag[0..16].*;
+                    crypto.aead.aes_gcm.Aes256Gcm.decrypt(ciphertext, ciphertext, tag_array, aad, nonce_array, key_array) catch {
+                        return Error.DecryptionFailed;
+                    };
+                },
+                .chacha20_poly1305 => {
+                    const key_array: [32]u8 = self.key[0..32].*;
+                    const nonce_array: [12]u8 = nonce[0..12].*;
+                    const tag_array: [16]u8 = tag[0..16].*;
+                    crypto.aead.chacha_poly.ChaCha20Poly1305.decrypt(ciphertext, ciphertext, tag_array, aad, nonce_array, key_array) catch {
+                        return Error.DecryptionFailed;
+                    };
+                },
+            }
+
+            return ciphertext.len;
+        }
+    };
+
+    /// Batch processing for high-throughput scenarios
+    pub const BatchProcessor = struct {
+        aead: AEAD,
+        buffer_pool: [][]u8,
+        allocator: std.mem.Allocator,
+
+        pub fn init(allocator: std.mem.Allocator, aead: AEAD, max_packets: usize, max_packet_size: usize) !BatchProcessor {
+            const buffer_pool = try allocator.alloc([]u8, max_packets);
+            for (buffer_pool) |*buffer| {
+                buffer.* = try allocator.alloc(u8, max_packet_size);
+            }
+
+            return BatchProcessor{
+                .aead = aead,
+                .buffer_pool = buffer_pool,
+                .allocator = allocator,
+            };
+        }
+
+        pub fn deinit(self: *BatchProcessor) void {
+            for (self.buffer_pool) |buffer| {
+                self.allocator.free(buffer);
+            }
+            self.allocator.free(self.buffer_pool);
+        }
+
+        /// Process multiple packets in batch for improved performance
+        pub fn encryptBatch(self: *BatchProcessor, packets: [][]u8, nonces: [][]const u8, aads: [][]const u8) ![]usize {
+            std.debug.assert(packets.len == nonces.len);
+            std.debug.assert(packets.len == aads.len);
+            std.debug.assert(packets.len <= self.buffer_pool.len);
+
+            const results = try self.allocator.alloc(usize, packets.len);
+
+            for (packets, nonces, aads, results, 0..) |packet, nonce, aad, *result, i| {
+                var tag: [16]u8 = undefined;
+                result.* = try self.aead.sealInPlace(nonce, packet, aad, &tag);
+                // In real implementation, you'd append tag to packet
+                _ = i; // Suppress unused variable warning
+            }
+
+            return results;
+        }
+    };
+};
+
+// QUIC-specific key derivation labels (RFC 9001)
+pub const QuicLabels = struct {
+    pub const initial_salt = "38762cf7f55934b34d179ae6a4c80cadccbb7f0a";
+    pub const client_initial = "client in";
+    pub const server_initial = "server in";
+    pub const key = "quic key";
+    pub const iv = "quic iv";
+    pub const hp = "quic hp";
+    pub const ku = "quic ku";
+};
+
+/// SSH/QUIC secret derivation support (draft-denis-ssh-quic)
+/// Allows bypassing TLS handshake when SSH key exchange is used instead
+pub const SshQuicSecrets = struct {
+    client_secret: [32]u8,
+    server_secret: [32]u8,
+
+    /// Derive QUIC secrets from SSH shared secret (K) and exchange hash (H)
+    /// per draft-denis-ssh-quic specification
+    pub fn deriveFromSshSecret(
+        shared_secret_k: []const u8,
+        exchange_hash_h: []const u8,
+    ) SshQuicSecrets {
+        var client_secret: [32]u8 = undefined;
+        var server_secret: [32]u8 = undefined;
+
+        // Use HKDF with exchange hash as salt and shared secret as IKM
+        var prk: [32]u8 = undefined;
+        QuicCrypto.HKDF.extract(exchange_hash_h, shared_secret_k, &prk);
+
+        // Derive client and server secrets using SSH/QUIC labels
+        QuicCrypto.HKDF.expandLabel(&prk, "ssh quic client", "", &client_secret);
+        QuicCrypto.HKDF.expandLabel(&prk, "ssh quic server", "", &server_secret);
+
+        return SshQuicSecrets{
+            .client_secret = client_secret,
+            .server_secret = server_secret,
+        };
+    }
+
+    /// Create from pre-computed secrets (for external SSH key exchange)
+    pub fn fromSecrets(client_secret: [32]u8, server_secret: [32]u8) SshQuicSecrets {
+        return SshQuicSecrets{
+            .client_secret = client_secret,
+            .server_secret = server_secret,
+        };
+    }
+};
+
+// High-level QUIC crypto context
+pub const QuicConnection = struct {
+    allocator: std.mem.Allocator,
+    cipher_suite: QuicCrypto.CipherSuite,
+    client_secret: [32]u8,
+    server_secret: [32]u8,
+    iv: [12]u8,
+    header_protection: QuicCrypto.HeaderProtection,
+    aead: QuicCrypto.AEAD,
+    is_ssh_mode: bool = false,
+
+    /// Initialize from pre-computed secrets (SSH/QUIC mode or session resumption)
+    /// This bypasses TLS handshake and uses externally-derived secrets
+    pub fn initFromSecrets(
+        allocator: std.mem.Allocator,
+        client_secret: [32]u8,
+        server_secret: [32]u8,
+        cipher_suite: QuicCrypto.CipherSuite,
+        is_client: bool,
+    ) !QuicConnection {
+        // Use client or server secret depending on role
+        const active_secret = if (is_client) client_secret else server_secret;
+
+        const keys = try deriveQuicKeys(&active_secret, cipher_suite);
+
+        return QuicConnection{
+            .allocator = allocator,
+            .cipher_suite = cipher_suite,
+            .client_secret = client_secret,
+            .server_secret = server_secret,
+            .iv = keys.iv,
+            .header_protection = QuicCrypto.HeaderProtection.init(cipher_suite, &keys.hp),
+            .aead = QuicCrypto.AEAD.init(cipher_suite, &keys.key),
+            .is_ssh_mode = true,
+        };
+    }
+
+    /// Initialize from SSH/QUIC secrets
+    pub fn initFromSshSecrets(
+        allocator: std.mem.Allocator,
+        ssh_secrets: SshQuicSecrets,
+        cipher_suite: QuicCrypto.CipherSuite,
+        is_client: bool,
+    ) !QuicConnection {
+        return initFromSecrets(
+            allocator,
+            ssh_secrets.client_secret,
+            ssh_secrets.server_secret,
+            cipher_suite,
+            is_client,
+        );
+    }
+
+    pub fn initFromConnectionId(allocator: std.mem.Allocator, connection_id: []const u8, cipher_suite: QuicCrypto.CipherSuite) !QuicConnection {
+        // Derive initial secrets
+        var initial_salt: [20]u8 = undefined;
+        _ = std.fmt.hexToBytes(&initial_salt, QuicLabels.initial_salt) catch unreachable;
+
+        var initial_secret: [32]u8 = undefined;
+        QuicCrypto.HKDF.extract(&initial_salt, connection_id, &initial_secret);
+
+        var client_secret: [32]u8 = undefined;
+        var server_secret: [32]u8 = undefined;
+
+        QuicCrypto.HKDF.expandLabel(&initial_secret, QuicLabels.client_initial, "", &client_secret);
+        QuicCrypto.HKDF.expandLabel(&initial_secret, QuicLabels.server_initial, "", &server_secret);
+
+        const keys = try deriveQuicKeys(&client_secret, cipher_suite);
+
+        return QuicConnection{
+            .allocator = allocator,
+            .cipher_suite = cipher_suite,
+            .client_secret = client_secret,
+            .server_secret = server_secret,
+            .iv = keys.iv,
+            .header_protection = QuicCrypto.HeaderProtection.init(cipher_suite, &keys.hp),
+            .aead = QuicCrypto.AEAD.init(cipher_suite, &keys.key),
+        };
+    }
+
+    pub fn encryptPacket(self: *QuicConnection, packet: []u8, payload_len: usize, packet_number: u64) !usize {
+        if (payload_len == 0 or payload_len >= packet.len) return QuicCrypto.Error.InsufficientBuffer;
+
+        const ciphertext_end = 1 + payload_len;
+        const tag_end = ciphertext_end + self.cipher_suite.tagSize();
+        if (tag_end > packet.len) return QuicCrypto.Error.InsufficientBuffer;
+        if (tag_end < 20) return QuicCrypto.Error.InsufficientBuffer;
+
+        var nonce = self.iv;
+        var pn_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &pn_bytes, packet_number, .big);
+        for (0..8) |i| nonce[4 + i] ^= pn_bytes[i];
+
+        // Encrypt payload
+        var tag: [16]u8 = undefined;
+        _ = try self.aead.sealInPlace(&nonce, packet[1..ciphertext_end], packet[0..1], &tag);
+
+        // Append tag
+        @memcpy(packet[ciphertext_end..tag_end], &tag);
+
+        // Apply header protection
+        try self.header_protection.apply(packet[0..tag_end], tag_end - 16);
+
+        return tag_end;
+    }
+
+    pub fn decryptPacket(self: *QuicConnection, packet: []u8, packet_number: u64) !usize {
+        if (packet.len < 20) return QuicCrypto.Error.InsufficientBuffer;
+
+        // Remove header protection first
+        try self.header_protection.remove(packet, packet.len - 16 - 4);
+
+        var nonce = self.iv;
+        var pn_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &pn_bytes, packet_number, .big);
+        for (0..8) |i| nonce[4 + i] ^= pn_bytes[i];
+
+        // Decrypt payload
+        const tag = packet[packet.len - 16 ..];
+        const payload_len = try self.aead.openInPlace(&nonce, packet[1 .. packet.len - 16], packet[0..1], tag);
+
+        return 1 + payload_len;
+    }
+};
+
+// Tests
+test "HKDF extract and expand" {
+    const salt = "salt";
+    const ikm = "input key material";
+
+    var prk: [32]u8 = undefined;
+    QuicCrypto.HKDF.extract(salt, ikm, &prk);
+
+    var okm: [42]u8 = undefined;
+    QuicCrypto.HKDF.expand(&prk, "info", &okm);
+
+    // Basic sanity check - output should not be all zeros
+    var all_zeros = true;
+    for (okm) |byte| {
+        if (byte != 0) {
+            all_zeros = false;
+            break;
+        }
+    }
+    try testing.expect(!all_zeros);
+}
+
+test "AEAD seal and open" {
+    const key: [32]u8 = blk: {
+        var bytes = std.mem.zeroes([32]u8);
+        @memset(bytes[0..], 0x01);
+        break :blk bytes;
+    };
+    const nonce: [12]u8 = blk: {
+        var bytes = std.mem.zeroes([12]u8);
+        @memset(bytes[0..], 0x02);
+        break :blk bytes;
+    };
+    var plaintext = [_]u8{ 0x48, 0x65, 0x6c, 0x6c, 0x6f }; // "Hello"
+    const aad = "additional authenticated data";
+
+    const aead = QuicCrypto.AEAD.init(.chacha20_poly1305, &key);
+
+    var tag: [16]u8 = undefined;
+    _ = try aead.sealInPlace(&nonce, &plaintext, aad, &tag);
+
+    _ = try aead.openInPlace(&nonce, &plaintext, aad, &tag);
+
+    // Should decrypt back to original
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x48, 0x65, 0x6c, 0x6c, 0x6f }, &plaintext);
+}
+
+test "Header protection matches RFC 9001 A.5 mask" {
+    // The round-trip test below only proves apply/remove agree with each other,
+    // which stayed true while the mask itself was wrong. This vector is from
+    // RFC 9001 appendix A.5, so it fails if the mask stops matching what other
+    // QUIC implementations compute.
+    var hp_key: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&hp_key, "25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4");
+
+    var sample: [16]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&sample, "5e5cd55c41f69080575d7999c25a5bfb");
+
+    var expected: [5]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "aefefe7d03");
+
+    const hp = QuicCrypto.HeaderProtection.init(.chacha20_poly1305, &hp_key);
+
+    var mask: [5]u8 = undefined;
+    try hp.createMask(&sample, &mask);
+
+    try testing.expectEqualSlices(u8, &expected, &mask);
+}
+
+test "Header protection" {
+    const key: [32]u8 = blk: {
+        var bytes = std.mem.zeroes([32]u8);
+        @memset(bytes[0..], 0x03);
+        break :blk bytes;
+    };
+    const hp = QuicCrypto.HeaderProtection.init(.chacha20_poly1305, &key);
+
+    var packet = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01 } ++ std.mem.zeroes([20]u8);
+    const original_first_byte = packet[0];
+
+    try hp.apply(&packet, 5);
+    try testing.expect(packet[0] != original_first_byte);
+
+    try hp.remove(&packet, 5);
+    try testing.expectEqual(original_first_byte, packet[0]);
+}
+
+test "SSH/QUIC secret derivation" {
+    // Simulate SSH shared secret K and exchange hash H
+    const shared_secret_k = "test-ssh-shared-secret-key-32b!";
+    const exchange_hash_h = "test-exchange-hash-for-ssh-quic";
+
+    // Derive QUIC secrets from SSH key exchange
+    const ssh_secrets = SshQuicSecrets.deriveFromSshSecret(shared_secret_k, exchange_hash_h);
+
+    // Client and server secrets should be different
+    try testing.expect(!std.mem.eql(u8, &ssh_secrets.client_secret, &ssh_secrets.server_secret));
+
+    // Secrets should not be all zeros
+    var client_all_zeros = true;
+    for (ssh_secrets.client_secret) |byte| {
+        if (byte != 0) {
+            client_all_zeros = false;
+            break;
+        }
+    }
+    try testing.expect(!client_all_zeros);
+}
+
+test "QuicConnection from SSH secrets" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Create SSH-derived secrets
+    const client_secret: [32]u8 = blk: {
+        var bytes = std.mem.zeroes([32]u8);
+        @memset(bytes[0..], 0x11);
+        break :blk bytes;
+    };
+    const server_secret: [32]u8 = blk: {
+        var bytes = std.mem.zeroes([32]u8);
+        @memset(bytes[0..], 0x22);
+        break :blk bytes;
+    };
+
+    // Initialize QUIC connection from pre-computed secrets (SSH mode)
+    const client_conn = try QuicConnection.initFromSecrets(
+        allocator,
+        client_secret,
+        server_secret,
+        .chacha20_poly1305,
+        true, // is_client
+    );
+
+    const server_conn = try QuicConnection.initFromSecrets(
+        allocator,
+        client_secret,
+        server_secret,
+        .chacha20_poly1305,
+        false, // is_server
+    );
+
+    // Both should be in SSH mode
+    try testing.expect(client_conn.is_ssh_mode);
+    try testing.expect(server_conn.is_ssh_mode);
+
+    // Secrets should be stored correctly
+    try testing.expectEqualSlices(u8, &client_secret, &client_conn.client_secret);
+    try testing.expectEqualSlices(u8, &server_secret, &server_conn.server_secret);
+}
+
+test "QuicConnection encrypts packet with reserved tag space" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const connection_id = [_]u8{ 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0 };
+    var conn = try QuicConnection.initFromConnectionId(allocator, &connection_id, .chacha20_poly1305);
+
+    var packet: [64]u8 = undefined;
+    @memset(&packet, 0);
+    packet[0] = 0x40;
+
+    const payload = blk: {
+        var bytes = std.mem.zeroes([32]u8);
+        @memset(bytes[0..], 0x42);
+        break :blk bytes;
+    };
+    @memcpy(packet[1 .. 1 + payload.len], &payload);
+
+    const encrypted_len = try conn.encryptPacket(packet[0..], payload.len, 42);
+    try testing.expect(encrypted_len == 1 + payload.len + 16);
+    try testing.expect(!std.mem.eql(u8, &payload, packet[1 .. 1 + payload.len]));
+}

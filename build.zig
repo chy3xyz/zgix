@@ -21,7 +21,7 @@ fn guardNativeLibc(b: *std.Build, target: std.Build.ResolvedTarget, libcrypto: *
     if (!target.query.isNative()) return;
     // An explicit libc description answers the same question `cc` would.
     if (b.graph.environ_map.get("ZIG_LIBC") != null) return;
-    if (b.findProgram(&.{ "cc", "gcc", "clang" }, &.{})) |_| return else |_| {}
+    if (b.findProgram(.{ .names = &.{ "cc", "gcc", "clang" } })) |_| return else {}
 
     libcrypto.step.dependOn(&b.addFail(
         \\no C compiler on PATH, so Zig cannot detect this machine's libc.
@@ -35,6 +35,117 @@ fn guardNativeLibc(b: *std.Build, target: std.Build.ResolvedTarget, libcrypto: *
         \\once and let it load. Cross-compiling (-Dtarget=...) needs none of
         \\this, and ZIG_LIBC overrides the check if you know better.
     ).step);
+}
+
+const H3Modules = struct {
+    zquic: *std.Build.Module,
+    qtls: *std.Build.Module,
+    qpack: *std.Build.Module,
+};
+
+/// The HTTP/3 dependency surface, built at one optimize mode. Both the
+/// default build and the ReleaseSafe twin need their own module objects
+/// (a module is bound to one optimize mode), so this is one definition
+/// rather than two copies that could drift.
+///
+/// Seam invariant, as of upstream TLS: the h3 modules may import zssl —
+/// the h3 proxy reaches the process's own upstream TLS client engine
+/// (`src/tls/UpstreamTls.zig`, file-relatively) so a cluster's `tls` block
+/// means one thing on both protocols, and each consumer module (`zoxy`,
+/// `h3-check`, `h3-serve`) declares the zssl import itself. What the seam
+/// must still not import is everything else zoxy-side that drags the
+/// serving path: hparse, the counters/access-log modules, config, Server.
+fn createH3Modules(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    zhttp_h2_module: *std.Build.Module,
+    libssl: *std.Build.Step.Compile,
+) H3Modules {
+    const openssl_c_module = b.createModule(.{
+        .root_source_file = b.path("vendor/zhttp/src/openssl_c.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    openssl_c_module.linkLibrary(libssl);
+    const qtls_module = b.createModule(.{
+        .root_source_file = b.path("vendor/zhttp/src/h3/native/qtls.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "openssl_c", .module = openssl_c_module },
+        },
+    });
+    qtls_module.linkLibrary(libssl);
+    // zhttp's RFC 9204 QPACK codec: a real static/dynamic decoder and a
+    // static-table encoder, replacing the vendor's toy QPACK for HTTP/3
+    // interop. Its Huffman codec is the h2 module's, shared by name.
+    const qpack_module = b.createModule(.{
+        .root_source_file = b.path("vendor/zhttp/src/qpack_export.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zhttp-h2", .module = zhttp_h2_module },
+        },
+    });
+
+    // zquic's QUIC/HTTP-3 core plus its zcrypto dependency. It is linked
+    // into the binary only because `zoxy.http.h3` is reachable from
+    // `main`; the library's other serving paths never import it.
+    const zcrypto_options = b.addOptions();
+    zcrypto_options.addOption([]const u8, "version", "1.0.7");
+    zcrypto_options.addOption(bool, "enable_tls", true);
+    zcrypto_options.addOption(bool, "enable_post_quantum", false);
+    zcrypto_options.addOption(bool, "enable_hardware_accel", true);
+    zcrypto_options.addOption(bool, "enable_blockchain", false);
+    zcrypto_options.addOption(bool, "enable_vpn", false);
+    zcrypto_options.addOption(bool, "enable_wasm", false);
+    zcrypto_options.addOption(bool, "enable_enterprise", false);
+    zcrypto_options.addOption(bool, "enable_zkp", false);
+    zcrypto_options.addOption(bool, "enable_async", false);
+    zcrypto_options.addOption(bool, "enable_tpm", false);
+    zcrypto_options.addOption(bool, "enable_pkcs11", false);
+    zcrypto_options.addOption(bool, "enable_secure_enclave", false);
+    zcrypto_options.addOption(bool, "allow_experimental_crypto", false);
+    zcrypto_options.addOption(bool, "allow_insecure_options", false);
+    zcrypto_options.addOption(bool, "api_surface_control", false);
+    const zcrypto_module = b.createModule(.{
+        .root_source_file = b.path("deps/zcrypto/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "build_options", .module = zcrypto_options.createModule() },
+        },
+    });
+    const zquic_options = b.addOptions();
+    zquic_options.addOption([]const u8, "version", "0.9.18");
+    zquic_options.addOption(bool, "enable_http3", true);
+    zquic_options.addOption(bool, "enable_doq", false);
+    zquic_options.addOption(bool, "enable_vpn", false);
+    zquic_options.addOption(bool, "enable_services", false);
+    zquic_options.addOption(bool, "enable_post_quantum", false);
+    zquic_options.addOption(bool, "enable_experimental_crypto", false);
+    zquic_options.addOption(bool, "enable_monitoring", false);
+    // zquic's feature modules import `zquic_core`; its own build.zig does
+    // not declare that name. The vendored copy points those three imports
+    // at `core.zig` directly (recorded in PROVENANCE), so no alias module
+    // is needed here.
+    const zquic_module = b.createModule(.{
+        .root_source_file = b.path("vendor/zquic/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "build_options", .module = zquic_options.createModule() },
+            .{ .name = "zcrypto", .module = zcrypto_module },
+        },
+    });
+    return .{
+        .zquic = zquic_module,
+        .qtls = qtls_module,
+        .qpack = qpack_module,
+    };
 }
 
 pub fn build(b: *std.Build) void {
@@ -86,7 +197,7 @@ pub fn build(b: *std.Build) void {
         "link the executable statically, libcrypto included (release artifacts)",
     ) orelse false;
 
-    // libxev is pinned by content hash to the zoxy-io fork's
+    // libxev is vendored under deps/libxev at the zoxy-io fork's
     // zoxy-ring-flags branch: the audited upstream snapshot plus the
     // setup-flags commit (DESIGN.md §4); see build.zig.zon. The pin moves
     // only after re-audit.
@@ -96,19 +207,20 @@ pub fn build(b: *std.Build) void {
     });
     const xev_module = xev_dependency.module("xev");
 
-    // hparse — the hardened head-parser fork — is pinned by content hash
-    // to an audited zoxy-io/hparse commit (DESIGN.md §7); the pin moves
-    // only after re-audit. Only src/http/parser.zig may import it (lint-
-    // enforced): that wrapper owns every strictness and framing decision.
+    // hparse — the hardened head-parser fork — is vendored under
+    // deps/hparse at the audited zoxy-io/hparse commit (DESIGN.md §7); the
+    // copy moves only after re-audit. Only src/http/parser.zig may import
+    // it (lint-enforced): that wrapper owns every strictness and framing
+    // decision.
     const hparse_dependency = b.dependency("hparse", .{
         .target = target,
         .optimize = optimize,
     });
     const hparse_module = hparse_dependency.module("hparse");
 
-    // zssl — the TLS 1.3 engine (DESIGN.md §4) — is pinned by content
-    // hash; see build.zig.zon for why it replaced the ztls fork. Only
-    // src/tls/ may import it (lint-enforced). It is a Zig protocol layer
+    // zssl — the TLS 1.3 engine (DESIGN.md §4) — is vendored under
+    // deps/zssl at the audited commit; see build.zig.zon for why it
+    // replaced the ztls fork. Only src/tls/ may import it (lint-enforced). It is a Zig protocol layer
     // over libcrypto primitives, which is why every build below links
     // libcrypto: the §4 crypto-primitives exception, and the codebase's one
     // C surface.
@@ -152,7 +264,7 @@ pub fn build(b: *std.Build) void {
     libcrypto.root_module.sanitize_c = .off;
     const openssl_fast_dependency = b.dependency("openssl", .{
         .target = target,
-        .optimize = std.builtin.OptimizeMode.ReleaseSafe,
+        .optimize = std.builtin.OptimizeMode.safe,
     });
     const libcrypto_fast = openssl_fast_dependency.artifact("crypto");
     // Same reason, and this is the archive that matters most: the twin
@@ -170,6 +282,27 @@ pub fn build(b: *std.Build) void {
     const zssl_module = zssl_dependency.module("zssl");
     zssl_module.linkLibrary(libcrypto);
 
+    // zhttp's pure HTTP/2 codec, vendored under vendor/zhttp (§4/§7).
+    // Only `src/h2` is compiled: frames, HPACK/Huffman, settings, flow
+    // control and the stream registry. The upstream server/client loops
+    // are Io-driven and do not fit this proxy's sans-I/O pump, so they
+    // stay unbuilt.
+    const zhttp_h2_module = b.createModule(.{
+        .root_source_file = b.path("vendor/zhttp/src/h2/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // QUIC-TLS through OpenSSL's `SSL_set_quic_tls_cbs` (3.5+), taken from
+    // the same vendored zhttp tree. libssl is built by the openssl package
+    // beside libcrypto; the default binary links it because `main` wires
+    // the HTTP/3 listener.
+    const libssl = openssl_dependency.artifact("ssl");
+    const h3 = createH3Modules(b, target, optimize, zhttp_h2_module, libssl);
+    const qtls_module = h3.qtls;
+    const qpack_module = h3.qpack;
+    const zquic_module = h3.zquic;
+
     const zoxy_module = b.addModule("zoxy", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -178,9 +311,20 @@ pub fn build(b: *std.Build) void {
             .{ .name = "xev", .module = xev_module },
             .{ .name = "hparse", .module = hparse_module },
             .{ .name = "zssl", .module = zssl_module },
+            .{ .name = "zhttp-h2", .module = zhttp_h2_module },
+            // HTTP/3 is reachable as `zoxy.http.h3`; the imports are
+            // declared here so an application can opt into it without a
+            // second copy of these files. Zig analyzes the h3 seam only
+            // when a build references that declaration.
+            .{ .name = "zquic", .module = zquic_module },
+            .{ .name = "qtls", .module = qtls_module },
+            .{ .name = "qpack", .module = qpack_module },
         },
     });
     linkLibcrypto(zoxy_module, libcrypto);
+    // The h3 seam's QUIC-TLS bridge calls libssl; attached to the module
+    // so any consumer that reaches `zoxy.http.h3` links it.
+    zoxy_module.linkLibrary(libssl);
     // `src/io/XevIo.zig` reads the backend choice from here.
     zoxy_module.addOptions("io_options", io_options);
     // The shipped example config is embedded so tests and the fuzz corpus
@@ -213,9 +357,7 @@ pub fn build(b: *std.Build) void {
 
     const run_command = b.addRunArtifact(exe);
     run_command.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_command.addArgs(args);
-    }
+    run_command.addPassthruArgs();
     const run_step = b.step("run", "Run zoxy");
     run_step.dependOn(&run_command.step);
 
@@ -237,6 +379,67 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&module_tests.step);
     test_step.dependOn(&exe_tests.step);
     test_step.dependOn(&lint_tests.step);
+
+    // Experimental HTTP/3 seam: compiles zquic's QUIC/HTTP-3 core and its
+    // zcrypto dependency under this tree, and runs the seam's tests —
+    // now including the h3 proxy's upstream-TLS suites, which reach the
+    // process's zssl client engine (`src/tls/UpstreamTls.zig`) and so
+    // need the zssl import and libcrypto link here. Deliberately outside
+    // `test`/`ci` — nothing the HTTP/1.1 proxy serves reaches it — but
+    // kept runnable so the dependency surface does not rot.
+    const h3_seam_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/h3_check.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zquic", .module = zquic_module },
+                .{ .name = "qtls", .module = qtls_module },
+                .{ .name = "qpack", .module = qpack_module },
+                .{ .name = "zssl", .module = zssl_module },
+                .{ .name = "xev", .module = xev_module },
+                .{ .name = "io_options", .module = io_options.createModule() },
+            },
+        }),
+    });
+    linkLibcrypto(h3_seam_tests.root_module, libcrypto);
+    h3_seam_tests.root_module.linkLibrary(libssl);
+    const run_h3_seam_tests = b.addRunArtifact(h3_seam_tests);
+    const h3_check_step = b.step(
+        "h3-check",
+        "Compile and test the experimental HTTP/3 seam (zquic, h3 proxy)",
+    );
+    h3_check_step.dependOn(&run_h3_seam_tests.step);
+    // Experimental live HTTP/3 server for real-client interop. Not part of
+    // the proxy or the `ci` gate; `zig build h3-serve` builds it and
+    // `zig-out/bin/h3-serve` answers every request with a fixed 200.
+    const h3_serve_module = b.createModule(.{
+        .root_source_file = b.path("src/h3_serve.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "zquic", .module = zquic_module },
+            .{ .name = "qtls", .module = qtls_module },
+            .{ .name = "qpack", .module = qpack_module },
+            .{ .name = "zssl", .module = zssl_module },
+            .{ .name = "xev", .module = xev_module },
+            .{ .name = "io_options", .module = io_options.createModule() },
+        },
+    });
+    linkLibcrypto(h3_serve_module, libcrypto);
+    h3_serve_module.linkLibrary(libssl);
+    const h3_serve_exe = b.addExecutable(.{
+        .name = "h3-serve",
+        .root_module = h3_serve_module,
+    });
+    const h3_serve_install = b.addInstallArtifact(h3_serve_exe, .{});
+    b.getInstallStep().dependOn(&h3_serve_install.step);
+    const h3_serve_step = b.step("h3-serve", "Build the experimental live HTTP/3 server");
+    // The step installs too: `zig build h3-serve` must leave a fresh
+    // binary in zig-out/bin, or a developer re-runs an older one and
+    // reads its behaviour as this build's.
+    h3_serve_step.dependOn(&h3_serve_install.step);
 
     // The fixed libcrypto heap (§4, §5): its own step, and the one TLS
     // test that cannot ride the main test binary. The allocation hooks
@@ -274,9 +477,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const sim_run = b.addRunArtifact(sim_exe);
-    if (b.args) |args| {
-        sim_run.addArgs(args);
-    }
+    sim_run.addPassthruArgs();
     const sim_step = b.step("sim", "Deterministic simulation: -- [seed] [iterations] | fuzz");
     sim_step.dependOn(&sim_run.step);
 
@@ -338,30 +539,29 @@ pub fn build(b: *std.Build) void {
     const smoke_run = b.addRunArtifact(smoke_exe);
     smoke_run.addArg("--zoxy");
     smoke_run.addArtifactArg(exe);
-    if (b.args) |args| {
-        smoke_run.addArgs(args);
-    }
+    smoke_run.addPassthruArgs();
     const smoke_step = b.step("smoke", "Tier-0.5 live gate: the real binary against a live origin");
     smoke_step.dependOn(&smoke_run.step);
 
-    // §9 Tier 1: the loopback band harness embeds zrk (pinned by hash) as
+    // §9 Tier 1: the loopback band harness embeds zrk (vendored under
+    // deps/zrk) as
     // its load generator — that role stays ReleaseFast regardless of what
     // zoxy itself ships as; it isn't the thing under test, it just needs
     // to generate load fast enough not to be the bottleneck.
     const zrk_dependency = b.dependency("zrk", .{
         .target = target,
-        .optimize = std.builtin.OptimizeMode.ReleaseFast,
+        .optimize = std.builtin.OptimizeMode.fast,
     });
     // zrk embeds its load off a zio (io_uring) runtime rather than the
     // default std.Io.Threaded backend, so the harness must build its own
     // zio.Runtime to drive zrk's runner (bench/run.zig, bench/profile.zig).
     const zio_dependency = b.dependency("zio", .{
         .target = target,
-        .optimize = std.builtin.OptimizeMode.ReleaseFast,
+        .optimize = std.builtin.OptimizeMode.fast,
     });
     // The zoxy under test is ReleaseSafe — matching the shipped binary
     // (release.yml) — whatever -Doptimize says for the default install.
-    // ReleaseSafe still selects the LLVM backend (Zig 0.16's default for
+    // ReleaseSafe still selects the LLVM backend (Zig 0.17's default for
     // every release mode, not just ReleaseFast), so hparse's SIMD paths
     // are emitted; only a Debug/self-hosted zoxy scalarizes them and
     // would benchmark the wrong code. hparse_fast_dependency keeps its
@@ -369,24 +569,42 @@ pub fn build(b: *std.Build) void {
     // though it's no longer the *fastest* build mode.
     const hparse_fast_dependency = b.dependency("hparse", .{
         .target = target,
-        .optimize = std.builtin.OptimizeMode.ReleaseSafe,
+        .optimize = std.builtin.OptimizeMode.safe,
     });
     const zssl_fast_dependency = b.dependency("zssl", .{
         .target = target,
-        .optimize = std.builtin.OptimizeMode.ReleaseSafe,
+        .optimize = std.builtin.OptimizeMode.safe,
     });
     zssl_fast_dependency.module("zssl").linkLibrary(libcrypto_fast);
+    // The ReleaseSafe twin of the vendored h2 codec, on the same terms as
+    // the zssl module above: a module object is bound to one optimize
+    // mode, so the twin gets its own.
+    const zhttp_h2_fast_module = b.createModule(.{
+        .root_source_file = b.path("vendor/zhttp/src/h2/root.zig"),
+        .target = target,
+        .optimize = .safe,
+    });
+    // The ReleaseSafe twin of the HTTP/3 surface. Its libssl must be the
+    // same-optimize artifact as libcrypto_fast; the two are linked
+    // together by the OpenSSL package.
+    const libssl_fast = openssl_fast_dependency.artifact("ssl");
+    const h3_fast = createH3Modules(b, target, .safe, zhttp_h2_fast_module, libssl_fast);
     const zoxy_fast_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .imports = &.{
             .{ .name = "xev", .module = xev_module },
             .{ .name = "hparse", .module = hparse_fast_dependency.module("hparse") },
             .{ .name = "zssl", .module = zssl_fast_dependency.module("zssl") },
+            .{ .name = "zhttp-h2", .module = zhttp_h2_fast_module },
+            .{ .name = "zquic", .module = h3_fast.zquic },
+            .{ .name = "qtls", .module = h3_fast.qtls },
+            .{ .name = "qpack", .module = h3_fast.qpack },
         },
     });
     linkLibcrypto(zoxy_fast_module, libcrypto_fast);
+    zoxy_fast_module.linkLibrary(libssl_fast);
     // The ReleaseSafe twin of the library module needs the same backend
     // choice: it is the same `src/root.zig`, so `XevIo` asks it the same
     // question.
@@ -396,7 +614,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .imports = &.{
                 .{ .name = "zoxy", .module = zoxy_fast_module },
             },
@@ -422,9 +640,7 @@ pub fn build(b: *std.Build) void {
     const smoke_release_run = b.addRunArtifact(smoke_exe);
     smoke_release_run.addArg("--zoxy");
     smoke_release_run.addArtifactArg(release_zoxy);
-    if (b.args) |args| {
-        smoke_release_run.addArgs(args);
-    }
+    smoke_release_run.addPassthruArgs();
     smoke_release_run.step.dependOn(&smoke_run.step);
     const smoke_release_step = b.step(
         "smoke-release",
@@ -439,7 +655,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("bench/run.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .imports = &.{
                 .{ .name = "zrk", .module = zrk_dependency.module("zrk") },
                 .{ .name = "zio", .module = zio_dependency.module("zio") },
@@ -452,9 +668,7 @@ pub fn build(b: *std.Build) void {
     // binary (§9). bench/run.zig takes it via --zoxy.
     bench_run.addArg("--zoxy");
     bench_run.addArtifactArg(release_zoxy);
-    if (b.args) |args| {
-        bench_run.addArgs(args);
-    }
+    bench_run.addPassthruArgs();
     const bench_step = b.step(
         "bench",
         "Tier-1 loopback bands: -- [--rate N] [--seconds N] [--origin host:port]",
@@ -467,12 +681,15 @@ pub fn build(b: *std.Build) void {
     // (SIMD parser included) matches the shipped binary, checks and all.
     const micro_step = b.step("bench-micro", "Build Tier-0 micro binaries for poop A/B");
     for ([_][]const u8{ "pool_acquire_release", "relay_chunking", "l7_head_pipeline", "conn_touch_scaling" }) |micro_name| {
+        // This one drives std.os.linux directly and is the production
+        // target's measurement; it has no macOS build.
+        if (std.mem.eql(u8, micro_name, "conn_touch_scaling") and target.result.os.tag != .linux) continue;
         const micro_exe = b.addExecutable(.{
             .name = b.fmt("zoxy-bench-{s}", .{micro_name}),
             .root_module = b.createModule(.{
                 .root_source_file = b.path(b.fmt("bench/micro/{s}.zig", .{micro_name})),
                 .target = target,
-                .optimize = .ReleaseSafe,
+                .optimize = .safe,
                 .imports = &.{
                     .{ .name = "zoxy", .module = zoxy_fast_module },
                 },
@@ -494,7 +711,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("bench/profile.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .imports = &.{
                 .{ .name = "zrk", .module = zrk_dependency.module("zrk") },
                 .{ .name = "zio", .module = zio_dependency.module("zio") },
@@ -536,14 +753,14 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zoxy_constants", .module = b.createModule(.{
                     .root_source_file = b.path("src/constants.zig"),
                     .target = target,
-                    .optimize = .ReleaseFast,
+                    .optimize = .fast,
                 }) },
             },
         }),
     });
     const profile_run = b.addRunArtifact(profile_harness);
     profile_run.addArtifactArg(release_zoxy);
-    if (b.args) |args| profile_run.addArgs(args);
+    profile_run.addPassthruArgs();
     const profile_step = b.step(
         "profile",
         "Pinned perf + flamegraph of zoxy under load (Linux; needs the dev shell)",
@@ -627,16 +844,22 @@ pub fn build(b: *std.Build) void {
 
     // Absolute src root: kcov filters recorded files by this prefix, and the
     // cobertura patch below rewrites it back to the repo-relative "src".
-    const src_abs = b.path("src").getPath(b);
-    const include_arg = b.fmt("--include-path={s}", .{src_abs});
-
+    // `Cache.Path` keeps the build root as a directory plus a sub-path, so
+    // resolve through `b.root` rather than the process working directory.
+    const src_abs = b.pathResolve(&.{ b.root.sub_path, "src" });
     const kcov_tests = b.addSystemCommand(&.{"kcov"});
-    kcov_tests.addArg(include_arg);
+    kcov_tests.addDirectoryArg2(b.path("src"), .{
+        .prefix = "--include-path=",
+        .make_absolute = true,
+    });
     const tests_cov = kcov_tests.addOutputDirectoryArg("cov-tests");
     kcov_tests.addArtifactArg(cov_tests);
 
     const kcov_sim = b.addSystemCommand(&.{"kcov"});
-    kcov_sim.addArg(include_arg);
+    kcov_sim.addDirectoryArg2(b.path("src"), .{
+        .prefix = "--include-path=",
+        .make_absolute = true,
+    });
     const sim_cov = kcov_sim.addOutputDirectoryArg("cov-sim");
     kcov_sim.addArtifactArg(cov_sim);
     kcov_sim.addArgs(&.{ "0", "150" });

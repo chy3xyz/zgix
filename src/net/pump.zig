@@ -27,7 +27,7 @@
 //! Optional Policy decls (skipped when absent):
 //!   beforeRecv(conn) / beforeSend(conn)   pre-arm bookkeeping (flags, phase)
 //!   onRecvEntry(conn)                     post-await recv invariant re-checks
-//!   afterFeed(conn, received, fr)         e.g. pipelined-tail detection
+//!   afterFeed(conn, chunk_len, fr)        e.g. pipelined-tail detection
 //!   afterSend(conn, sent)                 e.g. access-log byte accounting
 //!   onSendEntry(server, conn) bool        divert a settled verdict; true = handled
 //!   recvBuffer(conn) []u8                 where a read lands
@@ -134,7 +134,7 @@ pub fn Pump(
         }
 
         fn directionState(conn: *ConnType) *stream_module.DirectionState {
-            return &conn.stream.directions[@intFromEnum(direction)];
+            return &conn.stream.directions[@backingInt(direction)];
         }
 
         fn buffer(conn: *ConnType) []u8 {
@@ -279,7 +279,14 @@ pub fn Pump(
                 server.beginTeardown(conn);
                 return;
             }
-            if (@hasDecl(Policy, "afterFeed")) Policy.afterFeed(conn, received, fr);
+            // The framed source's chunk, not the socket delivery: on a
+            // transforming leg those differ by the transform's overhead
+            // (ciphertext vs plaintext), and a policy comparing `consumed`
+            // against wire bytes would see a pipelined tail in every
+            // fragmented record.
+            if (@hasDecl(Policy, "afterFeed")) {
+                Policy.afterFeed(conn, @intCast(chunk.len), fr);
+            }
             const state = directionState(conn);
             state.owe(fr.consumed);
             if (state.owed() >= 1) {

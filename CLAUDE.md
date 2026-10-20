@@ -1,6 +1,6 @@
 # zoxy
 
-Bullet-proof L4/L7 proxy in Zig 0.16 (toolchain pinned via devenv/Nix;
+Bullet-proof L4/L7 proxy in Zig 0.17 (toolchain pinned via devenv/Nix;
 direnv activates the shell). Read before writing code:
 
 - [docs/DESIGN.md](docs/DESIGN.md) — the settled design: what's shipped
@@ -31,8 +31,9 @@ direnv activates the shell). Read before writing code:
 
 ## Policies
 
-- Dependencies are audited forks pinned by content hash in build.zig.zon
-  (libxev, hparse, zssl). A pin moves only after re-audit. libxev and
+- Dependencies are audited forks vendored under `deps/` (each entry in
+  `build.zig.zon` records its upstream URL and commit). A vendored copy
+  moves only after re-audit. libxev and
   hparse are pure Zig; zssl is the one C surface — a Zig TLS 1.3 protocol
   layer over libcrypto primitives (DESIGN.md §4's scoped exception), and
   the C binding lives inside it, so `@cImport` stays lint-forbidden here.

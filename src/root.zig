@@ -15,6 +15,7 @@ pub const config = @import("config.zig");
 pub const config_schema = @import("config_schema.zig");
 pub const json_schema = @import("json_schema.zig");
 pub const constants = @import("constants.zig");
+pub const conn_limit = @import("conn_limit.zig");
 pub const counters = @import("counters.zig");
 /// L7 HTTP/1.1 modules (§7). `parser` wraps the vendored hparse behind
 /// the trust boundary, `render` writes upstream/downstream heads, and
@@ -25,6 +26,19 @@ pub const http = struct {
     pub const router = @import("http/router.zig");
     pub const filter = @import("http/filter.zig");
     pub const proxy = @import("http/proxy.zig");
+    /// The vendored HTTP/2 codec (§4). No serving path uses it yet; the
+    /// seam exists so a listener that negotiates `h2` can be added
+    /// without a second vendor import.
+    pub const h2 = @import("http/h2.zig");
+    /// The sans-I/O HTTP/2 client driver over that codec. Not yet wired
+    /// into the serving path; the module and its tests are the foundation
+    /// the upstream leg will use.
+    pub const h2_client = @import("http/h2_client.zig");
+    /// The experimental HTTP/3 (QUIC) stack: the zquic seam, bounded
+    /// session model, listener and buffered origin proxy. Importing this
+    /// declaration is what pulls zquic/qtls into a build; the default
+    /// `test`/`ci` steps do not reference it.
+    pub const h3 = @import("http/h3/root.zig");
 };
 pub const Io = @import("io/io.zig");
 pub const Pool = @import("mem/Pool.zig").Pool;
@@ -37,6 +51,11 @@ pub const shed = @import("shed.zig");
 /// only place libcrypto is reachable from — lint-enforced.
 pub const tls = struct {
     pub const Credentials = @import("tls/Credentials.zig");
+    pub const CredentialSet = @import("tls/CredentialSet.zig");
+    pub const CredentialStore = @import("tls/CredentialStore.zig");
+    pub const TrustStore = @import("tls/TrustStore.zig");
+    pub const ClusterTls = @import("tls/ClusterTls.zig");
+    pub const UpstreamTls = @import("tls/UpstreamTls.zig");
     pub const Engine = @import("tls/Engine.zig");
     pub const libcrypto_heap = @import("tls/libcrypto_heap.zig");
     pub const Tickets = @import("tls/Tickets.zig");
@@ -67,6 +86,7 @@ pub const testing = struct {
 test {
     _ = access_log;
     _ = balancer;
+    _ = conn_limit;
     _ = @import("budget.zig");
     _ = config;
     _ = config_schema;
@@ -78,10 +98,17 @@ test {
     _ = http.router;
     _ = http.filter;
     _ = http.proxy;
+    _ = http.h2;
+    _ = http.h2_client;
     _ = Io;
     _ = Server;
     _ = shed;
     _ = tls.Credentials;
+    _ = tls.CredentialSet;
+    _ = tls.CredentialStore;
+    _ = tls.TrustStore;
+    _ = tls.ClusterTls;
+    _ = tls.UpstreamTls;
     _ = tls.Engine;
     _ = tls.Tickets;
     _ = @import("tls/engine_test.zig");

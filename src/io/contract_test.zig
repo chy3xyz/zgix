@@ -538,7 +538,7 @@ fn runRandomContract(comptime IoType: type, io: *IoType) !void {
     io.fillRandom(bounded[0..1]);
     try std.testing.expectEqualSlices(
         u8,
-        &[_]u8{random_sentinel} ** (Io.random_bytes_max - 1),
+        &@as([Io.random_bytes_max - 1]u8, @splat(random_sentinel)),
         bounded[1..],
     );
 }
@@ -1539,4 +1539,122 @@ test "contract: a read-half shutdown forces an armed recv on XevIo" {
     try initTestIo(&xev_io, arena_state.allocator(), 0);
     defer xev_io.deinit();
     try runReadShutdownContract(XevIo, &xev_io);
+}
+
+/// The UDP arm's only gate today: a real datagram crosses the seam with
+/// its payload and per-datagram source. There is no SimIo counterpart
+/// because the simulator has no virtual datagram network yet; that is why
+/// nothing in the serving path depends on this arm.
+const UdpProbe = struct {
+    sent_len: u32 = 0,
+    received_len: u32 = 0,
+    source: std.Io.net.IpAddress = undefined,
+
+    fn onSend(self: *UdpProbe, result: Io.SendError!u32) void {
+        self.sent_len = result catch unreachable;
+    }
+
+    fn onRecv(self: *UdpProbe, result: Io.RecvError!Io.UdpDatagram) void {
+        const datagram = result catch unreachable;
+        self.received_len = datagram.len;
+        self.source = datagram.source;
+    }
+};
+
+test "udp: a datagram crosses the seam with its source address" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var xev_io: XevIo = undefined;
+    try initTestIo(&xev_io, arena, 0);
+    defer xev_io.deinit();
+
+    const loopback = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    const receiver = try xev_io.udpBind(&.{ .ip = loopback });
+    defer xev_io.udpCloseNow(receiver);
+    const sender = try xev_io.udpBind(&.{ .ip = loopback });
+    defer xev_io.udpCloseNow(sender);
+    const sender_address = xev_io.udpAddress(sender);
+    try std.testing.expect(sender_address.getPort() != 0);
+
+    var probe: UdpProbe = .{};
+    var buffer: [64]u8 = undefined;
+    var recv_completion: XevIo.UdpCompletion = .{};
+    xev_io.udpRecv(
+        receiver,
+        &buffer,
+        &recv_completion,
+        UdpProbe,
+        &probe,
+        UdpProbe.onRecv,
+    );
+    var send_completion: XevIo.UdpCompletion = .{};
+    xev_io.udpSend(
+        sender,
+        xev_io.udpAddress(receiver),
+        "quic-probe!",
+        &send_completion,
+        UdpProbe,
+        &probe,
+        UdpProbe.onSend,
+    );
+    try xev_io.run();
+
+    try std.testing.expectEqual(@as(u32, 11), probe.sent_len);
+    try std.testing.expectEqual(@as(u32, 11), probe.received_len);
+    try std.testing.expectEqualStrings("quic-probe!", buffer[0..probe.received_len]);
+    try std.testing.expectEqual(sender_address.getPort(), probe.source.getPort());
+}
+
+test "udp: the simulator delivers a datagram with its source address" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var sim_io: SimIo = undefined;
+    try sim_io.init(arena_state.allocator(), .{ .seed = 249 });
+
+    const loopback = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    const receiver = try sim_io.udpBind(&.{ .ip = loopback });
+    defer sim_io.udpCloseNow(receiver);
+    const sender = try sim_io.udpBind(&.{ .ip = loopback });
+    defer sim_io.udpCloseNow(sender);
+    const receiver_address = sim_io.udpAddress(receiver);
+    const sender_address = sim_io.udpAddress(sender);
+    try std.testing.expect(receiver_address.getPort() != 0);
+    try std.testing.expect(sender_address.getPort() != 0);
+    try std.testing.expect(receiver_address.getPort() != sender_address.getPort());
+    // A second bind on the same address is the listen-side conflict.
+    try std.testing.expectError(
+        error.AddressInUse,
+        sim_io.udpBind(&.{ .ip = receiver_address }),
+    );
+
+    var probe: UdpProbe = .{};
+    var buffer: [64]u8 = undefined;
+    var recv_completion: SimIo.UdpCompletion = .{};
+    sim_io.udpRecv(
+        receiver,
+        &buffer,
+        &recv_completion,
+        UdpProbe,
+        &probe,
+        UdpProbe.onRecv,
+    );
+    var send_completion: SimIo.UdpCompletion = .{};
+    sim_io.udpSend(
+        sender,
+        receiver_address,
+        "quic-probe!",
+        &send_completion,
+        UdpProbe,
+        &probe,
+        UdpProbe.onSend,
+    );
+    try sim_io.run();
+
+    try std.testing.expectEqual(@as(u32, 11), probe.sent_len);
+    try std.testing.expectEqual(@as(u32, 11), probe.received_len);
+    try std.testing.expectEqualStrings("quic-probe!", buffer[0..probe.received_len]);
+    try std.testing.expectEqual(sender_address.getPort(), probe.source.getPort());
 }

@@ -87,6 +87,17 @@ pub const Match = struct {
     methods: ?std.EnumSet(parser.Method) = null,
     host: ?[]const u8 = null,
     path_prefix: ?[]const u8 = null,
+    /// ASCII case-insensitive substring of the canonical path. Canonical,
+    /// not raw, so the filter and the router judge the same bytes: a
+    /// percent-escape the canonicalizer decoded cannot hide from this
+    /// predicate.
+    path_contains: ?[]const u8 = null,
+    /// ASCII case-insensitive substring of the raw query, without its
+    /// leading `?`. The query is opaque and never canonicalized, so this
+    /// judges exactly the bytes the client sent after the separator.
+    query_contains: ?[]const u8 = null,
+    /// ASCII case-insensitive prefix of that same raw query.
+    query_prefix: ?[]const u8 = null,
     headers: []const HeaderMatch = &.{},
     /// CIDR prefixes the connection's client address must fall inside —
     /// any-of across the list, conjoined with the rest (#177). Empty =
@@ -344,6 +355,89 @@ pub fn isRejectStatus(status: u16) bool {
     return false;
 }
 
+/// Load-time bounds on a listener's WAF block. They live here, beside the
+/// evaluator that asserts them, rather than in `constants`: they describe
+/// this feature's contract, and config.zig reads them to compile and to
+/// emit the schema without restating either number.
+pub const waf_patterns_max: u32 = 64;
+pub const waf_pattern_bytes_max: u32 = 256;
+pub const waf_status_default: u16 = 403;
+
+/// A listener-level, head-only denylist. **Deliberately not a WAF**: no
+/// body inspection, no decoding, no regular expressions, no scripting.
+/// Each pattern is a literal matched ASCII case-insensitively against
+/// the canonical path, the raw query, and every request header value —
+/// the same bounded head bytes routing and filters already hold. That
+/// shape catches the loudest probes and nothing else: percent-encoded
+/// (`%2e%2e%2f`, `%3Cscript`, `+` for space) and body-borne payloads
+/// pass. The request-target charset also excludes spaces and `<`, so a
+/// multi-word or angle-bracket pattern can match a header value but
+/// never a path or query — the literal example `"union select"` is
+/// reachable only there.
+pub const Waf = struct {
+    /// Compiled at load into an arena slice; never allocated per request.
+    patterns: []const []const u8,
+    /// The status a hit answers with. One of `reject_statuses`, checked
+    /// at load so the responder's comptime bridge cannot miss it.
+    status: u16,
+};
+
+/// Whether any WAF pattern occurs in the request's canonical path, raw
+/// query, or a header value. Bounded by `waf_patterns_max` patterns,
+/// `waf_pattern_bytes_max` bytes each, and the parser's header cap; the
+/// loops never allocate.
+pub fn wafBlocks(waf: Waf, view: RequestView) bool {
+    assert(waf.patterns.len >= 1);
+    assert(waf.patterns.len <= waf_patterns_max);
+    assert(isRejectStatus(waf.status));
+    for (waf.patterns) |pattern| {
+        assert(pattern.len >= 1);
+        assert(pattern.len <= waf_pattern_bytes_max);
+    }
+    if (patternsMatch(waf.patterns, view.path)) return true;
+    if (patternsMatch(waf.patterns, view.query)) return true;
+    for (view.headers) |header| {
+        if (patternsMatch(waf.patterns, header.value)) return true;
+    }
+    return false;
+}
+
+/// Whether any pattern is an ASCII case-insensitive substring of `text`.
+/// Patterns are all >= 1 byte, so the substring scan has a defined step.
+fn patternsMatch(patterns: []const []const u8, text: []const u8) bool {
+    assert(patterns.len >= 1);
+    assert(patterns.len <= waf_patterns_max);
+    for (patterns) |pattern| {
+        assert(pattern.len >= 1);
+        if (containsIgnoreCase(text, pattern)) return true;
+    }
+    return false;
+}
+
+/// ASCII case-insensitive substring search. `std.ascii.eqlIgnoreCase`
+/// folds only ASCII, which is exactly the contract: non-ASCII bytes
+/// compare literally and no Unicode case mapping can widen a match.
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    assert(needle.len >= 1);
+    if (needle.len > haystack.len) return false;
+    const last = haystack.len - needle.len;
+    var start: usize = 0;
+    while (start <= last) : (start += 1) {
+        assert(start <= last);
+        if (std.ascii.eqlIgnoreCase(haystack[start..][0..needle.len], needle)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The raw query string a predicate sees: the canonical split's query
+/// suffix, minus its leading `?` when present. The query itself is never
+/// canonicalized (it is opaque to the proxy), so this is verbatim.
+pub fn rawQuery(query: []const u8) []const u8 {
+    return if (query.len >= 1 and query[0] == '?') query[1..] else query;
+}
+
 /// The parsed head a rule matches against, in the §7 canonical forms:
 /// `host` is the canonical routing host (null when absent/unmatchable),
 /// `path` the canonical request path (or "/" for asterisk-form), and
@@ -352,6 +446,10 @@ pub const RequestView = struct {
     method: parser.Method,
     host: ?[]const u8,
     path: []const u8,
+    /// The raw query without its `?` (see `rawQuery`), or empty when the
+    /// target carried none. Defaulted because "no query" is the common
+    /// case and the one every pre-WAF test literal means.
+    query: []const u8 = "",
     headers: []const parser.Header,
     /// The connection's client address (#177), by pointer like every
     /// address here (32 bytes, past TIGER_STYLE's by-value threshold).
@@ -575,6 +673,24 @@ fn matches(match: Match, view: RequestView) bool {
     }
     if (match.path_prefix) |prefix| {
         if (!router.prefixMatches(prefix, view.path)) {
+            return false;
+        }
+    }
+    if (match.path_contains) |needle| {
+        assert(needle.len >= 1);
+        if (!containsIgnoreCase(view.path, needle)) {
+            return false;
+        }
+    }
+    if (match.query_contains) |needle| {
+        assert(needle.len >= 1);
+        if (!containsIgnoreCase(view.query, needle)) {
+            return false;
+        }
+    }
+    if (match.query_prefix) |prefix| {
+        assert(prefix.len >= 1);
+        if (!std.ascii.startsWithIgnoreCase(view.query, prefix)) {
             return false;
         }
     }
@@ -1186,12 +1302,12 @@ test "filter: response rules match on status, class and headers" {
 test "filter: the status-class vocabulary maps each token to its digit" {
     // The enum's field names ARE the JSON tokens and its values the
     // class digits — the loader leans on both, so pin the pairing.
-    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(StatusClass.@"1xx"));
-    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(StatusClass.@"2xx"));
-    try std.testing.expectEqual(@as(u8, 3), @intFromEnum(StatusClass.@"3xx"));
-    try std.testing.expectEqual(@as(u8, 4), @intFromEnum(StatusClass.@"4xx"));
-    try std.testing.expectEqual(@as(u8, 5), @intFromEnum(StatusClass.@"5xx"));
-    try std.testing.expectEqual(@as(usize, 5), @typeInfo(StatusClass).@"enum".fields.len);
+    try std.testing.expectEqual(@as(u8, 1), @backingInt(StatusClass.@"1xx"));
+    try std.testing.expectEqual(@as(u8, 2), @backingInt(StatusClass.@"2xx"));
+    try std.testing.expectEqual(@as(u8, 3), @backingInt(StatusClass.@"3xx"));
+    try std.testing.expectEqual(@as(u8, 4), @backingInt(StatusClass.@"4xx"));
+    try std.testing.expectEqual(@as(u8, 5), @backingInt(StatusClass.@"5xx"));
+    try std.testing.expectEqual(@as(usize, 5), @typeInfo(StatusClass).@"enum".field_names.len);
 }
 
 test "filter: rewritePath reports Oversize when the result would not fit" {
@@ -1201,4 +1317,134 @@ test "filter: rewritePath reports Oversize when the result would not fit" {
         "/a/x",
         &tiny,
     ));
+}
+
+test "filter: query and path substring predicates are ASCII case-insensitive" {
+    const empty: []const parser.Header = &.{};
+    const rules = [_]Rule{.{
+        .match = .{
+            .path_contains = "PRIVATE",
+            .query_contains = "union select",
+        },
+        .actions = &.{.{ .reject = 403 }},
+    }};
+    // Both halves hold, in different cases: the canonical path carries
+    // /private and the raw query carries UNION SELECT.
+    try std.testing.expectEqual(@as(u16, 403), firstVerdict(&rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/users/private/list",
+        .query = "q=UNION SELECT&x=1",
+        .headers = empty,
+        .client = &test_view_client,
+    }).?.reject);
+    // A query-only hit still matches (the conjunction: path must hold).
+    try std.testing.expectEqual(@as(?Verdict, null), firstVerdict(&rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/public",
+        .query = "q=union%20select",
+        .headers = empty,
+        .client = &test_view_client,
+    }));
+    // A path-only hit still needs the query predicate.
+    try std.testing.expectEqual(@as(?Verdict, null), firstVerdict(&rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/private",
+        .query = "q=plain",
+        .headers = empty,
+        .client = &test_view_client,
+    }));
+    // Missing the needle entirely.
+    try std.testing.expectEqual(@as(?Verdict, null), firstVerdict(&rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/public",
+        .query = "q=select",
+        .headers = empty,
+        .client = &test_view_client,
+    }));
+}
+
+test "filter: query_prefix anchors at the raw query's first byte" {
+    const empty: []const parser.Header = &.{};
+    const rules = [_]Rule{.{
+        .match = .{ .query_prefix = "DEBUG=" },
+        .actions = &.{.{ .reject = 400 }},
+    }};
+    try std.testing.expectEqual(@as(u16, 400), firstVerdict(&rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/",
+        .query = "debug=true&x=1",
+        .headers = empty,
+        .client = &test_view_client,
+    }).?.reject);
+    // The same text later in the query is a suffix, not a prefix.
+    try std.testing.expectEqual(@as(?Verdict, null), firstVerdict(&rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/",
+        .query = "x=1&debug=true",
+        .headers = empty,
+        .client = &test_view_client,
+    }));
+    // An absent query never matches a non-empty prefix.
+    try std.testing.expectEqual(@as(?Verdict, null), firstVerdict(&rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/",
+        .query = "",
+        .headers = empty,
+        .client = &test_view_client,
+    }));
+}
+
+test "filter: rawQuery drops one leading separator" {
+    try std.testing.expectEqualStrings("a=1", rawQuery("?a=1"));
+    try std.testing.expectEqualStrings("", rawQuery(""));
+    // A literal '?' in the query is data, not a second separator.
+    try std.testing.expectEqualStrings("?a=1", rawQuery("??a=1"));
+}
+
+test "filter: wafBlocks scans path, query and every header value" {
+    const waf: Waf = .{
+        .patterns = &.{ "../", "<script", "union select" },
+        .status = 403,
+    };
+    const clean = [_]parser.Header{parser.Header.init("X-Trace", "safe")};
+    // Path, query and header-value hits, all case-insensitive.
+    try std.testing.expect(wafBlocks(waf, .{
+        .method = .get,
+        .host = null,
+        .path = "/a/../b",
+        .headers = &clean,
+        .client = &test_view_client,
+    }));
+    try std.testing.expect(wafBlocks(waf, .{
+        .method = .get,
+        .host = null,
+        .path = "/",
+        .query = "q=UNION SELECT",
+        .headers = &clean,
+        .client = &test_view_client,
+    }));
+    const evil = [_]parser.Header{parser.Header.init("User-Agent", "<ScRiPt>")};
+    try std.testing.expect(wafBlocks(waf, .{
+        .method = .get,
+        .host = null,
+        .path = "/",
+        .headers = &evil,
+        .client = &test_view_client,
+    }));
+    // Names are not values: a hostile *name* alone must not block.
+    const named = [_]parser.Header{parser.Header.init("X-script", "clean")};
+    try std.testing.expect(!wafBlocks(waf, .{
+        .method = .get,
+        .host = null,
+        .path = "/",
+        .headers = &named,
+        .client = &test_view_client,
+    }));
 }

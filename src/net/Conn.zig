@@ -13,6 +13,7 @@ const constants = @import("../constants.zig");
 const router = @import("../http/router.zig");
 const sni_router = @import("sni_router.zig");
 const filter = @import("../http/filter.zig");
+const rate_limit = @import("../rate_limit.zig");
 const relay = @import("relay.zig");
 const stream_module = @import("Stream.zig");
 const TlsEngine = @import("../tls/Engine.zig");
@@ -114,11 +115,31 @@ pub fn Conn(comptime IoType: type) type {
         /// same way; `0` is unlimited. Per listener since the freeze, so
         /// the serving path asks its own socket rather than the config.
         keepalive_requests: u32,
+        /// The listener's per-client token bucket (§7), carried like the
+        /// fields above; null means this socket has no limit.
+        rate_limit: ?rate_limit.Policy,
+        /// The listener's concurrent-connection cap per client (§7), or
+        /// null. Carried like the bucket above.
+        conn_limit_max: ?u32,
+        /// Whether this connection has been counted against that cap. Set
+        /// at its first admitted request and cleared only when the count
+        /// is returned at teardown — a keep-alive connection must not
+        /// count twice, and a slot recycled by `prepare` must start
+        /// uncounted.
+        conn_limit_counted: bool,
+        /// `compress.min_bytes`, or null. Same lifetime as the tables
+        /// above; the shared compressor lives on the Server because it is
+        /// synchronous and one is enough.
+        compress_min_bytes: ?u32,
         /// Requests this connection has served, for the #237 cap. On the
         /// connection rather than in `l7`, which resets at every
         /// turnaround — the whole point is a total that survives them.
         requests_served: u32,
         request_filters: []const filter.Rule,
+        /// The listener's WAF-lite denylist, same lifetime; null when the
+        /// listener configured none. Read once per request before the
+        /// filter walk.
+        waf: ?filter.Waf,
         /// The listener's #175 response filter rules, same lifetime:
         /// matched against the origin's parsed response head at the
         /// re-render (empty on L4 and when none are configured).
@@ -126,10 +147,21 @@ pub fn Conn(comptime IoType: type) type {
         /// The listener's §7 client-address forwarding mode, same lifetime
         /// as `routes`; null leaves `X-Forwarded-For` untouched.
         forwarded: ?config_module.Config.Listener.Forwarded,
+        /// The same block's optional `X-Real-IP` / `X-Forwarded-Proto`
+        /// requests, carried beside the mode so the render reads one
+        /// place for all three headers.
+        forwarded_real_ip: bool,
+        forwarded_proto: bool,
         /// Whether this listener names an RFC 9209 cause on the refusals
         /// it renders itself (#300), carried like the modes above so a
         /// shed asks its own socket rather than the listener index.
         proxy_status: bool,
+        /// The listener's `Alt-Svc` advertisement (RFC 7838) — the value
+        /// every proxied final response head on this socket carries, or
+        /// null for none. Borrowed from the config's arena, like the
+        /// filter tables above: what this socket may say on the wire is
+        /// decided per listener, and the render reads it from here.
+        h3_advertise: ?[]const u8,
         /// The endpoint this L4 connection is charged against in the
         /// server's per-endpoint in-flight table (§7), or `endpoint_none`
         /// when it is charged against none — every L7 connection, and
@@ -317,13 +349,21 @@ pub fn Conn(comptime IoType: type) type {
             conn.routes = &.{};
             conn.sni_routes = &.{};
             conn.request_filters = &.{};
+            conn.waf = null;
             conn.response_filters = &.{};
             conn.upgrades = .{};
             conn.max_body_bytes = 0;
             conn.keepalive_requests = 0;
+            conn.rate_limit = null;
+            conn.conn_limit_max = null;
+            conn.conn_limit_counted = false;
+            conn.compress_min_bytes = null;
             conn.requests_served = 0;
             conn.forwarded = null;
+            conn.forwarded_real_ip = false;
+            conn.forwarded_proto = false;
             conn.proxy_status = false;
+            conn.h3_advertise = null;
             conn.charged_endpoint = stream_module.LogState.endpoint_none;
             conn.charged_cluster = 0;
             conn.protocol = protocol;

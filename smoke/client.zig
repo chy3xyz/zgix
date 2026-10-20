@@ -244,6 +244,34 @@ pub const Client = struct {
         /// `persistence`, so a request's bytes are readable off it.
         cookie: ?[]const u8,
     ) !Response {
+        try client.sendGet(host, target, persistence, cookie);
+        return client.finish(null);
+    }
+
+    /// The same exchange, with the body kept in `body_out` so the caller
+    /// can compare it byte-for-byte. The upstream-TLS leg needs this: a
+    /// length equality alone would pass a hop that reordered or zeroed a
+    /// body of the right size, which is exactly what a broken transform
+    /// seam is most likely to do.
+    pub fn getCaptured(
+        client: *Client,
+        host: []const u8,
+        target: []const u8,
+        persistence: Persistence,
+        cookie: ?[]const u8,
+        body_out: []u8,
+    ) !Response {
+        try client.sendGet(host, target, persistence, cookie);
+        return client.finish(body_out);
+    }
+
+    fn sendGet(
+        client: *Client,
+        host: []const u8,
+        target: []const u8,
+        persistence: Persistence,
+        cookie: ?[]const u8,
+    ) !void {
         assert(client.connected);
         assert(target.len >= 1);
         assert(target[0] == '/');
@@ -266,21 +294,135 @@ pub const Client = struct {
                 .{ target, host, persistence.header() },
             );
         }
+    }
+
+    /// A POST whose body is framed with `Content-Length`, echoed into
+    /// `body_out` on the way back. The upstream-TLS leg uses it because
+    /// a body is the one request-side payload a transform seam can lose
+    /// while every head still looks right.
+    pub fn post(
+        client: *Client,
+        host: []const u8,
+        target: []const u8,
+        persistence: Persistence,
+        body: []const u8,
+        body_out: []u8,
+    ) !Response {
+        assert(client.connected);
+        assert(target.len >= 1);
+        assert(target[0] == '/');
+        assert(body.len >= 1);
+        const wire = client.plaintext();
+        try wire.out.print(
+            "POST {s} HTTP/1.1\r\nHost: {s}\r\n" ++
+                request_id_header ++ ": " ++ request_id_value ++
+                "\r\nContent-Length: {d}\r\n{s}\r\n",
+            .{ target, host, body.len, persistence.header() },
+        );
+        try wire.out.writeAll(body);
+        return client.finish(body_out);
+    }
+
+    /// The same POST framed with `Transfer-Encoding: chunked`. One data
+    /// chunk is enough to exercise the framing: the origin decodes it and
+    /// echoes the plaintext, so what the caller compares is the body, not
+    /// the chunk envelope.
+    pub fn postChunked(
+        client: *Client,
+        host: []const u8,
+        target: []const u8,
+        persistence: Persistence,
+        body: []const u8,
+        body_out: []u8,
+    ) !Response {
+        assert(client.connected);
+        assert(target.len >= 1);
+        assert(target[0] == '/');
+        assert(body.len >= 1);
+        const wire = client.plaintext();
+        try wire.out.print(
+            "POST {s} HTTP/1.1\r\nHost: {s}\r\n" ++
+                request_id_header ++ ": " ++ request_id_value ++
+                "\r\nTransfer-Encoding: chunked\r\n{s}\r\n",
+            .{ target, host, persistence.header() },
+        );
+        try wire.out.print("{x}\r\n", .{body.len});
+        try wire.out.writeAll(body);
+        try wire.out.writeAll("\r\n0\r\n\r\n");
+        return client.finish(body_out);
+    }
+
+    /// Open an upgrade tunnel and prove it carries opaque bytes: send the
+    /// handshake, require a `101`, then push `payload` and read exactly
+    /// that many bytes back. The caller closes the client afterwards,
+    /// which is the half-close that ends the relay.
+    pub fn tunnel(
+        client: *Client,
+        host: []const u8,
+        target: []const u8,
+        payload: []const u8,
+        echoed: []u8,
+    ) !void {
+        assert(client.connected);
+        assert(target.len >= 1);
+        assert(target[0] == '/');
+        assert(payload.len >= 1);
+        assert(echoed.len >= payload.len);
+        const wire = client.plaintext();
+        try wire.out.print(
+            "GET {s} HTTP/1.1\r\nHost: {s}\r\n" ++
+                request_id_header ++ ": " ++ request_id_value ++ "\r\n" ++
+                "Upgrade: websocket\r\nConnection: Upgrade\r\n" ++
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+                "Sec-WebSocket-Version: 13\r\n\r\n",
+            .{ target, host },
+        );
         try client.flushAll();
         client.requests += 1;
-        const response = try readResponse(wire.in);
+        const status = try readStatus(wire.in);
+        if (status != 101) return error.TunnelNotEstablished;
+        // A 101 carries no body framing: read to the blank line rather
+        // than through `readHeaders`, whose `body_bytes` contract every
+        // ordinary response meets and a switch does not.
+        while (true) {
+            const line = (try wire.in.takeDelimiter('\n')) orelse
+                return error.ResponseTruncated;
+            const trimmed = std.mem.trimEnd(u8, line, "\r");
+            if (trimmed.len == 0) break;
+        }
+        try wire.out.writeAll(payload);
+        try client.flushAll();
+        try wire.in.readSliceAll(echoed[0..payload.len]);
+    }
+
+    /// Flush what a send staged and read its response. Split out so every
+    /// verb shares the one place that increments `requests` — the count
+    /// the callers assert their keep-alive arithmetic against.
+    fn finish(client: *Client, body_out: ?[]u8) !Response {
+        assert(client.connected);
+        try client.flushAll();
+        client.requests += 1;
+        const wire = client.plaintext();
+        const response = try readResponse(wire.in, body_out);
         assert(client.requests >= 1);
         return response;
     }
 };
 
 /// Read one whole response: status line, headers, then exactly the body
-/// the `Content-Length` promised.
-fn readResponse(reader: *Io.Reader) !Response {
+/// the `Content-Length` promised. `body_out` keeps those bytes for a
+/// caller comparing content; null discards them, which is what the legs
+/// whose verdict is a length do.
+fn readResponse(reader: *Io.Reader, body_out: ?[]u8) !Response {
     const status = try readStatus(reader);
     const head = try readHeaders(reader);
     assert(head.body_bytes <= response_body_bytes_max);
-    try reader.discardAll(head.body_bytes);
+    if (body_out) |out| {
+        if (head.body_bytes > out.len) return error.ResponseBodyBufferTooSmall;
+        try reader.readSliceAll(out[0..head.body_bytes]);
+    } else {
+        try reader.discardAll(head.body_bytes);
+    }
     return .{
         .status = status,
         .body_bytes = head.body_bytes,

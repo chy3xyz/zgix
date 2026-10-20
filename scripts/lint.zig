@@ -54,6 +54,11 @@ const boundaries = [_]Boundary{
         .confined_to = "tls/",
         .message = "zssl may only be imported under src/tls/ — the crypto boundary (DESIGN.md §4)",
     },
+    .{
+        .needle = "@import(\"zquic\")",
+        .confined_to = "http/h3/",
+        .message = "the experimental HTTP/3 seam is the only zquic importer (§4/§7)",
+    },
 };
 
 /// TIGER_STYLE's "put a limit on everything", made mechanical: `while

@@ -181,7 +181,7 @@ tls_tokens: [tls_client_slots][tls_token_bytes]u8,
 /// POST-then-GET pair, which exercised the response render's happy path
 /// and nothing else.
 tls_scripts: [tls_client_slots]l7.Script,
-tls_credentials: [3]?zoxy.tls.Credentials,
+tls_credentials: [3]?zoxy.tls.CredentialSet,
 /// The #142 gate drawn for the l4 listener; `populateClients` reads it
 /// to decide whether its clients open with headers.
 proxy_protocol_l4: ?zoxy.config.Config.Listener.ProxyProtocol,
@@ -1496,7 +1496,11 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
             // this states is only that the listener terminates — which is
             // what `Server.start` checks its credentials table against.
             .tls = if (harness.tls_clients >= 1)
-                .{ .cert_path = "cert.pem", .key_path = "key.pem" }
+                .{ .certificates = &.{.{
+                    .cert_path = "cert.pem",
+                    .key_path = "key.pem",
+                    .names = &.{},
+                }} }
             else
                 null,
         },
@@ -1597,10 +1601,12 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
     harness.tls_credentials = .{ null, null, null };
     if (harness.tls_clients >= 1) {
         // Index 2: the terminating listener is the third.
-        harness.tls_credentials[2] = try zoxy.tls.Credentials.load(
+        harness.tls_credentials[2] = try zoxy.tls.CredentialSet.load(
             arena,
-            zoxy.tls.testdata.cert_pem,
-            zoxy.tls.testdata.key_pem,
+            &.{.{
+                .cert_pem = zoxy.tls.testdata.cert_pem,
+                .key_pem = zoxy.tls.testdata.key_pem,
+            }},
             // The deterministic nonce is not optional here: without it the
             // CertificateVerify signature varies run to run, and this
             // gate's whole verdict is that one seed replays byte-exact.
@@ -2333,6 +2339,11 @@ fn strandCanExplainStuck(harness: *const Harness) bool {
         // because the alternative is an exclusion list, and
         // `drawStrandKind` records why this hook no longer keeps one.
         .close => admin_stuck,
+        // The UDP arm is not in `drawStrandKind`'s set: no seed arms a
+        // datagram op yet, so a strand can never name one. A future h3
+        // scenario that adds them there must decide which planes they can
+        // leave stuck, exactly like every kind above.
+        .udp_recv, .udp_send => unreachable,
         // Out of `drawStrandKind`'s list, so unreachable rather than
         // defaulted: adding one there without giving it an arm here panics
         // every seed that strands it, and a named arm is what makes that
@@ -2432,8 +2443,8 @@ fn endScenario(harness: *Harness) void {
     harness.origin_http.stopListening();
 }
 
-/// Free what the arena cannot (§4): a `Credentials` owns a libcrypto key
-/// object, which is not arena memory, so a sweep that only reset the
+/// Free what the arena cannot (§4): a `CredentialSet` owns libcrypto key
+/// objects, which are not arena memory, so a sweep that only reset the
 /// arena would leak one key per seed — twice over, since every seed runs
 /// twice for the determinism check.
 pub fn tearDown(harness: *Harness) void {
@@ -2843,10 +2854,11 @@ fn l7OutcomeTotal(counters: *const zoxy.counters.Counters) u64 {
         "l7_bad_request",
         "l7_uri_too_long",
         "l7_headers_too_large",
-        // The #125 sibling: a terminated connection whose head fit and
-        // whose body did not. Answered like the two above, so it belongs
-        // in the same sum — added while it is free rather than on the
-        // first seed that reaches it.
+        // The #125 sibling: a terminated head destination that overran
+        // after the head parsed. The current sizing makes that ladder
+        // unreachable in a served flow, so this term is free — kept in
+        // the sum so a future head source cannot answer 413 off the
+        // books.
         "l7_body_too_large",
         // The #236 cap's answered half. Its sibling
         // `l7_body_cut_mid_stream` is deliberately absent: that one tears

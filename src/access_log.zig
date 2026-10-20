@@ -758,12 +758,12 @@ test "access log: a line at every cap still fits the bound (#140)" {
     // Control bytes: JSON's 6x worst case, which is what the per-header
     // term budgets for.
     @memset(value, 0x01);
-    const name = "x" ** constants.access_log_header_name_bytes_max;
+    const name: [constants.access_log_header_name_bytes_max]u8 = @splat('x');
 
     var names: [constants.access_log_headers_max][]const u8 = undefined;
     var values: [constants.access_log_headers_max][]const u8 = undefined;
     for (&names, &values) |*name_slot, *value_slot| {
-        name_slot.* = name;
+        name_slot.* = &name;
         value_slot.* = value;
     }
     const path = try gpa.alloc(u8, constants.access_log_path_bytes_max);
@@ -776,8 +776,8 @@ test "access log: a line at every cap still fits the bound (#140)" {
     var entry = testRecord();
     entry.path = path;
     entry.host = host;
-    entry.method = "M" ** constants.access_log_method_bytes_max;
-    entry.cluster = "c" ** constants.cluster_name_bytes_max;
+    entry.method = &@as([constants.access_log_method_bytes_max]u8, @splat('M'));
+    entry.cluster = &@as([constants.cluster_name_bytes_max]u8, @splat('c'));
     entry.client = try std.Io.net.IpAddress.parseLiteral("[2001:db8::1]:65535");
     entry.upstream = .{ .ip = try std.Io.net.IpAddress.parseLiteral("[2001:db8::2]:65535") };
     entry.duration_ns = std.math.maxInt(u64);

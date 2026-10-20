@@ -1,0 +1,25 @@
+.{
+    .name = .openssl,
+    .version = "3.5.7",
+    .fingerprint = 0x773a47f1dd422f4c,
+    .minimum_zig_version = "0.16.0",
+
+    .dependencies = .{
+        .openssl = .{
+            // upstream: git+https://github.com/openssl/openssl?ref=openssl-3.5.7#8cf17aaeb4599f8af87fefd810b5b5fee90fe69e
+            .path = "../openssl-src",
+        },
+    },
+
+    .paths = .{
+        "LICENSE",
+        "README.md",
+        "build.zig",
+        "build.zig.zon",
+        "config.zig",
+        "generate.zig",
+        "mingw-arm64.conf",
+        "gen",
+        "crypto",
+    },
+}

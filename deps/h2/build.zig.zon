@@ -1,0 +1,20 @@
+.{
+    .name = .h2,
+    .version = "0.0.0",
+    .fingerprint = 0x242aa2d0b70b78fa, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    // Zero dependencies beyond the Zig toolchain, and this stays empty:
+    // `scripts/lint.zig` forbids `@cImport`, and every buffer is caller-owned,
+    // so there is nothing left for a dependency to provide.
+    .dependencies = .{},
+    // What ships to a consumer. `corpus/`, `fuzz/`, `bench/` and `scripts/`
+    // are gates rather than library, and `corpus/` alone is 828 KiB of
+    // vendored fixtures nobody depending on this package needs.
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}

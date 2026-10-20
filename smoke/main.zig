@@ -161,6 +161,49 @@ const requests_per_connection: u32 = 16;
 /// counter for want of exactly this delivery.
 const large_requests: u32 = 4;
 
+/// The upstream-TLS leg: one keep-alive connection to a plaintext
+/// listener whose cluster dials the terminating listener over TLS, and
+/// four exchanges across that hop — a small GET, the bulk GET (the body
+/// has to survive the origin TLS leg), a Content-Length POST and a
+/// chunked POST, both echoed byte-for-byte. Nothing else in the tree
+/// covers `cluster.tls` end to end: the directed tests drive the client
+/// in isolation and the terminated-listener leg below only exercises
+/// zoxy as a TLS *server*.
+const upstream_tls_requests: u32 = 4;
+/// The one client connection those four exchanges ride. It is a
+/// data-listener accept like every other, so it enters
+/// `connections_expected`.
+const upstream_tls_connections: u32 = 1;
+/// And the terminating listener's accepts: one, because the four
+/// exchanges share one parked TLS upstream connection. Parking is the
+/// shipped behavior now, so this equality is what notices a regression
+/// back to dial-per-request: four accepts would fail the run.
+const upstream_tls_hop_connections: u32 = 1;
+const upstream_tls_leg_connections: u32 =
+    upstream_tls_connections + upstream_tls_hop_connections;
+/// The cluster behind the hop, and the shapes its exchanges carry. The
+/// POST bodies are non-empty on purpose: an echo of nothing would pass
+/// whether or not the body crossed at all.
+const upstream_tls_cluster = "upstream-tls";
+const upstream_tls_post_body = "upstream-tls content-length echo\n";
+const upstream_tls_chunked_body = "upstream-tls chunked echo\n";
+
+/// The upgrade leg: one client connection to the hop listener, a 101
+/// through both TLS hops, and a payload echoed byte-for-byte. It runs
+/// *before* the body leg, when no TLS session is parked yet, so the hop
+/// dials fresh and the accept/handshake counts are deterministic; the
+/// tunnel then keeps that session for its life (a TLS tunnel holds its
+/// upstream slot), so the body leg that follows dials its own.
+const tunnel_payload_bytes: usize = 32 * 1024;
+/// The hop's fresh TLS dial. The client connection is
+/// `tunnel_client_connections`; together they are what this leg adds to
+/// `connections_expected`.
+const tunnel_hop_connections: u32 = 1;
+const tunnel_client_connections: u32 = 1;
+const tunnel_leg_connections: u32 = tunnel_client_connections + tunnel_hop_connections;
+/// Two lines: the hop listener's and the terminating listener's.
+const tunnel_access_lines: u32 = 2;
+
 /// The load runs twice over the same connections, with the process's
 /// resident set read between the passes. The first pass is what makes the
 /// second measurable: zoxy's pools are lazily resident, so an unwarmed
@@ -220,8 +263,14 @@ const refused_path = "/refused";
 const exchanges_per_pass: u32 =
     @as(u32, keep_alive_connections) * requests_per_connection + large_requests;
 const http_exchanges: u32 = load_passes * exchanges_per_pass;
+/// The upstream-TLS requests are counted twice: once at the hop listener
+/// the harness entered, and once at the terminating listener that
+/// answered the hop's upstream leg. Both are real exchanges this process
+/// served and logged, so both are lines here.
+const upstream_tls_access_lines: u32 = 2 * upstream_tls_requests;
 const access_log_lines_expected: u32 = http_exchanges + sticky_exchanges +
-    body_exchanges + allowlist_exchanges + tls_requests + l4_connections;
+    body_exchanges + allowlist_exchanges + upstream_tls_access_lines +
+    tunnel_access_lines + tls_requests + l4_connections;
 
 /// What the resident set may grow by between the two passes. Measured at
 /// exactly zero, run after run — the tolerance is headroom for page
@@ -248,7 +297,8 @@ const allowlist_connections: u32 = 1;
 const readiness_probes: u32 = 1;
 const connections_expected: u32 = keep_alive_connections +
     load_passes * large_requests + l4_connections + sticky_connections +
-    body_connections + allowlist_connections + tls_connections + readiness_probes;
+    body_connections + allowlist_connections + upstream_tls_leg_connections +
+    tunnel_leg_connections + tls_connections + readiness_probes;
 
 /// What the harness holds open against the origin at its peak: every live
 /// client connection can have an upstream connection of its own, parked or
@@ -259,7 +309,13 @@ const connections_expected: u32 = keep_alive_connections +
 /// One more for the #331 leg, whose allowed request forwards: it reuses
 /// a parked upstream connection whenever one is free, and a dial of its
 /// own is the case this headroom covers.
-const origin_connections_peak: u8 = keep_alive_connections + l4_connections + 2 + 1 + 1;
+/// Two more for the upstream-TLS leg: the hop's TLS connection is
+/// terminated by the TLS listener, which then dials the origin, and that
+/// dial may be fresh rather than a parked one. The second slot is
+/// teardown slack, on the same terms as the `+ 2` above.
+/// One more for the upgrade leg: its tunnel holds an origin connection
+/// for the session's life, beside the hop's TLS connection.
+const origin_connections_peak: u8 = keep_alive_connections + l4_connections + 2 + 1 + 1 + 2 + 1;
 
 /// The drain's cap on waiting for the connections left open above. A
 /// drain cannot tell an idle keep-alive connection from one about to send
@@ -300,6 +356,9 @@ const zoxy_limits = .{
     .relay_buffers = 16,
     .upstream_slots = 16,
     .tls_engines = 2,
+    // The upgrade leg opens one tunnel through two hops. Required
+    // whenever a listener allows an upgrade; two leaves one for each.
+    .tunnels = 2,
 };
 
 /// The head buffer zoxy binds for this run — `limits.head_buffer_bytes`
@@ -338,8 +397,14 @@ comptime {
     assert(zoxy_limits.conn_slots >= connections_expected);
     // Same rule for the engine pool, which is its own admission rung
     // (§8): the https leg must be admitted rather than shed, or its
-    // counter verdicts would be measuring the wall.
+    // counter verdicts would be measuring the wall. The hop reuses one
+    // parked TLS session across its four exchanges, so it does not stack
+    // against this bound; the one below still covers the direct leg with
+    // an engine to spare.
     assert(zoxy_limits.tls_engines >= tls_connections);
+    // Every exchange this leg makes has to be one the line arithmetic
+    // below can name; the four shapes are fixed by the leg's body.
+    assert(upstream_tls_requests == 4);
 }
 
 /// The health-check shape this run configures, and the window it is
@@ -447,6 +512,8 @@ const Stage = enum {
     sticky_leg,
     bodies_leg,
     allowlist_leg,
+    tunnel_leg,
+    upstream_tls_leg,
     https_handshake,
     https_request,
     https_close_notify,
@@ -465,6 +532,8 @@ const Stage = enum {
             .sticky_leg => "the sticky leg (#178)",
             .bodies_leg => "the bodies leg (#159)",
             .allowlist_leg => "the allowlist leg (#331)",
+            .tunnel_leg => "the upgrade-tunnel leg",
+            .upstream_tls_leg => "the upstream-TLS leg",
             .https_handshake => "the https handshake",
             .watchdog_leg => "the loop-watchdog leg (#311)",
             .https_request => "an https request",
@@ -476,7 +545,7 @@ const Stage = enum {
     }
 };
 
-var current_stage = std.atomic.Value(u8).init(@intFromEnum(Stage.starting));
+var current_stage = std.atomic.Value(u8).init(@backingInt(Stage.starting));
 
 /// Which https request is in flight, 1-based, for the stage that repeats.
 /// The distinction it draws is the one worth having: the first request on
@@ -488,7 +557,7 @@ var current_https_request = std.atomic.Value(u32).init(0);
 /// watchdog's acquire load: the label must be readable by the time the
 /// wait it describes can hang.
 fn enterStage(stage: Stage) void {
-    current_stage.store(@intFromEnum(stage), .release);
+    current_stage.store(@backingInt(stage), .release);
 }
 
 const Flags = struct {
@@ -502,7 +571,12 @@ const Ports = struct {
     http: u16,
     l4: u16,
     admin: u16,
+    /// The terminating TLS listener — zoxy as a TLS server, and the
+    /// upstream endpoint of the hop's cluster.
     tls: u16,
+    /// A plaintext listener whose cluster dials `tls` over TLS: the
+    /// upstream-TLS leg enters here.
+    tls_hop: u16,
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -568,6 +642,15 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     // every filter verdict this run produced.
     enterStage(.allowlist_leg);
     const allowlist_ok = try allowlistPassed(arena, io, &ports);
+    // Before the body leg: no TLS session is parked yet, so this leg's hop
+    // dial is fresh and its accept/handshake counts are deterministic.
+    enterStage(.tunnel_leg);
+    const tunnel_ok = try tunnelPassed(arena, io, &ports);
+    // Before the direct HTTPS leg on purpose: this leg's cluster dials
+    // the terminating listener, so its handshake has to be counted by
+    // that leg's final scrape rather than arrive after it.
+    enterStage(.upstream_tls_leg);
+    const upstream_tls_ok = try upstreamTlsPassed(arena, io, &ports);
     // Last, so its scrape sees the whole run — and so a wedged handshake
     // cannot cost the legs above their verdicts.
     const tls_ok = try tlsPassed(arena, io, &ports);
@@ -581,15 +664,15 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     enterStage(.drain);
     const drained_cleanly = try drain(io, &child, &running);
     enterStage(.verdicts);
-    const lines = try readAccessLog(arena, io);
+    const lines = try readAccessLog(arena, io, &ports);
     // Every check runs and prints; a run that fails two ways should say
     // both, not stop at the first.
     const log_ok = accessLogPassed(&lines);
     const memory_ok = memoryPassed(&memory);
     const drain_ok = drainPassed(drained_cleanly);
     const passed = log_ok and counters.passed and sticky_ok and bodies_ok and
-        allowlist_ok and tls_ok and memory_ok and drain_ok and check_ok and
-        watchdog_ok;
+        allowlist_ok and tunnel_ok and upstream_tls_ok and tls_ok and memory_ok and
+        drain_ok and check_ok and watchdog_ok;
     return report(io, &lines, &counters, &memory, passed);
 }
 
@@ -655,7 +738,7 @@ fn watchdogTask(io: Io) void {
         assert(err == error.Canceled);
         return;
     };
-    const stage: Stage = @enumFromInt(current_stage.load(.acquire));
+    const stage: Stage = @fromBackingInt(@intCast(current_stage.load(.acquire)));
     const seconds = watchdog_budget_ns / std.time.ns_per_s;
     if (stage == .https_request) {
         std.debug.print(
@@ -720,9 +803,20 @@ const LogCounts = struct {
     /// than weakening the ok-equality.
     http_rejected: u32 = 0,
     http_responded: u32 = 0,
+    /// Tunnels: the only http lines whose outcome is `closed`, and the
+    /// only ones whose status is `101`. Counted apart from `ok` so the
+    /// ok-equality stays an equality rather than a floor.
+    http_closed: u32 = 0,
+    http_tunnels: u32 = 0,
     /// The #140 headers as the log actually spelled them.
     http_with_request_id: u32 = 0,
     http_with_origin_tag: u32 = 0,
+    /// The upstream-TLS leg's lines, counted twice: by the cluster the
+    /// config named (`"cluster":"upstream-tls"`) and by the endpoint that
+    /// cluster dialed (the terminating listener). Either alone could be a
+    /// rename that happened to match; both together are the hop.
+    http_upstream_tls: u32 = 0,
+    http_upstream_tls_endpoint: u32 = 0,
 };
 
 /// The access-log verdict, printed so a red run explains itself without a
@@ -737,7 +831,8 @@ fn accessLogPassed(lines: *const LogCounts) bool {
     // terminated request is an ordinary request by the time it is logged,
     // and a log that told them apart would be the defect.
     const http_lines_expected = http_exchanges + sticky_exchanges +
-        body_exchanges + allowlist_exchanges + tls_requests;
+        body_exchanges + allowlist_exchanges + upstream_tls_access_lines +
+        tunnel_access_lines + tls_requests;
     assert(access_log_lines_expected == http_lines_expected + l4_connections);
     var passed = true;
     if (lines.http != http_lines_expected) {
@@ -758,13 +853,21 @@ fn accessLogPassed(lines: *const LogCounts) bool {
         std.debug.print("FAIL: {d} access-log lines of no known kind\n", .{lines.other});
         passed = false;
     }
-    // Every line but the #159 leg's two and the #331 leg's refusal
-    // carries the origin's 200; those three carry outcomes only this
-    // proxy produces, so the counts partition the http lines exactly.
-    if (lines.http_ok + body_exchanges + allowlist_refused != lines.http) {
+    // Every line but the #159 leg's two, the #331 leg's refusal and the
+    // tunnel's `closed` lines carries the origin's 200; those carry
+    // outcomes only this proxy produces, so the counts partition the
+    // http lines exactly.
+    if (lines.http_ok + lines.http_closed + body_exchanges + allowlist_refused != lines.http) {
         std.debug.print(
-            "FAIL: {d} of {d} http lines did not complete with the origin's 200\n",
-            .{ lines.http - lines.http_ok, lines.http },
+            "FAIL: {d} of {d} http lines did not complete with the origin's 200 or a tunnel's close\n",
+            .{ lines.http - lines.http_ok - lines.http_closed, lines.http },
+        );
+        passed = false;
+    }
+    if (lines.http_closed != tunnel_access_lines or lines.http_tunnels != tunnel_access_lines) {
+        std.debug.print(
+            "FAIL: {d} closed and {d} 101 lines, not {d} each (the upgrade tunnel)\n",
+            .{ lines.http_closed, lines.http_tunnels, tunnel_access_lines },
         );
         passed = false;
     }
@@ -775,6 +878,26 @@ fn accessLogPassed(lines: *const LogCounts) bool {
         std.debug.print(
             "FAIL: {d} rejected and {d} responded lines, not {d} and 1 (#159, #331)\n",
             .{ lines.http_rejected, lines.http_responded, 1 + allowlist_refused },
+        );
+        passed = false;
+    }
+    // The upstream-TLS hop has to be *visible* in the log, not merely
+    // implied by a body that arrived: a run whose hop silently dialed
+    // the origin in the clear would pass every exchange check above. The
+    // tunnel's hop line is one more, so the count is the body leg's four
+    // plus that one.
+    const hop_lines = upstream_tls_requests + 1;
+    if (lines.http_upstream_tls != hop_lines) {
+        std.debug.print(
+            "FAIL: {d} access-log lines name the {s} cluster, not {d}\n",
+            .{ lines.http_upstream_tls, upstream_tls_cluster, hop_lines },
+        );
+        passed = false;
+    }
+    if (lines.http_upstream_tls_endpoint != hop_lines) {
+        std.debug.print(
+            "FAIL: {d} access-log lines name the TLS listener as upstream, not {d}\n",
+            .{ lines.http_upstream_tls_endpoint, hop_lines },
         );
         passed = false;
     }
@@ -1012,12 +1135,14 @@ fn identitiesPassed(first: *const scrape_module.Scrape) bool {
         );
         passed = false;
     }
-    // Minus the four legs that deliberately run after this scrape (see
-    // `sticky_exchanges`, `body_exchanges`, `allowlist_exchanges` and
+    // Minus the legs that deliberately run after this scrape (see
+    // `sticky_exchanges`, `body_exchanges`, `allowlist_exchanges`,
+    // `upstream_tls_connections`, `tunnel_leg_connections` and
     // `tls_requests`); the whole-run equality is asserted on the last of
     // their scrapes.
     const opened_so_far = connections_expected - sticky_connections -
-        body_connections - allowlist_connections - tls_connections;
+        body_connections - allowlist_connections - upstream_tls_leg_connections -
+        tunnel_leg_connections - tls_connections;
     if (accepted != opened_so_far) {
         std.debug.print(
             "FAIL: {d} connections accepted, not the {d} opened before this scrape\n",
@@ -1284,10 +1409,11 @@ fn stickyPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         }
     }
     // The accept count with this leg in, but still short the connections
-    // the #159 and TLS legs open after it — the whole-run equality lands
-    // on the last scrape of the run.
+    // the #159, tunnel, upstream-TLS and direct TLS legs open after it —
+    // the whole-run equality lands on the last scrape of the run.
     const opened_by_here = connections_expected - body_connections -
-        allowlist_connections - tls_connections;
+        allowlist_connections - tunnel_leg_connections -
+        upstream_tls_leg_connections - tls_connections;
     const accepted = counterOf(&scrape, "accepted") orelse return false;
     if (accepted != opened_by_here) {
         std.debug.print(
@@ -1336,9 +1462,11 @@ fn bodiesPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         std.debug.print("FAIL: l7_no_route reads {d}, not 1\n", .{no_route});
         passed = false;
     }
-    // Short the #331 and TLS legs' connections, which open after this
-    // scrape; the last of them carries the whole-run equality.
-    const opened_by_here = connections_expected - allowlist_connections - tls_connections;
+    // Short the #331, tunnel, upstream-TLS and direct TLS legs'
+    // connections, which open after this scrape; the last of them carries
+    // the whole-run equality.
+    const opened_by_here = connections_expected - allowlist_connections -
+        tunnel_leg_connections - upstream_tls_leg_connections - tls_connections;
     const accepted = counterOf(&scrape, "accepted") orelse return false;
     if (accepted != opened_by_here) {
         std.debug.print(
@@ -1543,6 +1671,263 @@ fn expectBodyResponse(
     return true;
 }
 
+/// The upgrade leg: a 101 through the TLS hop, then opaque bytes echoed
+/// both ways. It is the only automated coverage of the tunnel relay's
+/// TLS transforms — both ends of the hop speak TLS, and the payload has
+/// to survive the two transforms and the half-close.
+fn tunnelPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
+    assert(ports.tls_hop != 0);
+    assert(ports.admin != 0);
+    var host_buffer: [32]u8 = undefined;
+    const host = try std.fmt.bufPrint(&host_buffer, "127.0.0.1:{d}", .{ports.tls_hop});
+    var payload: [tunnel_payload_bytes]u8 = undefined;
+    for (&payload, 0..) |*byte, index| byte.* = @truncate(index *% 31 +% 7);
+    var echoed: [tunnel_payload_bytes]u8 = undefined;
+
+    var tunnel_client: client_module.Client = .{};
+    try tunnel_client.connect(io, ports.tls_hop);
+    tunnel_client.tunnel(host, "/", &payload, &echoed) catch |err| {
+        tunnel_client.close();
+        return err;
+    };
+    // Closing the client is the half-close that ends the relay: the hop
+    // sends FIN (and close_notify on the TLS leg), the origin sees EOF,
+    // and both directions report `closed`.
+    tunnel_client.close();
+
+    var passed = true;
+    if (!std.mem.eql(u8, &payload, &echoed)) {
+        std.debug.print(
+            "FAIL: the upgrade tunnel echoed different bytes than it was given\n",
+            .{},
+        );
+        passed = false;
+    }
+    const scrape = try scrape_module.parse(try scrape_module.fetch(arena, io, ports.admin));
+    const tunnels = counterOf(&scrape, "tunnels_established") orelse return false;
+    if (tunnels != 2) {
+        std.debug.print(
+            "FAIL: {d} tunnels established, not 2 (the hop and the terminating listener)\n",
+            .{tunnels},
+        );
+        passed = false;
+    }
+    const relay_failed = counterOf(&scrape, "tls_relay_failed") orelse return false;
+    if (relay_failed != 0) {
+        std.debug.print(
+            "FAIL: {d} tls_relay_failed after the upgrade tunnel, not 0\n",
+            .{relay_failed},
+        );
+        passed = false;
+    }
+    return passed;
+}
+
+/// The upstream-TLS leg: four exchanges through the plaintext listener
+/// whose cluster dials the terminating listener over TLS. The bodies are
+/// compared byte-for-byte, not by length, because a transform seam that
+/// loses or reorders bytes is exactly what a length-only check cannot
+/// see — and the bulk GET is the case where the origin's response
+/// crosses a TLS record boundary before zoxy forwards it.
+///
+/// One keep-alive connection carries all four exchanges. Upstream TLS
+/// parks and reuses one session across the leg (Stage 1 now includes
+/// parking), so the hop accepts and handshakes once; a regression back
+/// to dial-per-request would fail the accept and handshake equalities
+/// below rather than pass quietly.
+fn upstreamTlsPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
+    assert(ports.tls_hop != 0);
+    assert(ports.admin != 0);
+    var host_buffer: [32]u8 = undefined;
+    const host = try std.fmt.bufPrint(&host_buffer, "127.0.0.1:{d}", .{ports.tls_hop});
+    // Sized for the largest body this leg compares; the smaller ones
+    // reuse it, and `expectUpstreamTlsResponse` checks the bound before
+    // reading the capture.
+    const captured = try arena.alloc(u8, @as(usize, origin_module.large_body_bytes));
+    try single_client.connect(io, ports.tls_hop);
+    defer single_client.close();
+
+    var passed = true;
+    const small = try single_client.getCaptured(host, "/", .keep_alive, null, captured);
+    if (!expectUpstreamTlsResponse(small, captured, origin_module.body, "small GET")) passed = false;
+
+    const large = try single_client.getCaptured(
+        host,
+        origin_module.large_path,
+        .keep_alive,
+        null,
+        captured,
+    );
+    if (!expectUpstreamTlsResponse(large, captured, &origin_module.large_body, "bulk GET")) {
+        passed = false;
+    }
+
+    const posted = try single_client.post(
+        host,
+        "/echo",
+        .keep_alive,
+        upstream_tls_post_body,
+        captured,
+    );
+    if (!expectUpstreamTlsResponse(
+        posted,
+        captured,
+        upstream_tls_post_body,
+        "Content-Length POST",
+    )) passed = false;
+
+    const chunked = try single_client.postChunked(
+        host,
+        "/echo",
+        .keep_alive,
+        upstream_tls_chunked_body,
+        captured,
+    );
+    if (!expectUpstreamTlsResponse(
+        chunked,
+        captured,
+        upstream_tls_chunked_body,
+        "chunked POST",
+    )) passed = false;
+
+    const scrape = try scrape_module.parse(try scrape_module.fetch(arena, io, ports.admin));
+    // The origin-served exchanges the run has completed by this scrape.
+    // The bodies leg's two answers never reached an origin, so they are
+    // absent here by construction — the same partition `finishExchange`
+    // draws inside the process.
+    const responses_expected: u64 = http_exchanges + sticky_exchanges +
+        (allowlist_exchanges - allowlist_refused) + upstream_tls_access_lines;
+    const responses = counterOf(&scrape, "l7_responses") orelse return false;
+    if (responses != responses_expected) {
+        std.debug.print(
+            "FAIL: l7_responses reads {d} after the upstream-TLS leg, not the {d} exchanges before it\n",
+            .{ responses, responses_expected },
+        );
+        passed = false;
+    }
+    // The hop's own labeled series: four responses against the one
+    // endpoint it dialed. This is the counter-side witness that the
+    // requests were routed to `upstream_tls_cluster`, not merely that
+    // some listener answered them.
+    const endpoint_label = try std.fmt.allocPrint(
+        arena,
+        "endpoint_responses{{cluster=\"{s}\",endpoint=\"127.0.0.1:{d}\"}}",
+        .{ upstream_tls_cluster, ports.tls },
+    );
+    const hop_responses = counterOf(&scrape, endpoint_label) orelse return false;
+    if (hop_responses != upstream_tls_requests) {
+        std.debug.print(
+            "FAIL: {s} reads {d}, not the {d} hop exchanges\n",
+            .{ endpoint_label, hop_responses, upstream_tls_requests },
+        );
+        passed = false;
+    }
+    // The server side of the hop: the TLS listener completed exactly the
+    // handshakes the upstream dials caused — the tunnel leg's fresh dial
+    // (which ran first) plus this leg's own. A hop that dialed in the
+    // clear would leave this at zero while every body above still
+    // arrived.
+    const hop_handshakes = tunnel_hop_connections + upstream_tls_hop_connections;
+    const verdicts = [_]struct { name: []const u8, expected: u64 }{
+        .{
+            .name = "tls_handshakes_completed",
+            .expected = hop_handshakes,
+        },
+        .{
+            .name = "tls_tickets_issued",
+            .expected = @as(u64, hop_handshakes) * tls_tickets_per_handshake,
+        },
+        .{ .name = "tls_handshake_failed", .expected = 0 },
+        .{ .name = "tls_resumed", .expected = 0 },
+        .{ .name = "upstream_connect_failed", .expected = 0 },
+    };
+    for (verdicts) |verdict| {
+        const value = counterOf(&scrape, verdict.name) orelse {
+            passed = false;
+            continue;
+        };
+        if (value != verdict.expected) {
+            std.debug.print(
+                "FAIL: {s} reads {d}, not {d}, after the upstream-TLS leg\n",
+                .{ verdict.name, value, verdict.expected },
+            );
+            passed = false;
+        }
+    }
+    // The direct HTTPS leg is the only one after this, so the whole-run
+    // accept equality still lands on `tlsPassed`; here it is short by
+    // exactly that leg's connection.
+    const opened_by_here = connections_expected - tls_connections;
+    const accepted = counterOf(&scrape, "accepted") orelse return false;
+    if (accepted != opened_by_here) {
+        std.debug.print(
+            "FAIL: {d} connections accepted, not the {d} opened by the upstream-TLS leg\n",
+            .{ accepted, opened_by_here },
+        );
+        passed = false;
+    }
+    return passed;
+}
+
+/// One response from the hop, compared against the bytes the origin was
+/// given. `edited` is required because the hop listener carries the same
+/// #175 response filter as the plaintext load listener: its absence
+/// would mean the response came from somewhere other than the listener
+/// this leg entered.
+fn expectUpstreamTlsResponse(
+    response: client_module.Response,
+    captured: []u8,
+    expected: []const u8,
+    role: []const u8,
+) bool {
+    assert(role.len >= 1);
+    assert(expected.len >= 1);
+    if (response.status != 200) {
+        std.debug.print(
+            "FAIL: the upstream-TLS {s} answered {d}, not 200\n",
+            .{ role, response.status },
+        );
+        return false;
+    }
+    if (response.body_bytes != expected.len) {
+        std.debug.print(
+            "FAIL: the upstream-TLS {s} body was {d} bytes, not {d}\n",
+            .{ role, response.body_bytes, expected.len },
+        );
+        return false;
+    }
+    if (response.body_bytes > captured.len) {
+        std.debug.print(
+            "FAIL: the upstream-TLS {s} body outpaced this leg's capture\n",
+            .{role},
+        );
+        return false;
+    }
+    if (!std.mem.eql(u8, captured[0..response.body_bytes], expected)) {
+        const mismatch = std.mem.indexOfDiff(u8, captured[0..response.body_bytes], expected) orelse 0;
+        std.debug.print(
+            "FAIL: the upstream-TLS {s} body changed across the hop (first difference at byte {d})\n",
+            .{ role, mismatch },
+        );
+        return false;
+    }
+    if (!response.edited) {
+        std.debug.print(
+            "FAIL: the upstream-TLS {s} carried no X-Zoxy-Smoke stamp\n",
+            .{role},
+        );
+        return false;
+    }
+    if (response.sticky_tag != null) {
+        std.debug.print(
+            "FAIL: the upstream-TLS {s} announced an endpoint tag\n",
+            .{role},
+        );
+        return false;
+    }
+    return true;
+}
+
 /// The #125 leg: a real TLS 1.3 handshake against the terminating
 /// listener, `tls_requests` exchanges over the session it opens, and a
 /// `close_notify` to end it — then the counters on the run's last scrape.
@@ -1583,9 +1968,13 @@ fn tlsPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
 
     enterStage(.https_scrape);
     const scrape = try scrape_module.parse(try scrape_module.fetch(arena, io, ports.admin));
+    // This leg's session plus the ones the upstream-TLS hop and the
+    // upgrade tunnel caused when their clusters dialed this same
+    // listener. All are real server handshakes, and counting them
+    // together is the whole-run equality.
+    const handshakes_expected = 1 + upstream_tls_hop_connections + tunnel_hop_connections;
     const verdicts = [_]struct { name: []const u8, expected: u64 }{
-        // One session, completed: the handshake ran once and finished.
-        .{ .name = "tls_handshakes_completed", .expected = 1 },
+        .{ .name = "tls_handshakes_completed", .expected = handshakes_expected },
         // And nothing on the failure side. Stated as equalities against
         // zero rather than left unread, because every one of these is a
         // rung a working run must never reach — a session that failed and
@@ -1595,7 +1984,10 @@ fn tlsPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         // rather than only in a simulator: it is what carries the ACK
         // that keeps a client's first request out of its own Nagle queue,
         // so a deployment issuing none has the ~45 ms stall back.
-        .{ .name = "tls_tickets_issued", .expected = tls_tickets_per_handshake },
+        .{
+            .name = "tls_tickets_issued",
+            .expected = @as(u64, handshakes_expected) * tls_tickets_per_handshake,
+        },
         // And nothing resumed: this client is offered tickets and never
         // returns one, so a count here would mean the counter fires on
         // something other than resumption.
@@ -1768,10 +2160,17 @@ fn drain(io: Io, child: *std.process.Child, running: *bool) !bool {
 /// Count what the run wrote. The whole file is read at once: the log is
 /// bounded by the load this harness issued, and a file bigger than the
 /// cap is itself the finding.
-fn readAccessLog(arena: std.mem.Allocator, io: Io) !LogCounts {
+fn readAccessLog(arena: std.mem.Allocator, io: Io, ports: *const Ports) !LogCounts {
+    assert(ports.tls != 0);
     const bytes_max = @as(usize, access_log_lines_expected + 64) * 1024;
     const text = try Io.Dir.cwd().readFileAlloc(io, access_log_path, arena, .limited(bytes_max));
     assert(text.len <= bytes_max);
+    const cluster_needle = "\"cluster\":\"" ++ upstream_tls_cluster ++ "\"";
+    const endpoint_needle = try std.fmt.allocPrint(
+        arena,
+        "\"upstream\":\"127.0.0.1:{d}\"",
+        .{ports.tls},
+    );
     var counts: LogCounts = .{};
     var remaining = std.mem.splitScalar(u8, text, '\n');
     while (remaining.next()) |line| {
@@ -1791,6 +2190,15 @@ fn readAccessLog(arena: std.mem.Allocator, io: Io) !LogCounts {
             if (std.mem.indexOf(u8, line, "\"outcome\":\"responded\"") != null) {
                 counts.http_responded += 1;
             }
+            // A tunnel is the one `closed` line and the one `101`. Both
+            // facts are counted so the log verdict can say which kind of
+            // line went missing rather than only that the total moved.
+            if (std.mem.indexOf(u8, line, "\"outcome\":\"closed\"") != null) {
+                counts.http_closed += 1;
+            }
+            if (std.mem.indexOf(u8, line, "\"status\":101") != null) {
+                counts.http_tunnels += 1;
+            }
             // The #140 join, on the real wire: every http line must
             // carry the client's correlation header, and every line
             // whose exchange reached the origin must carry the origin's
@@ -1802,6 +2210,12 @@ fn readAccessLog(arena: std.mem.Allocator, io: Io) !LogCounts {
             }
             if (std.mem.indexOf(u8, line, logged_origin_tag) != null) {
                 counts.http_with_origin_tag += 1;
+            }
+            if (std.mem.indexOf(u8, line, cluster_needle) != null) {
+                counts.http_upstream_tls += 1;
+            }
+            if (std.mem.indexOf(u8, line, endpoint_needle) != null) {
+                counts.http_upstream_tls_endpoint += 1;
             }
         } else {
             if (std.mem.indexOf(u8, line, "\"kind\":\"l4\"") != null) {
@@ -1948,11 +2362,11 @@ fn spawnWatchdogZoxy(io: Io, zoxy_path: []const u8) !std.process.Child {
     });
 }
 
-/// Two loopback ports the kernel is not using, held open together so it
+/// Loopback ports the kernel is not using, held open together so it
 /// cannot hand out the same one twice, then released for zoxy to bind.
 /// There is a window between the release and zoxy's bind; nothing can
 /// close it from out here, and it is far smaller than the collision a
-/// hard-coded pair would carry on a shared runner.
+/// hard-coded set would carry on a shared runner.
 fn reservePorts(io: Io) !Ports {
     var http_address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var http_listener = try http_address.listen(io, .{ .mode = .stream });
@@ -1960,34 +2374,48 @@ fn reservePorts(io: Io) !Ports {
     var l4_listener = try l4_address.listen(io, .{ .mode = .stream });
     var tls_address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var tls_listener = try tls_address.listen(io, .{ .mode = .stream });
+    var tls_hop_address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var tls_hop_listener = try tls_hop_address.listen(io, .{ .mode = .stream });
     var admin_address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var admin_listener = try admin_address.listen(io, .{ .mode = .stream });
     const ports: Ports = .{
         .http = http_listener.socket.address.getPort(),
         .l4 = l4_listener.socket.address.getPort(),
         .tls = tls_listener.socket.address.getPort(),
+        .tls_hop = tls_hop_listener.socket.address.getPort(),
         .admin = admin_listener.socket.address.getPort(),
     };
     http_listener.deinit(io);
     l4_listener.deinit(io);
     tls_listener.deinit(io);
+    tls_hop_listener.deinit(io);
     admin_listener.deinit(io);
     assert(ports.http != 0);
     assert(ports.l4 != 0);
     assert(ports.tls != 0);
+    assert(ports.tls_hop != 0);
     assert(ports.admin != 0);
     assert(ports.http != ports.l4);
+    assert(ports.http != ports.tls);
+    assert(ports.http != ports.tls_hop);
     assert(ports.http != ports.admin);
+    assert(ports.l4 != ports.tls);
+    assert(ports.l4 != ports.tls_hop);
     assert(ports.l4 != ports.admin);
+    assert(ports.tls != ports.tls_hop);
+    assert(ports.tls != ports.admin);
+    assert(ports.tls_hop != ports.admin);
     return ports;
 }
 
-/// Both protocols against one origin (§6, §7), with the access log on a
-/// file rather than stdout: the file is what this gate counts, and a pipe
+/// Both protocols against one origin (§6, §7), plus a TLS listener and
+/// the plaintext hop that dials it (§4), with the access log on a file
+/// rather than stdout: the file is what this gate counts, and a pipe
 /// nobody drains is a drop rung (§8) waiting to make the count a lie.
 fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_port: u16) !void {
     assert(origin_port != 0);
     assert(ports.http != 0);
+    assert(ports.tls_hop != 0);
     const config_json = try std.fmt.allocPrint(arena, config_template, .{
         ports.http,
         allowed_path,
@@ -1998,9 +2426,11 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         ports.tls,
         tls_cert_path,
         tls_key_path,
+        ports.tls_hop,
         origin_port,
         health_probe_timeout_ms,
         origin_port,
+        ports.tls,
         not_found_body,
         robots_path,
         ports.admin,
@@ -2012,6 +2442,7 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         zoxy_limits.relay_buffers,
         zoxy_limits.upstream_slots,
         zoxy_limits.tls_engines,
+        zoxy_limits.tunnels,
     });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = config_json });
 }
@@ -2044,8 +2475,15 @@ const config_template =
     \\          ] }} }},
     \\        {{ "bind": "127.0.0.1:{d}", "l4": {{ "cluster": "origin" }} }},
     \\        {{ "bind": "127.0.0.1:{d}",
-    \\          "http": {{ "routes": [{{ "host": "127.0.0.1", "prefix": "/", "cluster": "origin" }}] }},
-    \\          "tls": {{ "cert": "{s}", "key": "{s}" }} }}
+    \\          "http": {{ "routes": [{{ "host": "127.0.0.1", "prefix": "/", "cluster": "origin" }}],
+    \\                     "upgrades": {{ "websocket": true }} }},
+    \\          "tls": {{ "cert": "{s}", "key": "{s}" }} }},
+    \\        {{ "bind": "127.0.0.1:{d}", "http": {{
+    \\          "routes": [{{ "host": "127.0.0.1", "prefix": "/", "cluster": "upstream-tls" }}],
+    \\          "upgrades": {{ "websocket": true }},
+    \\          "response_filters": [
+    \\              {{ "actions": [{{ "header_set": {{ "name": "X-Zoxy-Smoke", "value": "1" }} }}] }}
+    \\          ] }} }}
     \\    ],
     \\    "clusters": {{
     \\        "origin": {{
@@ -2055,6 +2493,11 @@ const config_template =
     \\        "sticky": {{
     \\            "endpoints": ["127.0.0.1:{d}"],
     \\            "pick": {{ "policy": "hash", "key": "cookie", "name": "zoxy-smoke-srv" }}
+    \\        }},
+    \\        "upstream-tls": {{
+    \\            "endpoints": ["127.0.0.1:{d}"],
+    \\            "tls": {{ "server_name": "spike.zoxy.test",
+    \\                     "ca_file": "src/tls/testdata/cert.pem" }}
     \\        }}
     \\    }},
     \\    "bodies": {{
@@ -2076,7 +2519,8 @@ const config_template =
     \\        "conn_slots": {d},
     \\        "relay_buffers": {d},
     \\        "upstream_slots": {d},
-    \\        "tls_engines": {d}
+    \\        "tls_engines": {d},
+    \\        "tunnels": {d}
     \\    }}
     \\}}
     \\

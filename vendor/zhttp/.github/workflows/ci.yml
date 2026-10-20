@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  # The HTTP/1.1 and HTTP/2 library, on the released compiler.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The released compiler, not master: `build.zig.zon` declares
+      # `minimum_zig_version = "0.17.0"`, and a job that tracked master would
+      # go red for reasons that have nothing to do with this library.
+      #
+      # v2 of the action and not v1: v1 asks for archives named
+      # `zig-<os>-<arch>-<version>.tar.xz`, which no longer exist — 0.17.0 is
+      # published as `zig-<arch>-<os>-<version>.tar.xz` — so it 404s on every
+      # mirror and then falls back to the master channel, which is what failed
+      # every run from v0.15.0 to v0.20.0.
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev
+
+      - name: Run Tests
+        run: zig build test
+
+      # The formatter is part of the toolchain: keep the tree in the shape it
+      # produces so a `zig fmt --check` never fails for unrelated reasons.
+      - name: Check Formatting
+        run: zig fmt --check src benches tests examples
+
+      - name: Build Examples
+        run: zig build
+
+  # HTTP/3 is opt-in. The transport is the vendored zquic tree and the
+  # handshake uses OpenSSL's QUIC-TLS callbacks, which Ubuntu's OpenSSL 3.0
+  # does not have; this job builds/caches OpenSSL 3.6. No
+  # libngtcp2/libnghttp3 is built or linked.
+  h3:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y perl
+
+      # OpenSSL 3.6 has SSL_set_quic_tls_cbs, the callback interface this
+      # stack drives. 3.0 (Ubuntu 24.04) has no QUIC-TLS API at all.
+      - name: Cache OpenSSL
+        id: openssl-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/h3
+          key: openssl-3.6.5-${{ runner.os }}
+
+      - name: Build OpenSSL
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          prefix="$RUNNER_TEMP/h3"
+          curl -fsSL https://github.com/openssl/openssl/releases/download/openssl-3.6.5/openssl-3.6.5.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/openssl-3.6.5"
+          ./Configure --prefix="$prefix" --libdir=lib no-tests no-docs no-apps
+          make -j"$(nproc)"
+          make install_sw
+
+      - name: Run Tests and Build with HTTP/3
+        env:
+          LD_LIBRARY_PATH: ${{ runner.temp }}/h3/lib
+          H3: -Dh3=true -Dopenssl-lib=${{ runner.temp }}/h3/lib
+        run: |
+          zig build test $H3
+          zig build test-native $H3
+          zig build test-native $H3 --fuzz=1000
+          zig build $H3

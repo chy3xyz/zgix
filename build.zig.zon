@@ -25,12 +25,17 @@
     .fingerprint = 0xa872299f36b5e445, // Changing this has security and trust implications.
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
+    // Every dependency is vendored under `deps/` and referenced by path, so
+    // a checkout builds with no package fetching. Each entry records the
+    // upstream URL and commit it was taken from; an entry whose copy also
+    // carries the Zig 0.17 compatibility delta says so. The audit histories
+    // below still describe what moved and why.
     .dependencies = .{
         // Audited fork: zoxy-io/libxev branch zoxy-buffer-group = upstream
         // 9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf (the audited snapshot)
@@ -139,8 +144,10 @@
         // arms discard which errno failed, which is what left a c10k run
         // reporting 227,628 indistinguishable failures.
         .libxev = .{
-            .url = "git+https://github.com/zoxy-io/libxev#010be2aa1a7e760031f213ad4ed8ff3f1b68a4d0",
-            .hash = "libxev-0.0.0-86vtc6d2FADTmwZO_3A6KLpUc8d0dzRsy018hm65aNuI",
+            // upstream: git+https://github.com/zoxy-io/libxev#010be2aa1a7e760031f213ad4ed8ff3f1b68a4d0
+            // + Zig 0.17 compatibility delta (build script, repetition,
+            //   type-info, std.meta.Int, watcher decl reflection)
+            .path = "deps/libxev",
         },
         // Load generator, §9 Tier 0/1 only — never linked into the proxy
         // (no `src/` file imports it), so a bump moves what the benchmark
@@ -182,13 +189,15 @@
         // the *generator*, and zrk's own TLS is what a client's would
         // be. Bring the two back together when zrk moves.
         //
-        // The zio bump beside it is not optional. zrk carries zio 0.17.0 at
-        // 3820667, and the rule below — that this file's zio must be
-        // *exactly* zrk's — is what keeps the harness and zrk's runner on
-        // one runtime.
+        // The zio bump beside it is not optional. zrk's build.zig.zon now
+        // carries zio 0.19.0 at 4e4e1ed, and the rule below — that this
+        // file's zio must be *exactly* zrk's — is what keeps the harness
+        // and zrk's runner on one runtime.
         .zrk = .{
-            .url = "git+https://github.com/zoxy-io/zrk?ref=main#391145c959dcd87b6a625126f533fa5c385a83a1",
-            .hash = "zrk-2.3.0-WqdFO8ivBgAuhlauaaH-f0kFVtb7HN-Whto424YYd2AT",
+            // upstream: git+https://github.com/zoxy-io/zrk?ref=main#391145c959dcd87b6a625126f533fa5c385a83a1
+            // + Zig 0.17 compatibility delta (std.Io operate(), build
+            //   script, repetition, type-info, zio path dependency)
+            .path = "deps/zrk",
         },
         // zrk embeds its load off a zio (io_uring) runtime, not the default
         // std.Io.Threaded backend — plain Threaded is missing pieces zrk
@@ -201,14 +210,17 @@
         // not patch is a second thing to keep in sync with zrk's pin, and
         // the only way it can differ from upstream is by being wrong.
         //
-        // 3820667 is what zrk 2.3.0 carries — which is the only reason
-        // this line has that value. It moved with the zrk bump above and
-        // for no other reason; the lockstep rule is the whole content of
-        // this pin.
+        // 4e4e1ed is what the zrk checkout carries. The Zig 0.17 migration
+        // is the only reason this line moved: it is the zio commit whose
+        // minimum Zig version is 0.17.0, and whose `std.Io` implementation
+        // matches 0.17's vtable. It moved with the zrk bump above and for
+        // no other reason; the lockstep rule is the whole content of this
+        // pin.
         //
-        // It is 121 commits ahead of the b822fda this used to pin, and zero
-        // behind, so the fix that pin existed for is contained rather than
-        // lost: zio#628, "flush a full submission queue instead of dropping
+        // The 0.16-era pin before this one was 121 commits ahead of the
+        // b822fda it replaced, and zero behind, so the fix that pin existed
+        // for is contained rather than lost: zio#628, "flush a full
+        // submission queue instead of dropping
         // SQEs". Before it, zio dropped a cancel when the io_uring SQ was
         // full, leaving the target completion stuck `.running` forever and the
         // awaiting task blocked with it — which a c10k load reaches reliably,
@@ -217,10 +229,10 @@
         // `compare/b822fda...df666c2` before moving, because "the fix is still
         // in there" is exactly the assumption a bump is where you lose.
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio?ref=main#38206678edca2abf4e27ce18bb963bfa6f4297ab",
-            .hash = "zio-0.17.0-xHbVVK-DKABkbm_XZgK-21SgNvYr9U5zr1MgOw7Q6JtM",
+            // upstream: git+https://github.com/lalinsky/zio?ref=main#4e4e1ed10da974f15b119207d346a78cc6c363e4
+            .path = "deps/zio",
         },
-        // Audited fork: zoxy-io/hparse, pinned by content hash; the pin
+        // Audited fork: zoxy-io/hparse, vendored under deps/hparse; the copy
         // moves only after re-audit, and the paragraphs below are that
         // record.
         //
@@ -405,8 +417,9 @@
         // terminator and one-shot parses a head already known to be
         // complete, and the comment there says why.
         .hparse = .{
-            .url = "git+https://github.com/zoxy-io/hparse#2dcaf4599dcd22628fcc6b7c5ea7a666d2ac8cc1",
-            .hash = "hparse-0.2.0-IukW0vD7AwCZKtRWydtUnnrsIsiHHYvVNPRsyty5M7GX",
+            // upstream: git+https://github.com/zoxy-io/hparse#2dcaf4599dcd22628fcc6b7c5ea7a666d2ac8cc1
+            // + Zig 0.17 compatibility delta (build script, repetition, @Int)
+            .path = "deps/hparse",
         },
         // libcrypto, built by Zig rather than found on the system.
         //
@@ -432,8 +445,8 @@
         // libcrypto version steps back one minor release onto a supported LTS
         // branch, and forward two years from the package's own 3.3.2.
         .openssl = .{
-            .url = "git+https://github.com/zoxy-io/openssl?ref=main#0377b65001a49a33e5fd69f2ad561f0f9dcb0d69",
-            .hash = "openssl-3.5.7-TC9C3eDUfwH9TWFR4TWTjcA8oCo_VrNIqg20l63i8uZF",
+            // upstream: git+https://github.com/zoxy-io/openssl?ref=main#0377b65001a49a33e5fd69f2ad561f0f9dcb0d69
+            .path = "deps/openssl",
         },
         // zssl — the TLS 1.3 engine (DESIGN.md §4), written for this
         // proxy rather than adapted to it. It replaces the audited
@@ -550,14 +563,17 @@
         // RFC 8446 §4.3.2's CertificateRequest, RFC 5705 exporters, and
         // 0-RTT with the strike register RFC 8446 §8.2 needs.
         .zssl = .{
-            .url = "git+https://github.com/zoxy-io/zssl#91a985a4a1b408702d36e14986211cbc29953e9f",
-            .hash = "zssl-0.0.1-5ocyiNepEAAWCUGlH-CSBBwkdmjUf31MPSjD-hk5QRCo",
+            // upstream: git+https://github.com/zoxy-io/zssl#91a985a4a1b408702d36e14986211cbc29953e9f
+            // + Zig 0.17 compatibility delta (translate-c, repetition,
+            //   type-info, PSS signature pointer)
+            .path = "deps/zssl",
         },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "deps",
         // For example...
         //"LICENSE",
         //"README.md",

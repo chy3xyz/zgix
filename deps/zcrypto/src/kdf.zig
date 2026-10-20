@@ -1,0 +1,416 @@
+//! Key derivation functions - HKDF, PBKDF2
+//!
+//! Secure key derivation for cryptographic applications.
+//! Implements TLS 1.3 and QUIC key derivation patterns.
+
+const std = @import("std");
+
+const HkdfSha384 = std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384);
+
+fn decodeHex(comptime N: usize, hex: []const u8) [N]u8 {
+    var out: [N]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
+    return out;
+}
+
+/// HKDF PRKs are exactly one hash output wide, so the secret length selects
+/// the hash. Returns the hash output size in bytes.
+fn hashLenForSecret(secret: []const u8) !usize {
+    return switch (secret.len) {
+        32, 48, 64 => secret.len,
+        else => error.InvalidSecretLength,
+    };
+}
+
+fn hkdfExpandFromSecret(secret: []const u8, info: []const u8, output: []u8) !void {
+    switch (secret.len) {
+        32 => std.crypto.kdf.hkdf.HkdfSha256.expand(output, info, secret[0..32].*),
+        48 => HkdfSha384.expand(output, info, secret[0..48].*),
+        64 => std.crypto.kdf.hkdf.HkdfSha512.expand(output, info, secret[0..64].*),
+        else => return error.InvalidSecretLength,
+    }
+}
+
+/// HKDF using SHA-256
+pub fn hkdfSha256(
+    allocator: std.mem.Allocator,
+    ikm: []const u8, // Input Key Material
+    salt: []const u8,
+    info: []const u8,
+    length: usize,
+) ![]u8 {
+    const output = try allocator.alloc(u8, length);
+    errdefer allocator.free(output);
+
+    // HKDF Extract
+    const prk = std.crypto.kdf.hkdf.HkdfSha256.extract(salt, ikm);
+
+    // HKDF Expand
+    std.crypto.kdf.hkdf.HkdfSha256.expand(output, info, prk);
+    return output;
+}
+
+/// HKDF using SHA-512
+pub fn hkdfSha512(
+    allocator: std.mem.Allocator,
+    ikm: []const u8,
+    salt: []const u8,
+    info: []const u8,
+    length: usize,
+) ![]u8 {
+    const output = try allocator.alloc(u8, length);
+    errdefer allocator.free(output);
+
+    // HKDF Extract
+    const prk = std.crypto.kdf.hkdf.HkdfSha512.extract(salt, ikm);
+
+    // HKDF Expand
+    std.crypto.kdf.hkdf.HkdfSha512.expand(output, info, prk);
+    return output;
+}
+
+/// PBKDF2 using SHA-256
+pub fn pbkdf2Sha256(
+    allocator: std.mem.Allocator,
+    password: []const u8,
+    salt: []const u8,
+    iterations: u32,
+    length: usize,
+) ![]u8 {
+    const output = try allocator.alloc(u8, length);
+    errdefer allocator.free(output);
+
+    try std.crypto.pwhash.pbkdf2(output, password, salt, iterations, std.crypto.auth.hmac.sha2.HmacSha256);
+    return output;
+}
+
+/// PBKDF2 using SHA-512.
+///
+/// Required by BIP-39 seed derivation, which fixes the PRF at HMAC-SHA512. The
+/// SHA-256 variant above is not interchangeable there: it derives a different
+/// seed from the same mnemonic, so a wallet built on it would be silently
+/// incompatible with every other BIP-39 implementation.
+pub fn pbkdf2Sha512(
+    allocator: std.mem.Allocator,
+    password: []const u8,
+    salt: []const u8,
+    iterations: u32,
+    length: usize,
+) ![]u8 {
+    const output = try allocator.alloc(u8, length);
+    errdefer allocator.free(output);
+
+    try std.crypto.pwhash.pbkdf2(output, password, salt, iterations, std.crypto.auth.hmac.sha2.HmacSha512);
+    return output;
+}
+
+/// TLS 1.3 HKDF-Expand-Label implementation
+pub fn hkdfExpandLabel(
+    allocator: std.mem.Allocator,
+    secret: []const u8,
+    label: []const u8,
+    context: []const u8,
+    length: usize,
+) ![]u8 {
+    // Construct the HkdfLabel structure:
+    // struct {
+    //     uint16 length = Length;
+    //     opaque label<7..255> = "tls13 " + Label;
+    //     opaque context<0..255> = Context;
+    // } HkdfLabel;
+
+    const tls_prefix = "tls13 ";
+    const full_label_len = tls_prefix.len + label.len;
+
+    // The label and context lengths are each written into a single byte and
+    // the output length into a uint16, so oversized values have to be
+    // rejected here. Narrowing them with @intCast is illegal behaviour: it
+    // aborted the process instead of failing the call. RFC 5869 Section 2.3
+    // also caps HKDF-Expand at 255*HashLen, which for these hashes stays well
+    // inside the uint16 length field.
+    if (full_label_len > 255) return error.LabelTooLong;
+    if (context.len > 255) return error.ContextTooLong;
+    if (length > 255 * try hashLenForSecret(secret)) return error.OutputTooLong;
+
+    // Calculate total HkdfLabel size
+    const hkdf_label_size = 2 + 1 + full_label_len + 1 + context.len;
+    const hkdf_label = try allocator.alloc(u8, hkdf_label_size);
+    defer allocator.free(hkdf_label);
+
+    var offset: usize = 0;
+
+    // Length (big-endian uint16)
+    hkdf_label[offset] = @intCast((length >> 8) & 0xFF);
+    hkdf_label[offset + 1] = @intCast(length & 0xFF);
+    offset += 2;
+
+    // Label length
+    hkdf_label[offset] = @intCast(full_label_len);
+    offset += 1;
+
+    // Label content
+    @memcpy(hkdf_label[offset .. offset + tls_prefix.len], tls_prefix);
+    offset += tls_prefix.len;
+    @memcpy(hkdf_label[offset .. offset + label.len], label);
+    offset += label.len;
+
+    // Context length
+    hkdf_label[offset] = @intCast(context.len);
+    offset += 1;
+
+    // Context content
+    if (context.len > 0) {
+        @memcpy(hkdf_label[offset .. offset + context.len], context);
+    }
+
+    const output = try allocator.alloc(u8, length);
+    errdefer allocator.free(output);
+
+    try hkdfExpandFromSecret(secret, hkdf_label, output);
+    return output;
+}
+
+/// Derive key material using HKDF with convenient defaults
+pub fn deriveKey(
+    allocator: std.mem.Allocator,
+    master_secret: []const u8,
+    label: []const u8,
+    length: usize,
+) ![]u8 {
+    return hkdfSha256(allocator, master_secret, "", label, length);
+}
+
+/// Argon2id password hashing (RFC 9106) - Recommended for new applications
+/// Note: Uses PBKDF2 fallback while the current Zig stdlib Argon2 path is Io-driven
+pub fn argon2id(
+    allocator: std.mem.Allocator,
+    password: []const u8,
+    salt: []const u8,
+    key_length: usize,
+) ![]u8 {
+    const output = try allocator.alloc(u8, key_length);
+    errdefer allocator.free(output);
+
+    // Use PBKDF2 as fallback since stdlib Argon2 currently expects an Io-driven flow
+    // PBKDF2 with high iteration count provides good security
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    try std.crypto.pwhash.pbkdf2(output, password, salt, 600000, HmacSha256);
+
+    return output;
+}
+
+/// Secure key stretching for user passwords using Argon2id
+pub fn stretchPassword(
+    allocator: std.mem.Allocator,
+    password: []const u8,
+    salt: []const u8,
+    key_length: usize,
+) ![]u8 {
+    return argon2id(allocator, password, salt, key_length);
+}
+
+/// Legacy PBKDF2 for compatibility (use Argon2id for new code)
+pub fn legacyStretchPassword(
+    allocator: std.mem.Allocator,
+    password: []const u8,
+    salt: []const u8,
+    key_length: usize,
+) ![]u8 {
+    // Use reasonable iteration count for 2025
+    const iterations = 600_000;
+    return pbkdf2Sha256(allocator, password, salt, iterations, key_length);
+}
+
+test "hkdf sha256 basic" {
+    const allocator = std.testing.allocator;
+
+    const ikm = "input key material";
+    const salt = "salt";
+    const info = "info";
+
+    const derived = try hkdfSha256(allocator, ikm, salt, info, 32);
+    defer allocator.free(derived);
+
+    try std.testing.expectEqual(@as(usize, 32), derived.len);
+}
+
+test "hkdf sha256 RFC 5869 test case 1" {
+    const allocator = std.testing.allocator;
+
+    const ikm = blk: {
+        var bytes = std.mem.zeroes([22]u8);
+        @memset(bytes[0..], 0x0b);
+        break :blk bytes;
+    };
+    const salt = decodeHex(13, "000102030405060708090a0b0c");
+    const info = decodeHex(10, "f0f1f2f3f4f5f6f7f8f9");
+    const expected = decodeHex(42, "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865");
+
+    const actual = try hkdfSha256(allocator, &ikm, &salt, &info, expected.len);
+    defer allocator.free(actual);
+
+    try std.testing.expectEqualSlices(u8, &expected, actual);
+}
+
+test "tls 1.3 hkdf expand label" {
+    const allocator = std.testing.allocator;
+
+    const secret = blk: {
+        var bytes = std.mem.zeroes([32]u8);
+        @memset(bytes[0..], 0x11);
+        break :blk bytes;
+    };
+    const label = "key";
+    const context = "";
+
+    const derived = try hkdfExpandLabel(allocator, &secret, label, context, 16);
+    defer allocator.free(derived);
+
+    try std.testing.expectEqual(@as(usize, 16), derived.len);
+}
+
+test "tls 1.3 hkdf expand label matches stdlib expand for sha256 prk" {
+    const allocator = std.testing.allocator;
+
+    const secret = blk: {
+        var bytes = std.mem.zeroes([32]u8);
+        @memset(bytes[0..], 0x42);
+        break :blk bytes;
+    };
+    const label = "quic key";
+    const context = "";
+
+    const derived = try hkdfExpandLabel(allocator, &secret, label, context, 16);
+    defer allocator.free(derived);
+
+    var info: [2 + 1 + 6 + label.len + 1]u8 = undefined;
+    var offset: usize = 0;
+    info[offset] = 0;
+    info[offset + 1] = 16;
+    offset += 2;
+    info[offset] = 6 + label.len;
+    offset += 1;
+    @memcpy(info[offset .. offset + 6], "tls13 ");
+    offset += 6;
+    @memcpy(info[offset .. offset + label.len], label);
+    offset += label.len;
+    info[offset] = 0;
+
+    var expected: [16]u8 = undefined;
+    std.crypto.kdf.hkdf.HkdfSha256.expand(&expected, &info, secret);
+
+    try std.testing.expectEqualSlices(u8, &expected, derived);
+}
+
+test "pbkdf2 password stretching" {
+    const allocator = std.testing.allocator;
+
+    const password = "user-password-123";
+    const salt = "random-salt-bytes";
+
+    const key = try stretchPassword(allocator, password, salt, 32);
+    defer allocator.free(key);
+
+    try std.testing.expectEqual(@as(usize, 32), key.len);
+
+    // Same input should produce same output
+    const key2 = try stretchPassword(allocator, password, salt, 32);
+    defer allocator.free(key2);
+
+    try std.testing.expectEqualSlices(u8, key, key2);
+}
+
+test "pbkdf2 sha256 known-answer vectors" {
+    const allocator = std.testing.allocator;
+
+    const expected_1 = decodeHex(32, "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b");
+    const actual_1 = try pbkdf2Sha256(allocator, "password", "salt", 1, expected_1.len);
+    defer allocator.free(actual_1);
+    try std.testing.expectEqualSlices(u8, &expected_1, actual_1);
+
+    const expected_2 = decodeHex(32, "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43");
+    const actual_2 = try pbkdf2Sha256(allocator, "password", "salt", 2, expected_2.len);
+    defer allocator.free(actual_2);
+    try std.testing.expectEqualSlices(u8, &expected_2, actual_2);
+}
+
+test "derive key convenience function" {
+    const allocator = std.testing.allocator;
+
+    const master = "master secret";
+    const label = "application key";
+
+    const key = try deriveKey(allocator, master, label, 24);
+    defer allocator.free(key);
+
+    try std.testing.expectEqual(@as(usize, 24), key.len);
+}
+
+test "argon2id password hashing" {
+    const allocator = std.testing.allocator;
+
+    const password = "secure-password-123";
+    const salt = "random-salt-16-bytes"; // Should be 16+ bytes
+
+    const key = try argon2id(allocator, password, salt, 32);
+    defer allocator.free(key);
+
+    try std.testing.expectEqual(@as(usize, 32), key.len);
+
+    // Same input should produce same output
+    const key2 = try argon2id(allocator, password, salt, 32);
+    defer allocator.free(key2);
+
+    try std.testing.expectEqualSlices(u8, key, key2);
+
+    // Different salt should produce different output
+    const different_salt = "different-salt-16b";
+    const key3 = try argon2id(allocator, password, different_salt, 32);
+    defer allocator.free(key3);
+
+    try std.testing.expect(!std.mem.eql(u8, key, key3));
+}
+
+test "hkdf expand label enforces TLS 1.3 field bounds" {
+    const allocator = std.testing.allocator;
+    const secret: [32]u8 = @splat(0x01);
+
+    // TLS 1.3 encodes the label as opaque label<7..255>, including the
+    // "tls13 " prefix, and the context as opaque context<0..255>. Both
+    // lengths are written into a single byte, so an oversized value has to be
+    // rejected rather than narrowed.
+    const long_label: [250]u8 = @splat('a');
+    try std.testing.expectError(error.LabelTooLong, hkdfExpandLabel(allocator, &secret, &long_label, "", 32));
+
+    const long_context: [256]u8 = @splat(0xab);
+    try std.testing.expectError(error.ContextTooLong, hkdfExpandLabel(allocator, &secret, "key", &long_context, 32));
+
+    // The HkdfLabel length field is a uint16, and HKDF-Expand itself is
+    // capped at 255*HashLen octets (RFC 5869 Section 2.3).
+    try std.testing.expectError(error.OutputTooLong, hkdfExpandLabel(allocator, &secret, "key", "", 65536));
+    try std.testing.expectError(error.OutputTooLong, hkdfExpandLabel(allocator, &secret, "key", "", 255 * 32 + 1));
+
+    // The largest in-range values must still work.
+    const max_label: [249]u8 = @splat('a');
+    const ok_label = try hkdfExpandLabel(allocator, &secret, &max_label, "", 32);
+    defer allocator.free(ok_label);
+
+    const max_context: [255]u8 = @splat(0xab);
+    const ok_context = try hkdfExpandLabel(allocator, &secret, "key", &max_context, 32);
+    defer allocator.free(ok_context);
+}
+
+test "hkdf expand label rejects unsupported secret lengths without leaking" {
+    const allocator = std.testing.allocator;
+
+    // Only SHA-256/384/512 sized secrets map to a supported hash. The failure
+    // path runs after both the label and output buffers are allocated, so the
+    // testing allocator also proves neither is leaked.
+    for ([_]usize{ 0, 1, 31, 33, 47, 63, 65 }) |len| {
+        const secret = try allocator.alloc(u8, len);
+        defer allocator.free(secret);
+        @memset(secret, 0x01);
+
+        try std.testing.expectError(error.InvalidSecretLength, hkdfExpandLabel(allocator, secret, "key", "", 32));
+    }
+}

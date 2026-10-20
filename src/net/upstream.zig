@@ -14,6 +14,7 @@ const std = @import("std");
 
 const constants = @import("../constants.zig");
 const Pool = @import("../mem/Pool.zig").Pool;
+const UpstreamTls = @import("../tls/UpstreamTls.zig");
 
 const assert = std.debug.assert;
 
@@ -92,6 +93,12 @@ pub fn UpstreamPool(comptime IoType: type) type {
         /// compares two candidates' counts and picks the calmer one.
         /// u16 holds the whole pool (`upstream_slots_max` ≤ 65535).
         leased_counts: []u16,
+        /// The server's engine pool, wired once at init by the only
+        /// owner that has one. `release` hands an attached engine back
+        /// here, so a direct pool caller cannot leak a slot that still
+        /// names a session; null in socket-free tests that never attach
+        /// one and in plaintext-only deployments.
+        tls_engines: ?*Pool(UpstreamTls),
 
         const Self = @This();
 
@@ -128,6 +135,14 @@ pub fn UpstreamPool(comptime IoType: type) type {
             /// timer compares this against the clock and reaps overdue
             /// connections with a synchronous close.
             deadline_ns: u64,
+            /// The upstream TLS engine driving this slot, or null on a
+            /// plaintext dial. Owned by the slot for its whole connected
+            /// life — leased, parked and reused — and released exactly
+            /// once, when the connection is actually closed. A parked
+            /// engine must be connected, unclosed and outbox-empty:
+            /// parking anything else would hand the next request a
+            /// session that cannot carry it.
+            tls: ?*UpstreamTls = null,
         };
 
         /// In-place init via out-pointer for pointer stability. `arena`
@@ -147,10 +162,20 @@ pub fn UpstreamPool(comptime IoType: type) type {
             @memset(pool.idle_heads, idle_none);
             pool.idle_count = 0;
             @memset(pool.leased_counts, 0);
+            pool.tls_engines = null;
             assert(pool.slot_pool.slots.len == count);
             assert(pool.idle_heads.len == keys.count);
             assert(pool.leased_counts.len == keys.count);
             assert(pool.leasedCount() == 0);
+        }
+
+        /// Wire the engine pool a TLS dial draws from. Called once, right
+        /// after both pools exist: `init` takes no dependency on TLS so a
+        /// plaintext-only deployment (and every socket-free test) keeps
+        /// paying nothing for it.
+        pub fn ownTlsEnginePool(pool: *Self, engines: *Pool(UpstreamTls)) void {
+            assert(pool.tls_engines == null);
+            pool.tls_engines = engines;
         }
 
         /// A fresh slot for a new dial to the endpoint, or null when the
@@ -167,6 +192,7 @@ pub fn UpstreamPool(comptime IoType: type) type {
             upstream.head_buffer = null;
             upstream.head_len = 0;
             upstream.deadline_ns = 0;
+            upstream.tls = null;
             const key = pool.keys.key(cluster_index, endpoint_index);
             pool.leased_counts[key] += 1;
             assert(pool.leased_counts[key] <= pool.slot_pool.slots.len);
@@ -183,6 +209,17 @@ pub fn UpstreamPool(comptime IoType: type) type {
             // whole upstream story exists to prevent: the caller releases
             // it first, and a parked slot provably holds no head bytes.
             assert(upstream.head_buffer == null);
+            // A parked TLS slot keeps its engine, so the engine has to be
+            // in a state that can carry another request: connected (the
+            // session's keys exist), not peer-closed (a close_notify
+            // forbids further application data), and drained (ciphertext
+            // still staged would belong to the last exchange and would be
+            // sent ahead of the next one).
+            if (upstream.tls) |engine| {
+                assert(engine.isConnected());
+                assert(!engine.peerClosed());
+                assert(engine.outboxEmpty());
+            }
             assert(upstream.idle_next == idle_none);
             assert(upstream.idle_prev == idle_none);
             const index = pool.slot_pool.indexOf(upstream);
@@ -251,10 +288,26 @@ pub fn UpstreamPool(comptime IoType: type) type {
         /// Returns a leased slot to the free list at connection
         /// teardown. A parked slot must be unparked first — releasing it
         /// directly would leave a dangling idle-list entry.
+        ///
+        /// An attached engine is returned here rather than dropped: a
+        /// slot that leaves with its engine pointer still set would strand
+        /// that engine in the server's pool for the rest of the process,
+        /// and with the pools sized one-to-one (`budget.zig`) every later
+        /// TLS dial would eventually shed. The server-level release runs
+        /// this first, so the common path arrives with `tls` null.
         pub fn release(pool: *Self, upstream: *Upstream) void {
             assert(!upstream.parked);
             assert(upstream.idle_next == idle_none);
             assert(upstream.idle_prev == idle_none);
+            if (upstream.tls) |engine| {
+                engine.deinit();
+                // An engine can only come from a server that wired its
+                // pool beside this one; a null here is a construction bug,
+                // not a condition.
+                const engines = pool.tls_engines orelse unreachable;
+                engines.release(engine);
+                upstream.tls = null;
+            }
             const key = pool.keys.key(upstream.cluster_index, upstream.endpoint_index);
             assert(pool.leased_counts[key] >= 1);
             pool.leased_counts[key] -= 1;
@@ -361,6 +414,97 @@ test "upstream: dial-park-checkout-release keeps the same connection" {
     try std.testing.expectEqual(generation_at_park, reused.generation);
 
     pool.release(reused);
+    try std.testing.expect(pool.isFullyReleased());
+}
+
+/// A connected engine without a wire: these tests exercise the pool's
+/// park/release accounting, and the pool asks the engine only for its
+/// state. `init` is real because `deinit` at release is.
+fn connectTestEngine(engine: *UpstreamTls) void {
+    engine.init(&.{
+        .client_random = @splat(0x11),
+        .x25519_private = @splat(0x22),
+        .server_name = "origin.test",
+    });
+    engine.hs.state = .connected;
+}
+
+test "upstream: a connected TLS slot parks with its engine and releases it once" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var pool: TestPool = undefined;
+    try pool.init(arena_state.allocator(), 2, test_keys);
+    var engines: Pool(UpstreamTls) = undefined;
+    try engines.init(arena_state.allocator(), 2);
+    pool.ownTlsEnginePool(&engines);
+
+    const upstream = pool.acquire(0, 0).?;
+    upstream.socket = 78;
+    const engine = engines.acquire().?;
+    connectTestEngine(engine);
+    upstream.tls = engine;
+
+    // Parking keeps the session with the slot: no deinit, no engine
+    // release, and the same engine is still there at checkout.
+    pool.park(upstream);
+    try std.testing.expectEqual(@as(u32, 1), pool.idle_count);
+    try std.testing.expect(upstream.tls == engine);
+    try std.testing.expectEqual(@as(u32, 1), engines.acquired_count);
+
+    const reused = pool.checkout(0, 0).?;
+    try std.testing.expectEqual(upstream, reused);
+    try std.testing.expect(reused.tls == engine);
+
+    // The connection closed: the slot and its engine both go back, and
+    // the slot no longer names a session that a later tenant could see.
+    pool.release(reused);
+    try std.testing.expect(reused.tls == null);
+    try std.testing.expect(pool.isFullyReleased());
+    try std.testing.expect(engines.isFullyReleased());
+}
+
+test "upstream: a TLS slot released after being parked returns its engine" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var pool: TestPool = undefined;
+    try pool.init(arena_state.allocator(), 1, test_keys);
+    var engines: Pool(UpstreamTls) = undefined;
+    try engines.init(arena_state.allocator(), 1);
+    pool.ownTlsEnginePool(&engines);
+
+    const upstream = pool.acquire(0, 0).?;
+    const engine = engines.acquire().?;
+    connectTestEngine(engine);
+    upstream.tls = engine;
+    pool.park(upstream);
+
+    // The origin closed its side while the slot sat parked. The proxy
+    // refuses to reuse it and releases it; the engine must still come
+    // back exactly once so the 1:1 pool accounting stays whole.
+    engine.hs.state = .close_received;
+    const stale = pool.checkout(0, 0).?;
+    pool.release(stale);
+
+    try std.testing.expect(stale.tls == null);
+    try std.testing.expect(pool.isFullyReleased());
+    try std.testing.expect(engines.isFullyReleased());
+}
+
+test "upstream: acquire leases a plaintext slot and release returns it" {
+    comptime {
+        // `Pool` needs the header, and the dial side may fill in `tls`.
+        assert(@hasField(TestPool.Upstream, "pool_next"));
+        assert(@hasField(TestPool.Upstream, "generation"));
+        assert(@hasField(TestPool.Upstream, "tls"));
+    }
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var pool: TestPool = undefined;
+    try pool.init(arena_state.allocator(), 2, test_keys);
+
+    const upstream = pool.acquire(0, 0).?;
+    try std.testing.expect(upstream.tls == null);
+    pool.release(upstream);
     try std.testing.expect(pool.isFullyReleased());
 }
 

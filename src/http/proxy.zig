@@ -45,10 +45,12 @@ const relay = @import("../net/relay.zig");
 const Io = @import("../io/io.zig");
 const parser = @import("parser.zig");
 const render = @import("render.zig");
+const compress_module = @import("compress.zig");
 const router = @import("router.zig");
 const filter = @import("filter.zig");
 const shed = @import("../shed.zig");
 const TlsEngine = @import("../tls/Engine.zig");
+const UpstreamTls = @import("../tls/UpstreamTls.zig");
 
 const assert = std.debug.assert;
 
@@ -138,6 +140,9 @@ pub const RenderScratch = struct {
     request_edits: [constants.header_edits_max]filter.AppliedHeaderEdit,
     response_edits: [constants.response_edits_max]filter.AppliedHeaderEdit,
     forwarded: [constants.forwarded_value_bytes_max]u8,
+    /// Where `X-Real-IP` is formatted. Its own buffer because the render
+    /// needs it beside the `X-Forwarded-For` line, not after it.
+    real_ip: [constants.forwarded_client_bytes_max]u8,
     hops: [max_forwards_digits_max]u8,
     sticky: [sticky_value_bytes_max]u8,
     head: render.HeadScratch,
@@ -173,9 +178,9 @@ pub fn Proxy(comptime IoType: type) type {
                     // The handshake phase collects whatever the last
                     // flight carried without knowing what the protocol
                     // will make of it, so it can hold more than an L7
-                    // head may be. Same answer as an oversize read: fill
-                    // to the limit and let the dispatch say which of 413
-                    // or 431 it earned.
+                    // head may be. Fill what the destination holds and
+                    // let the dispatch apply the head limit and say
+                    // which of 431 or 413 it earned.
                     if (pending > capacity) {
                         fillHead(conn, @intCast(capacity), capacity);
                         answerHeadOverflow(server, conn);
@@ -294,9 +299,13 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.tls != null);
             const storage = server.borrowHeaderScratch();
             defer server.returnHeaderScratch();
-            if (parser.parseRequestHead(headBytes(server, conn)[0..conn.stream.head_len], true, storage, null)) |_| {
-                // The head completed inside the buffer, so what overran it
-                // was payload.
+            // Same slice rule as `parseAndDispatch`: the parser sees no
+            // more than the configured head width. A head that completes
+            // inside it means what overran the *destination* was payload.
+            const limit = headLimitBytes(server, conn);
+            const head = headBytes(server, conn)[0..@min(conn.stream.head_len, limit)];
+            if (parser.parseRequestHead(head, true, storage, null)) |request| {
+                assert(request.head_len <= limit);
                 respond(server, conn, 413, "l7_body_too_large");
             } else |err| switch (err) {
                 // The same three verdicts `parseAndDispatch` gives, and
@@ -374,10 +383,10 @@ pub fn Proxy(comptime IoType: type) type {
         //
         // Scoped to the request head deliberately. The origin's *response*
         // head accumulates the same way in `onResponseHeadRecv`, into the
-        // upstream slot's buffer, and does not need a source: §4's TLS
-        // termination applies to the client side only, so the upstream leg
-        // stays plaintext (kTLS on the origin side, if it ever comes, would
-        // revisit this).
+        // upstream slot's buffer. That path's source is chosen by the
+        // cluster, not by this seam: a plaintext dial reads straight into
+        // the buffer, and a `cluster.tls` dial decrypts into it through
+        // the upstream engine before the same parser runs.
         //
         // The third stays `parseAndDispatch`, the single answer to "what do
         // these bytes mean": read again, 400, 414, 431, or route. That matters
@@ -392,6 +401,14 @@ pub fn Proxy(comptime IoType: type) type {
         /// The head bytes this connection holds — the ring buffer bound at
         /// the delivery that started the request (§5). Asserting the hold
         /// here means every read of head content states its precondition.
+        ///
+        /// For a terminated connection this is the engine's *whole*
+        /// plaintext buffer, not the configured head width. The two are
+        /// different questions: the buffer is where a decrypt step lands,
+        /// and one step can carry the head plus a record's worth of body.
+        /// Slicing to the head limit here would hand a legal body to the
+        /// overflow ladder as a 413. What the operator bounded is the
+        /// head, and `headLimitBytes` is where that bound is read.
         fn headBytes(server: *ServerType, conn: *ConnType) []u8 {
             // A terminated connection accumulates its head in the engine's
             // own plaintext buffer, not the ring (§4). It has to: a ring
@@ -399,14 +416,23 @@ pub fn Proxy(comptime IoType: type) type {
             // that arrived inside the handshake's last flight has no later
             // delivery to bind one with. The engine's buffer is sized for
             // whichever is wider, a head or a record's decrypt.
-            // Sliced to the *configured* head size, not the buffer's own
-            // length: the buffer is wider so a record's decrypt always has
-            // somewhere to land, and a deployment that lowered
-            // `limits.head_buffer_bytes` to bound what it accepts must get
-            // that number back rather than the floor.
-            if (conn.tls) |engine| return engine.plaintext[0..engine.head_bytes];
+            if (conn.tls) |engine| return engine.plaintext;
             assert(conn.stream.head_buffer_id != StreamType.head_buffer_none);
             return server.io.bufferGroupSlice(conn.stream.head_buffer_id);
+        }
+
+        /// The most head bytes this connection accepts. This — not the
+        /// destination's capacity — is what "the head buffer is full"
+        /// means to the parser: it is `limits.head_buffer_bytes` on a
+        /// terminated connection (the engine's buffer is wider so a whole
+        /// decrypt step fits), and the ring buffer's own length on the
+        /// plaintext path, where the read and the bound are the same
+        /// allocation.
+        fn headLimitBytes(server: *ServerType, conn: *ConnType) usize {
+            const bytes = headBytes(server, conn);
+            assert(conn.stream.head_len <= bytes.len);
+            if (conn.tls) |engine| return engine.head_bytes;
+            return bytes.len;
         }
 
         /// The upstream head bytes this exchange holds (§5): acquired at
@@ -587,8 +613,16 @@ pub fn Proxy(comptime IoType: type) type {
         fn parseAndDispatch(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_reading_head);
             const bytes = headBytes(server, conn);
-            const head = bytes[0..conn.stream.head_len];
-            const head_is_full = conn.stream.head_len == bytes.len;
+            const limit = headLimitBytes(server, conn);
+            // The parser is handed at most what the operator accepts.
+            // "Full" is about that limit, not about how much the
+            // destination can hold: on a terminated connection the latter
+            // is wider by a record so head + body can land together, and
+            // the surplus is body. A terminator past the limit therefore
+            // cannot be found in this slice — which is exactly the
+            // oversize verdict the parser already knows how to give.
+            const head = bytes[0..@min(conn.stream.head_len, limit)];
+            const head_is_full = conn.stream.head_len >= limit;
 
             const storage = server.borrowHeaderScratch();
             defer server.returnHeaderScratch();
@@ -601,7 +635,7 @@ pub fn Proxy(comptime IoType: type) type {
                 &conn.stream.head_cursor,
             ) catch |err| switch (err) {
                 error.Incomplete => {
-                    // A full buffer never yields Incomplete — the parser
+                    // A full head never yields Incomplete — the parser
                     // converts it to the oversize verdicts below — so here
                     // there is room to read more.
                     assert(!head_is_full);
@@ -617,6 +651,9 @@ pub fn Proxy(comptime IoType: type) type {
                 error.UriTooLong => return respond(server, conn, 414, "l7_uri_too_long"),
                 error.HeadTooLarge => return respond(server, conn, 431, "l7_headers_too_large"),
             };
+            // The parse ran over a slice no wider than the limit, so the
+            // request cannot have exceeded it.
+            assert(request.head_len <= limit);
             routeRequest(server, conn, &request);
         }
 
@@ -750,6 +787,21 @@ pub fn Proxy(comptime IoType: type) type {
             unreachable;
         }
 
+        /// Answer a listener WAF hit with its configured policy status,
+        /// counted apart from `l7_filtered`: "a literal denylist caught
+        /// this" and "a request rule refused it" are different operator
+        /// facts. Same closed-set bridge as `respondFilter`, for the same
+        /// reason — `respond` selects a comptime static response.
+        fn respondWaf(server: *ServerType, conn: *ConnType, status: u16) void {
+            assert(filter.isRejectStatus(status));
+            inline for (filter.reject_statuses) |candidate| {
+                if (status == candidate) {
+                    return respond(server, conn, candidate, "l7_waf_blocked");
+                }
+            }
+            unreachable;
+        }
+
         /// The `Max-Forwards` this hop forwards, or null to leave the
         /// header exactly as it arrived (#240) — which is every request
         /// but an `OPTIONS` that carried a budget.
@@ -838,6 +890,10 @@ pub fn Proxy(comptime IoType: type) type {
                 .method = request.method,
                 .host = host,
                 .path = views.match,
+                // The render walk must judge the same query the verdict
+                // walk did, or an edit rule keyed on it would match once
+                // and not the other time.
+                .query = filter.rawQuery(views.forward.query),
                 .headers = request.headers,
                 .client = clientAddressOf(conn),
             };
@@ -876,6 +932,10 @@ pub fn Proxy(comptime IoType: type) type {
             // so a second recording would mean a head was routed twice.
             assert(conn.stream.l7.request_head_len == 0);
             conn.stream.l7.request_method = request.method;
+            // Parsed here, once, while the head bytes are live: a static
+            // answer renders after the head buffer has gone back, and
+            // the decision is a one-bit fact about this request.
+            conn.stream.l7.request_accepts_gzip = parser.acceptsGzip(request.headers);
             conn.stream.l7.request_framing = framingFromParsed(request.framing);
             conn.stream.l7.request_head_len = request.head_len;
             conn.stream.l7.client_keep_alive = request.keep_alive;
@@ -1028,6 +1088,18 @@ pub fn Proxy(comptime IoType: type) type {
         fn routeRequest(server: *ServerType, conn: *ConnType, request: *const parser.RequestHead) void {
             assert(conn.state == .l7_reading_head);
             assert(request.head_len <= conn.stream.head_len);
+            // Before every other policy: a client over its bucket should
+            // not spend a filter evaluation, a routing lookup or a pool
+            // acquisition, and the answer does not depend on what it
+            // asked for. Answering here also closes the connection — the
+            // body may be unread — which `respond` enforces for this
+            // rung at comptime.
+            // Before every other policy: a client already holding its
+            // share of connections should not spend a token, a filter
+            // evaluation or a routing lookup, and the answer does not
+            // depend on what it asked for.
+            if (connLimitReached(server, conn, request)) return;
+            if (rateLimited(server, conn, request)) return;
             if (!admitRequest(server, conn, request)) return;
             // §7: canonicalize the host and path once, then apply filters
             // and routing to that one view before acquiring any resource,
@@ -1048,16 +1120,29 @@ pub fn Proxy(comptime IoType: type) type {
                 return respond(server, conn, 400, "l7_bad_request");
             };
             captureTarget(conn, keys.host, keys.views.match);
-            // §7 filters run before routing: a terminal verdict — reject
-            // or redirect (#176) — stops the request whether or not it
-            // would have routed.
-            if (filter.firstVerdict(conn.request_filters, .{
+            // One view for both policy layers, so the WAF and the filter
+            // walk judge identical canonical path and raw-query bytes.
+            const view = filter.RequestView{
                 .method = request.method,
                 .host = keys.host,
                 .path = keys.views.match,
+                .query = filter.rawQuery(keys.views.forward.query),
                 .headers = request.headers,
                 .client = clientAddressOf(conn),
-            })) |verdict| {
+            };
+            // The listener WAF runs first and is terminal: a coarse
+            // denylist must not be talked past by a filter `allow`, and
+            // answering before routing means the origin is never dialed.
+            // Head-only by construction — this view holds no body.
+            if (conn.waf) |waf| {
+                if (filter.wafBlocks(waf, view)) {
+                    return respondWaf(server, conn, waf.status);
+                }
+            }
+            // §7 filters run before routing: a terminal verdict — reject
+            // or redirect (#176) — stops the request whether or not it
+            // would have routed.
+            if (filter.firstVerdict(conn.request_filters, view)) |verdict| {
                 switch (verdict) {
                     .reject => |status| return respondFilter(server, conn, status),
                     .redirect => |redirect| {
@@ -1066,14 +1151,90 @@ pub fn Proxy(comptime IoType: type) type {
                     .respond => |page| return respondWithPage(server, conn, page),
                 }
             }
-            conn.stream.cluster_index = router.route(conn.routes, keys.host, keys.views.match, request.headers) orelse {
+            const matched = router.find(
+                conn.routes,
+                keys.host,
+                keys.views.match,
+                request.headers,
+            ) orelse {
                 return respond(server, conn, 404, "l7_no_route");
             };
-
+            conn.stream.cluster_index = matched.cluster_index;
+            conn.stream.log.suppressed = !matched.access_log;
             conn.stream.relay_buffer = server.acquireRelayBuffer() orelse {
                 return respond(server, conn, 503, "l7_shed_relay_buffers");
             };
             beginUpstream(server, conn, request, &keys.views, render_scratch);
+        }
+
+        /// The listener's cap on concurrent connections from one client
+        /// (§7). True means the request has been answered with `503` and
+        /// the caller must return. A connection is counted at its first
+        /// admitted request — the point where a PROXY-protocol listener
+        /// finally knows the real address — and its count is returned by
+        /// `releasePooledResources` at teardown. A table that cannot place
+        /// a new identity fails open and is counted, the rate limiter's
+        /// rule: a memory bound must not become an outage.
+        fn connLimitReached(
+            server: *ServerType,
+            conn: *ConnType,
+            request: *const parser.RequestHead,
+        ) bool {
+            const max = conn.conn_limit_max orelse return false;
+            // Keep-alive: the connection already holds one count.
+            if (conn.conn_limit_counted) return false;
+            const client = clientAddressOf(conn) orelse return false;
+            return switch (server.conn_limit.admit(client, max)) {
+                .allowed => blk: {
+                    conn.conn_limit_counted = true;
+                    break :blk false;
+                },
+                .limited => blk: {
+                    recordRequestFacts(server, conn, request);
+                    respond(server, conn, 503, "l7_conn_limited");
+                    break :blk true;
+                },
+                .table_full => blk: {
+                    server.counters.increment("l7_conn_limit_full");
+                    break :blk false;
+                },
+            };
+        }
+
+        /// The listener's per-client token bucket (§7), checked before
+        /// any other routing policy. True means the request has been
+        /// answered with `429` and the caller must return.
+        ///
+        /// A `unix:` listener has no client address to key on (#303),
+        /// and the loader does not forbid a rate limit there — so the
+        /// honest answer is to leave it unlimited rather than invent an
+        /// identity every local process would share. A table that cannot
+        /// place a new key fails open and is counted: a memory bound must
+        /// not become an outage.
+        fn rateLimited(
+            server: *ServerType,
+            conn: *ConnType,
+            request: *const parser.RequestHead,
+        ) bool {
+            const policy = conn.rate_limit orelse return false;
+            const client = clientAddressOf(conn) orelse return false;
+            return switch (server.rate_limit.admit(client, server.io.nowNs(), policy)) {
+                .allowed => false,
+                .limited => blk: {
+                    // The head parsed, so record what the access log will
+                    // say about it before `respond` commits the verdict.
+                    // `admitRequest` never runs on this path, and the
+                    // recording is exactly what makes a HEAD's 429 a
+                    // bodiless answer too.
+                    recordRequestFacts(server, conn, request);
+                    respond(server, conn, 429, "l7_rate_limited");
+                    break :blk true;
+                },
+                .table_full => blk: {
+                    server.counters.increment("l7_rate_limit_full");
+                    break :blk false;
+                },
+            };
         }
 
         /// The request-derived half of this exchange's pick (#178): what
@@ -1232,6 +1393,18 @@ pub fn Proxy(comptime IoType: type) type {
             }
         }
 
+        /// Whether a parked slot just checked out can serve this request
+        /// without a dial. Plaintext always can: a connection the origin
+        /// closed while parked surfaces on first use and takes the one
+        /// free replay (§7). A TLS session is checked here too, because
+        /// discarding it is free of any request bytes — and an engine
+        /// that is already known to be closed would only burn the replay
+        /// on a failure this check can see coming.
+        fn parkedReusable(parked: *UpstreamType) bool {
+            const engine = parked.tls orelse return true;
+            return engine.isConnected() and !engine.peerClosed() and engine.outboxEmpty();
+        }
+
         /// Route resolved and a relay buffer held: choose an endpoint and
         /// get onto it, by reuse when the pool has one parked and by a
         /// fresh dial otherwise. Split from `routeRequest` because the
@@ -1269,30 +1442,40 @@ pub fn Proxy(comptime IoType: type) type {
             };
             const pick = pickEndpointOrShed(server, conn, request_key) orelse return;
             if (server.upstreams.checkout(conn.stream.cluster_index, pick.endpoint_index)) |parked| {
-                server.counters.increment("upstream_reused");
-                // Recorded once the slot is actually held, never at the
-                // pick: a request shed for want of a slot contacted no
-                // origin, and a line claiming one would send an operator
-                // looking at a backend that never saw the request (§8).
-                conn.stream.log.endpoint_index = pick.endpoint_index;
-                conn.stream.upstream = parked;
-                conn.stream.upstream_socket = parked.socket;
-                parked.head_len = 0;
-                // A parked slot released its head buffer before parking;
-                // the exchange re-acquires here, still in
-                // `.l7_reading_head` so a shed keeps (the checked-out
-                // socket is closed with the slot — the shed costs a
-                // parked origin connection, not a client one).
-                if (!acquireUpstreamHeadOrShed(server, conn)) return;
-                conn.stream.l7.upstream_was_reused = true;
-                conn.state = .l7_dialing;
-                // No await happened: this runs in the same callback as the
-                // parse whose result is still live, so the reuse path —
-                // the hot one — skips the re-parse the dial path needs,
-                // and hands over the canonical target it already built
-                // rather than having it decoded and collapsed again.
-                renderRequestAndStartLegs(server, conn, request, views, scratch);
-                return;
+                if (parkedReusable(parked)) {
+                    server.counters.increment("upstream_reused");
+                    // Recorded once the slot is actually held, never at the
+                    // pick: a request shed for want of a slot contacted no
+                    // origin, and a line claiming one would send an operator
+                    // looking at a backend that never saw the request (§8).
+                    conn.stream.log.endpoint_index = pick.endpoint_index;
+                    conn.stream.upstream = parked;
+                    conn.stream.upstream_socket = parked.socket;
+                    parked.head_len = 0;
+                    // A parked slot released its head buffer before
+                    // parking; the exchange re-acquires here, still in
+                    // `.l7_reading_head` so a shed keeps (the checked-out
+                    // socket is closed with the slot — the shed costs a
+                    // parked origin connection, not a client one).
+                    if (!acquireUpstreamHeadOrShed(server, conn)) return;
+                    conn.stream.l7.upstream_was_reused = true;
+                    conn.state = .l7_dialing;
+                    // No await happened: this runs in the same callback as
+                    // the parse whose result is still live, so the reuse
+                    // path — the hot one — skips the re-parse the dial
+                    // path needs, and hands over the canonical target it
+                    // already built rather than having it decoded and
+                    // collapsed again.
+                    renderRequestAndStartLegs(server, conn, request, views, scratch);
+                    return;
+                }
+                // The slot came back but its session is known not to be
+                // able to carry another request. Close and release it now,
+                // then dial fresh: discarding it before any request byte
+                // goes out is free, where discovering the same thing on
+                // first use would spend the one replay (§7).
+                server.io.closeNow(parked.socket);
+                server.releaseUpstream(parked);
             }
             dialUpstream(server, conn, pick, .fresh);
         }
@@ -1480,8 +1663,161 @@ pub fn Proxy(comptime IoType: type) type {
             server.io.setNodelay(socket) catch |err| {
                 server.witnessKernelPressure(.set_option, err);
             };
+            if (server.config.clusters[conn.stream.cluster_index].tls != null) {
+                startUpstreamTls(server, conn);
+                return;
+            }
             renderAndStartLegs(server, conn);
         }
+
+        // -- upstream TLS -----------------------------------------------------
+        //
+        // The shape mirrors the downstream handshake in `Server.zig`: one
+        // data op at a time on the upstream socket, ciphertext through the
+        // engine's outbox on the way out and its record buffer on the way
+        // in, and the umbrella connection state stays `.l7_dialing` so the
+        // dial's teardown and static-response paths keep their asserts.
+        // The handshake runs only on a fresh dial: a parked slot's engine
+        // is already connected, and `beginUpstream` checks that before
+        // reusing it.
+
+        /// Begin the client-side handshake on a dialed upstream. Failure
+        /// before any application byte has gone out is an origin-side
+        /// gateway failure like a refused dial: answer 502 and let
+        /// `respond` release the slot and its engine.
+        fn startUpstreamTls(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .l7_dialing);
+            assert(conn.stream.upstream != null);
+            assert(conn.stream.upstream.?.tls == null);
+            assert(conn.stream.l7.upstream_tls_phase == .none);
+            const engine = server.acquireUpstreamTlsEngine(conn.stream.cluster_index) catch {
+                respond(server, conn, 502, "l7_bad_gateway");
+                return;
+            };
+            conn.stream.upstream.?.tls = engine;
+            engine.start();
+            pumpUpstreamTlsOutbound(server, conn);
+        }
+
+        /// Drain whatever the engine staged, then take the next step: the
+        /// send's completion re-enters here, so the loop is "outbox empty,
+        /// and only then decide connected or read again".
+        fn pumpUpstreamTlsOutbound(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .l7_dialing);
+            const engine = conn.stream.upstream.?.tls.?;
+            const staged = engine.outbound();
+            if (staged.len >= 1) {
+                conn.stream.l7.upstream_tls_phase = .sending;
+                conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
+                server.io.send(
+                    conn.stream.upstream_socket.?,
+                    staged,
+                    &conn.stream.op_data_client_to_upstream.completion,
+                    ConnType,
+                    conn,
+                    onUpstreamTlsSent,
+                );
+                return;
+            }
+            if (engine.isConnected()) {
+                assert(conn.stream.l7.upstream_tls_phase == .sending);
+                conn.stream.l7.upstream_tls_phase = .none;
+                renderAndStartLegs(server, conn);
+                return;
+            }
+            armUpstreamTlsRecv(server, conn);
+        }
+
+        fn armUpstreamTlsRecv(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .l7_dialing);
+            const engine = conn.stream.upstream.?.tls.?;
+            const destination = engine.recvBuffer();
+            assert(destination.len >= 1);
+            conn.stream.l7.upstream_tls_phase = .receiving;
+            conn.stream.arm(&conn.stream.op_data_upstream_to_client, "data_upstream_to_client");
+            server.io.recv(
+                conn.stream.upstream_socket.?,
+                destination,
+                &conn.stream.op_data_upstream_to_client.completion,
+                ConnType,
+                conn,
+                onUpstreamTlsRecv,
+            );
+        }
+
+        fn onUpstreamTlsSent(conn: *ConnType, result: Io.SendError!u32) void {
+            const server = conn.server;
+            conn.stream.delivered(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
+            if (conn.isTearingDown()) {
+                server.continueTeardown(conn);
+                return;
+            }
+            assert(conn.state == .l7_dialing);
+            if (conn.stream.l7.pending_verdict != .none) {
+                return handshakeTimedOut(server, conn);
+            }
+            const sent = result catch {
+                return respond(server, conn, 502, "l7_bad_gateway");
+            };
+            assert(sent >= 1);
+            conn.stream.upstream.?.tls.?.outboundSent(sent);
+            pumpUpstreamTlsOutbound(server, conn);
+        }
+
+        fn onUpstreamTlsRecv(conn: *ConnType, result: Io.RecvError!u32) void {
+            const server = conn.server;
+            conn.stream.delivered(&conn.stream.op_data_upstream_to_client, "data_upstream_to_client");
+            if (conn.isTearingDown()) {
+                server.continueTeardown(conn);
+                return;
+            }
+            assert(conn.state == .l7_dialing);
+            if (conn.stream.l7.pending_verdict != .none) {
+                return handshakeTimedOut(server, conn);
+            }
+            const received = result catch {
+                return respond(server, conn, 502, "l7_bad_gateway");
+            };
+            assert(received >= 1);
+            const engine = conn.stream.upstream.?.tls.?;
+            var sink: UpstreamTlsHandshakeSink = .{};
+            engine.received(received, &sink.sink()) catch {
+                return respond(server, conn, 502, "l7_bad_gateway");
+            };
+            pumpUpstreamTlsOutbound(server, conn);
+        }
+
+        /// The §8 deadline fired with the handshake in flight. The forced
+        /// op has now completed; answer the exchange's 504 rather than
+        /// leaving a socket with a half-built session behind.
+        fn handshakeTimedOut(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .l7_dialing);
+            assert(conn.stream.l7.pending_verdict == .gateway_timeout);
+            conn.stream.l7.pending_verdict = .none;
+            witnessNoResponse(server, conn);
+            respond(server, conn, 504, "l7_gateway_timeout");
+        }
+
+        /// Handshake plaintext is not expected before this proxy sends a
+        /// request; anything an origin volunteers is dropped (Stage 1 does
+        /// not surface upstream application data outside the response
+        /// path). A mid-handshake `close_notify` leaves the session
+        /// un-connected, so the pump reads again and the socket's EOF
+        /// answers 502.
+        const UpstreamTlsHandshakeSink = struct {
+            fn sink(self: *UpstreamTlsHandshakeSink) UpstreamTls.Sink {
+                return .{ .ctx = self, .appData = appData, .closed = closed };
+            }
+
+            fn appData(ctx: *anyopaque, bytes: []const u8) void {
+                _ = ctx;
+                _ = bytes;
+            }
+
+            fn closed(ctx: *anyopaque) void {
+                _ = ctx;
+            }
+        };
 
         /// Whether a failed dial may be sent to another endpoint (#181).
         ///
@@ -1647,17 +1983,32 @@ pub fn Proxy(comptime IoType: type) type {
                 return respond(server, conn, 431, "l7_headers_too_large");
             };
             const forwarded = planForwarded(server, conn, request, &scratch.forwarded);
+            // The companions are built here, from the same observed peer
+            // and listener, so all three spellings agree by construction.
+            const real_ip: ?[]const u8 = if (conn.forwarded_real_ip) blk: {
+                // The loader refuses `forwarded` on a listener with no
+                // client address (#303), and these flags live inside that
+                // block, so the unwrap states an invariant.
+                assert(conn.client_address != null);
+                break :blk bareAddress(&conn.client_address.?, &scratch.real_ip);
+            } else null;
+            const forwarded_proto: ?[]const u8 = if (conn.forwarded_proto)
+                (if (conn.tls != null) "https" else "http")
+            else
+                null;
             const hops = planMaxForwards(request, &scratch.hops);
             // No close announcement upstream (the `false` below): the
             // connection is a parking candidate (§5), and stripping the
             // client's Connection header already made persistence the wire
             // default.
-            const rendered = render.renderRequestHead(
+            const rendered = render.renderRequestHeadFull(
                 request,
                 plan.target,
                 plan.edits,
                 false,
                 forwarded,
+                real_ip,
+                forwarded_proto,
                 hops,
                 // The participating `Upgrade` travels only when this
                 // listener agreed to carry it (#180); the gate already
@@ -1769,11 +2120,49 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.stream.l7.request_leg == .sending_head);
             const l7 = &conn.stream.l7;
             assert(l7.request_head_sent < l7.rendered_request_len);
+            const upstream = conn.stream.upstream.?;
+            const head = upstreamHeadBytes(upstream);
             l7.request_op_on_client = false; // A send on the upstream socket.
+            if (upstream.tls) |engine| {
+                // Stage at most one record's plaintext per pass. A head
+                // larger than `tls_app_chunk_bytes` (an operator may set
+                // `head_buffer_bytes` up to 1 MiB) is encrypted in several
+                // records; `request_head_sent` still counts plaintext, so
+                // the access-log view is unaffected by the chunking.
+                if (engine.outbound().len == 0) {
+                    const remaining = head[l7.request_head_sent..l7.rendered_request_len];
+                    assert(remaining.len >= 1);
+                    const chunk: u32 = @intCast(@min(
+                        remaining.len,
+                        @as(usize, constants.tls_app_chunk_bytes),
+                    ));
+                    assert(chunk >= 1);
+                    engine.sendApp(remaining[0..chunk]) catch {
+                        server.counters.increment("tls_relay_failed");
+                        upstreamFailed(server, conn);
+                        return;
+                    };
+                    l7.request_head_staged = chunk;
+                } else {
+                    // A short send resumes the record already staged.
+                    assert(l7.request_head_staged >= 1);
+                }
+                assert(engine.outbound().len >= 1);
+                conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
+                server.io.send(
+                    conn.stream.upstream_socket.?,
+                    engine.outbound(),
+                    &conn.stream.op_data_client_to_upstream.completion,
+                    ConnType,
+                    conn,
+                    onRequestHeadSent,
+                );
+                return;
+            }
             conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.send(
                 conn.stream.upstream_socket.?,
-                upstreamHeadBytes(conn.stream.upstream.?)[l7.request_head_sent..l7.rendered_request_len],
+                head[l7.request_head_sent..l7.rendered_request_len],
                 &conn.stream.op_data_client_to_upstream.completion,
                 ConnType,
                 conn,
@@ -1800,19 +2189,41 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             };
             assert(sent >= 1);
-            conn.stream.l7.request_head_sent += sent;
-            assert(conn.stream.l7.request_head_sent <= conn.stream.l7.rendered_request_len);
-            if (conn.stream.l7.request_head_sent < conn.stream.l7.rendered_request_len) {
+            const l7 = &conn.stream.l7;
+            if (conn.stream.upstream.?.tls) |engine| {
+                // The socket cursor counts ciphertext; the plaintext chunk
+                // it carries is credited only when the whole record has
+                // drained, so a short write resumes without re-encrypting.
+                engine.outboundSent(sent);
+                if (engine.outbound().len >= 1) {
+                    armRequestHeadSend(server, conn);
+                    return;
+                }
+                const staged = l7.request_head_staged;
+                assert(staged >= 1);
+                l7.request_head_sent += staged;
+                l7.request_head_staged = 0;
+            } else {
+                l7.request_head_sent += sent;
+            }
+            assert(l7.request_head_sent <= l7.rendered_request_len);
+            if (l7.request_head_sent < l7.rendered_request_len) {
                 armRequestHeadSend(server, conn);
                 return;
             }
-            // Head on the wire. Validate the request-body prefix that
-            // arrived coalesced with the head before the response leg
-            // commits its recv op: a body that already violates its own
-            // framing is answered 400 while both data ops are still free
-            // (§7). Once the response recv is armed that op is gone, and an
-            // op is never canceled (§5) — so a malformed body found later
-            // can only tear down. Checking here keeps the 400 reachable.
+            onRequestHeadComplete(server, conn);
+        }
+
+        /// Head on the wire. Validate the request-body prefix that arrived
+        /// coalesced with the head before the response leg commits its recv
+        /// op: a body that already violates its own framing is answered 400
+        /// while both data ops are still free (§7). Once the response recv
+        /// is armed that op is gone, and an op is never canceled (§5) — so a
+        /// malformed body found later can only tear down. Checking here
+        /// keeps the 400 reachable.
+        fn onRequestHeadComplete(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .l7_exchanging);
+            assert(conn.stream.l7.request_leg == .sending_head);
             const excess = headBytes(server, conn)[conn.stream.l7.request_head_len..conn.stream.head_len];
             const feed = feedFraming(&conn.stream.l7.request_framing, excess);
             if (feed.malformed) {
@@ -1866,6 +2277,40 @@ pub fn Proxy(comptime IoType: type) type {
             const direction = &conn.stream.directions[0];
             const base = conn.stream.l7.request_head_len;
             conn.stream.l7.request_op_on_client = false; // A send on the upstream socket.
+            if (conn.stream.upstream.?.tls) |engine| {
+                // Stage at most one record's plaintext per pass. The
+                // excess can be as wide as the head buffer, so it is
+                // encrypted in several records; `direction.credit` still
+                // counts plaintext and the access log is unaffected.
+                if (engine.outbound().len == 0) {
+                    const window = direction.pending(headBytes(server, conn)[base..]);
+                    const chunk: u32 = @intCast(@min(
+                        window.len,
+                        @as(usize, constants.tls_app_chunk_bytes),
+                    ));
+                    assert(chunk >= 1);
+                    engine.sendApp(window[0..chunk]) catch {
+                        server.counters.increment("tls_relay_failed");
+                        upstreamFailed(server, conn);
+                        return;
+                    };
+                    conn.stream.l7.request_excess_staged = chunk;
+                } else {
+                    // A short send resumes the record already staged.
+                    assert(conn.stream.l7.request_excess_staged >= 1);
+                }
+                assert(engine.outbound().len >= 1);
+                conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
+                server.io.send(
+                    conn.stream.upstream_socket.?,
+                    engine.outbound(),
+                    &conn.stream.op_data_client_to_upstream.completion,
+                    ConnType,
+                    conn,
+                    onRequestExcessSent,
+                );
+                return;
+            }
             conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.send(
                 conn.stream.upstream_socket.?,
@@ -1897,7 +2342,22 @@ pub fn Proxy(comptime IoType: type) type {
             };
             assert(sent >= 1);
             const direction = &conn.stream.directions[0];
-            direction.credit(sent);
+            if (conn.stream.upstream.?.tls) |engine| {
+                // The socket cursor counts ciphertext; the plaintext chunk
+                // it carries is credited only when the whole record has
+                // drained, so a short write resumes without re-encrypting.
+                engine.outboundSent(sent);
+                if (engine.outbound().len >= 1) {
+                    armRequestExcessSend(server, conn);
+                    return;
+                }
+                const staged = conn.stream.l7.request_excess_staged;
+                assert(staged >= 1);
+                direction.credit(staged);
+                conn.stream.l7.request_excess_staged = 0;
+            } else {
+                direction.credit(sent);
+            }
             if (direction.owed() >= 1) {
                 armRequestExcessSend(server, conn);
                 return;
@@ -1941,12 +2401,14 @@ pub fn Proxy(comptime IoType: type) type {
         /// a truncated request (teardown), a send failure is the origin
         /// giving out (`upstreamFailed`).
         const RequestBodyPolicy = struct {
-            // -- the TLS transform, client side (§4) --
+            // -- the TLS transforms on this leg (§4) --
             //
-            // The request leg reads from the client, so on a terminated
-            // connection it decrypts; the response leg below encrypts.
-            // The upstream halves of both stay plaintext, which is what
-            // termination means.
+            // The request leg reads from the client and writes to the
+            // origin, so either end may carry TLS: a terminated client is
+            // decrypted in `transformIn`, and a TLS origin is encrypted in
+            // `transformOut`. Both can be true at once, and the plaintext
+            // window between them is the client engine's body buffer or
+            // the relay half.
 
             /// Ciphertext reads into the engine's record buffer, as it
             /// does everywhere else the client speaks.
@@ -1976,14 +2438,73 @@ pub fn Proxy(comptime IoType: type) type {
                 return engine.peerClosed();
             }
 
-            /// The framed window lives wherever the transform put it.
+            /// The plaintext buffer framing named bytes in: the client
+            /// engine's body buffer on a terminated connection, the relay
+            /// half otherwise. Both `sendSlice` and `transformOut` read
+            /// the same window, which is what keeps plaintext and
+            /// ciphertext cursors from disagreeing about where it starts.
+            fn plaintextWindow(conn: *ConnType) []u8 {
+                if (conn.tls) |engine| return engine.body_plaintext;
+                return conn.stream.relay_buffer.?.client_to_upstream;
+            }
+
+            /// The framed window lives wherever the transform put it; with
+            /// a TLS origin the wire carries the engine's outbox instead.
             pub fn sendSlice(conn: *ConnType) []const u8 {
+                if (conn.stream.upstream.?.tls) |engine| return engine.outbound();
                 const state = &conn.stream.directions[
-                    @intFromEnum(StreamType.Direction.client_to_upstream)
+                    @backingInt(StreamType.Direction.client_to_upstream)
                 ];
                 if (state.owed() == 0) return &.{};
-                if (conn.tls) |engine| return state.pending(engine.body_plaintext);
-                return state.pending(conn.stream.relay_buffer.?.client_to_upstream);
+                return state.pending(plaintextWindow(conn));
+            }
+
+            /// Encrypt the framed chunk before the first send, when the
+            /// origin leg is TLS. The plaintext window is bounded by the
+            /// client engine's body buffer or the relay half — both can be
+            /// wider than one emitted record — so this chunks exactly as
+            /// the response leg does. The outbox holds two records, which
+            /// covers the widest window either source can hand over.
+            pub fn transformOut(conn: *ConnType, consumed: u32) bool {
+                const engine = conn.stream.upstream.?.tls orelse return true;
+                const window = plaintextWindow(conn);
+                assert(consumed <= window.len);
+                var remaining = window[0..consumed];
+                // Bounded: every iteration appends one record and the
+                // outbox holds at most two, so this terminates by `room`.
+                while (remaining.len > 0) {
+                    if (engine.outboundRoom() < TlsEngine.emitted_record_bytes_max) {
+                        conn.server.counters.increment("tls_relay_failed");
+                        return false;
+                    }
+                    const chunk: u32 = @intCast(@min(
+                        remaining.len,
+                        constants.tls_app_chunk_bytes,
+                    ));
+                    assert(chunk >= 1);
+                    engine.sendApp(remaining[0..chunk]) catch {
+                        conn.server.counters.increment("tls_relay_failed");
+                        return false;
+                    };
+                    remaining = remaining[chunk..];
+                }
+                return true;
+            }
+
+            /// Ciphertext outnumbers the plaintext the debt counts, so the
+            /// debt settles all at once when the outbox drains.
+            pub fn creditSend(conn: *ConnType, sent: u32) void {
+                const state = &conn.stream.directions[
+                    @backingInt(StreamType.Direction.client_to_upstream)
+                ];
+                if (conn.stream.upstream.?.tls) |engine| {
+                    engine.outboundSent(sent);
+                    if (engine.outbound().len == 0 and state.owed() >= 1) {
+                        state.credit(state.owed());
+                    }
+                    return;
+                }
+                state.credit(sent);
             }
 
             pub fn beforeRecv(conn: *ConnType) void {
@@ -2030,12 +2551,17 @@ pub fn Proxy(comptime IoType: type) type {
                 };
             }
 
-            pub fn afterFeed(conn: *ConnType, received: u32, fr: pump.FeedResult) void {
+            pub fn afterFeed(conn: *ConnType, chunk_len: u32, fr: pump.FeedResult) void {
                 // Body bytes this request owns, counted where framing said
                 // which they were: a pipelined tail belongs to the *next*
                 // request, so it must not land on this one's line (§8).
                 conn.stream.log.bytes_in += fr.consumed;
-                if (fr.consumed < received) {
+                // `chunk_len` is the framed source's chunk (plaintext on a
+                // terminated connection), never the ciphertext delivery —
+                // the pump passes the transformed length for exactly this
+                // comparison. Comparing against wire bytes would see a
+                // pipelined tail in every record's AEAD overhead.
+                if (fr.consumed < chunk_len) {
                     // Bytes past the body are a pipelined next request; the
                     // connection will close after this exchange (§7 note).
                     conn.stream.l7.client_pipelined = true;
@@ -2126,10 +2652,19 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.stream.l7.response_leg == .awaiting_head);
             const upstream = conn.stream.upstream.?;
             assert(upstream.head_len < upstreamHeadBytes(upstream).len);
+            // A TLS upstream reads ciphertext into the engine's record
+            // buffer; the sink in `onResponseHeadRecv` appends only what it
+            // decrypts. A plaintext upstream reads straight into the head
+            // buffer, as before.
+            const destination = if (upstream.tls) |engine|
+                engine.recvBuffer()
+            else
+                upstreamHeadBytes(upstream)[upstream.head_len..];
+            assert(destination.len >= 1);
             conn.stream.arm(&conn.stream.op_data_upstream_to_client, "data_upstream_to_client");
             server.io.recv(
                 conn.stream.upstream_socket.?,
-                upstreamHeadBytes(upstream)[upstream.head_len..],
+                destination,
                 &conn.stream.op_data_upstream_to_client.completion,
                 ConnType,
                 conn,
@@ -2157,10 +2692,58 @@ pub fn Proxy(comptime IoType: type) type {
             };
             assert(received >= 1);
             const upstream = conn.stream.upstream.?;
+            if (upstream.tls) |engine| {
+                var sink: ResponseHeadPlaintext = .{ .conn = conn };
+                engine.received(received, &sink.sink()) catch {
+                    upstreamFailed(server, conn);
+                    return;
+                };
+                // A record whose plaintext does not fit the head buffer is
+                // an origin answer this slice cannot stage; 502 (through
+                // `upstreamFailed`) rather than a 431/413, which would
+                // blame the client for a head it never sent.
+                if (sink.overflow) {
+                    upstreamFailed(server, conn);
+                    return;
+                }
+                parseResponseAndDispatch(server, conn);
+                return;
+            }
             upstream.head_len += received;
             assert(upstream.head_len <= upstreamHeadBytes(upstream).len);
             parseResponseAndDispatch(server, conn);
         }
+
+        /// Where a TLS origin's decrypted response-head bytes land: the
+        /// upstream head buffer, exactly as the plaintext read does. The
+        /// sink cannot fail (its signature is `void`), so it records an
+        /// overrun for the caller to answer.
+        const ResponseHeadPlaintext = struct {
+            conn: *ConnType,
+            overflow: bool = false,
+
+            fn sink(self: *ResponseHeadPlaintext) UpstreamTls.Sink {
+                return .{ .ctx = self, .appData = append, .closed = closed };
+            }
+
+            fn append(ctx: *anyopaque, bytes: []const u8) void {
+                const self: *ResponseHeadPlaintext = @ptrCast(@alignCast(ctx));
+                const upstream = self.conn.stream.upstream.?;
+                const buffer = upstreamHeadBytes(upstream);
+                const filled = upstream.head_len;
+                assert(filled <= buffer.len);
+                const take = @min(bytes.len, buffer.len - filled);
+                @memcpy(buffer[filled..][0..take], bytes[0..take]);
+                upstream.head_len += @intCast(take);
+                if (take < bytes.len) self.overflow = true;
+            }
+
+            fn closed(ctx: *anyopaque) void {
+                // The response path discovers a close through the socket's
+                // EOF; nothing here needs to act on close_notify itself.
+                _ = ctx;
+            }
+        };
 
         /// Detect-and-retry over the origin's head, mirroring the request
         /// side; any verdict other than "valid" or "more bytes" dooms the
@@ -2437,13 +3020,17 @@ pub fn Proxy(comptime IoType: type) type {
         /// something in front may have terminated TLS, and `Secure` on a
         /// cookie the client can only ever return over http is a cookie
         /// it will never return at all.
-        /// This render's full edit set: the #175 filter edits, plus —
-        /// when the verdict owes the client an announcement — the #178
-        /// stamp in the one buffer slot reserved past the filter budget.
-        /// The stamp is an `add`, so an origin's own Set-Cookie lines
-        /// ride beside it untouched. The composed value lives in the
-        /// caller's scratch: it must survive exactly until the render
-        /// consumes it, in the same frame.
+        /// This render's full edit set: the #175 filter edits, plus the
+        /// proxy's own two injections — the #178 stamp, when the verdict
+        /// owes the client an announcement, and this listener's
+        /// `Alt-Svc` advertisement (RFC 7838), when one is configured.
+        /// Both are `add`s, so an origin's own lines ride beside them
+        /// untouched, and both ride the same edit machinery rather than
+        /// owning a second injection path. The stamp's composed value
+        /// lives in the caller's scratch: it must survive exactly until
+        /// the render consumes it, in the same frame. The advertisement
+        /// is config-lifetime memory borrowed by reference, so it needs
+        /// no scratch of its own.
         fn responseEditsWithStamp(
             server: *const ServerType,
             conn: *const ConnType,
@@ -2454,54 +3041,71 @@ pub fn Proxy(comptime IoType: type) type {
         ) []const filter.AppliedHeaderEdit {
             const edits = responseEdits(conn, response, buffer[0..constants.header_edits_max]);
             assert(edits.len <= constants.header_edits_max);
+            var count = edits.len;
             switch (verdict) {
-                .none, .followed => return edits,
-                .assigned, .repicked => {},
+                .none, .followed => {},
+                .assigned, .repicked => {
+                    const name = switch (server.config.clusters[conn.stream.cluster_index].hash_key) {
+                        .cookie => |name| name,
+                        // The verdict said cookie cluster; the config cannot
+                        // have changed under it (§5 parse-once).
+                        .source_ip, .header => unreachable,
+                    };
+                    assert(name.len >= 1);
+                    assert(name.len <= constants.pick_name_bytes_max);
+                    var len: u32 = 0;
+                    @memcpy(scratch[0..name.len], name);
+                    len += @intCast(name.len);
+                    scratch[len] = '=';
+                    len += 1;
+                    // Through the one mint (`formatEndpointTag`), so the tag the
+                    // stamp announces is byte-identical to the tag the next
+                    // request's parse will match.
+                    Balancer.formatEndpointTag(
+                        server.balancer.endpointIdentity(conn.stream.cluster_index, conn.stream.log.endpoint_index),
+                        scratch[len..][0..Balancer.endpoint_tag_len],
+                    );
+                    len += Balancer.endpoint_tag_len;
+                    // The connection's own termination, not the listener's
+                    // config: what `Secure` claims is how *this* client reached
+                    // us, and that is what `conn.tls` answers.
+                    const attributes = if (conn.tls != null)
+                        sticky_attributes_secure
+                    else
+                        sticky_attributes;
+                    @memcpy(scratch[len..][0..attributes.len], attributes);
+                    len += @intCast(attributes.len);
+                    // Exactly the four pieces, no gaps: the value the render
+                    // emits is the whole composition.
+                    assert(len == name.len + 1 + Balancer.endpoint_tag_len + attributes.len);
+                    // And the attributes the predicate chose are the ones on the
+                    // wire. The length check above cannot say that — it reuses
+                    // the same binding the copy did, so it holds just as well
+                    // under an inverted predicate. This reads the bytes back.
+                    if (conn.tls != null) {
+                        assert(std.mem.endsWith(u8, scratch[0..len], sticky_attributes_secure));
+                    } else {
+                        assert(!std.mem.endsWith(u8, scratch[0..len], sticky_attributes_secure));
+                    }
+                    buffer[count] = .{ .kind = .add, .name = "Set-Cookie", .value = scratch[0..len] };
+                    count += 1;
+                },
             }
-            const name = switch (server.config.clusters[conn.stream.cluster_index].hash_key) {
-                .cookie => |name| name,
-                // The verdict said cookie cluster; the config cannot
-                // have changed under it (§5 parse-once).
-                .source_ip, .header => unreachable,
-            };
-            assert(name.len >= 1);
-            assert(name.len <= constants.pick_name_bytes_max);
-            var len: u32 = 0;
-            @memcpy(scratch[0..name.len], name);
-            len += @intCast(name.len);
-            scratch[len] = '=';
-            len += 1;
-            // Through the one mint (`formatEndpointTag`), so the tag the
-            // stamp announces is byte-identical to the tag the next
-            // request's parse will match.
-            Balancer.formatEndpointTag(
-                server.balancer.endpointIdentity(conn.stream.cluster_index, conn.stream.log.endpoint_index),
-                scratch[len..][0..Balancer.endpoint_tag_len],
-            );
-            len += Balancer.endpoint_tag_len;
-            // The connection's own termination, not the listener's
-            // config: what `Secure` claims is how *this* client reached
-            // us, and that is what `conn.tls` answers.
-            const attributes = if (conn.tls != null)
-                sticky_attributes_secure
-            else
-                sticky_attributes;
-            @memcpy(scratch[len..][0..attributes.len], attributes);
-            len += @intCast(attributes.len);
-            // Exactly the four pieces, no gaps: the value the render
-            // emits is the whole composition.
-            assert(len == name.len + 1 + Balancer.endpoint_tag_len + attributes.len);
-            // And the attributes the predicate chose are the ones on the
-            // wire. The length check above cannot say that — it reuses
-            // the same binding the copy did, so it holds just as well
-            // under an inverted predicate. This reads the bytes back.
-            if (conn.tls != null) {
-                assert(std.mem.endsWith(u8, scratch[0..len], sticky_attributes_secure));
-            } else {
-                assert(!std.mem.endsWith(u8, scratch[0..len], sticky_attributes_secure));
+            // The listener's advertisement takes the next reserved slot.
+            // The loader holds the value to `alt_svc_value_bytes_max`, so
+            // the render emits it verbatim with no composition here; and
+            // when the filter budget plus the stamp already fill the
+            // buffer, it yields rather than overflowing — losing the
+            // discovery hint beats failing the response.
+            if (conn.h3_advertise) |value| {
+                assert(value.len >= 1);
+                assert(value.len <= constants.alt_svc_value_bytes_max);
+                if (count < constants.response_edits_max) {
+                    buffer[count] = .{ .kind = .add, .name = "Alt-Svc", .value = value };
+                    count += 1;
+                }
             }
-            buffer[edits.len] = .{ .kind = .add, .name = "Set-Cookie", .value = scratch[0..len] };
-            return buffer[0 .. edits.len + 1];
+            return buffer[0..count];
         }
 
         /// Count the #178 verdict — only after the render commits, so a
@@ -2580,14 +3184,14 @@ pub fn Proxy(comptime IoType: type) type {
         /// speaking HTTP and starts relaying (#180).
         ///
         /// What changes hands here is the whole point of the feature. The
-        /// shared relay buffer, the head buffer and the *upstream slot*
-        /// all go back to the pools ordinary traffic draws on — a tunnel
-        /// that kept them would be the starvation §5 refuses — while the
-        /// origin socket stays open and the endpoint stays charged, now
-        /// the way an L4 connection charges it (`chargeEndpoint`). Slot
-        /// and socket are separable, and separating them is what lets a
-        /// tunnel be counted against `max_inflight` for its whole life
-        /// without pinning capacity ordinary exchanges shed against.
+        /// shared relay buffer and the head buffer go back to the pools
+        /// ordinary traffic draws on, while the origin socket stays open
+        /// and the endpoint stays charged, now the way an L4 connection
+        /// charges it (`chargeEndpoint`). The *upstream slot* goes back
+        /// only on a plaintext dial: a TLS session's engine holds the keys
+        /// the relay reads and writes through, so that slot stays leased
+        /// for the tunnel's life — the one capacity a TLS tunnel pins,
+        /// bounded by `upstream_slots` and reported by the banner.
         ///
         /// Client bytes that arrived behind the handshake are staged into
         /// the tunnel buffer and framed as this direction's debt, exactly
@@ -2622,14 +3226,31 @@ pub fn Proxy(comptime IoType: type) type {
             const leased = conn.stream.upstream.?;
             const cluster_index = leased.cluster_index;
             const endpoint_index = leased.endpoint_index;
-            server.releaseUpstream(leased);
-            conn.stream.upstream = null;
+            if (leased.tls == null) {
+                // A plaintext slot goes back to the pool now: the tunnel
+                // keeps only the socket.
+                server.releaseUpstream(leased);
+                conn.stream.upstream = null;
+            } else {
+                // A TLS slot stays leased for the tunnel's life. Its engine
+                // holds the session keys the relay encrypts and decrypts
+                // through, so the slot and the socket cannot be separated;
+                // teardown releases both together. The head buffer is not
+                // part of the session and goes back now.
+                if (leased.head_buffer != null) {
+                    server.releaseUpstreamHeadBuffer(leased);
+                }
+            }
             // Both held for certain here, unlike at the static-response
             // rungs where either may never have been acquired: this runs
             // only after a rendered head went out, which needed the head
             // buffer, and every routed exchange holds a relay buffer.
             assert(conn.stream.relay_buffer != null);
-            assert(conn.stream.head_buffer_id != StreamType.head_buffer_none);
+            // A terminated connection's head lives in its engine, not the
+            // ring (§4), so only the plaintext path has a buffer to return.
+            if (conn.tls == null) {
+                assert(conn.stream.head_buffer_id != StreamType.head_buffer_none);
+            }
             server.releaseRelayBuffer(conn.stream.relay_buffer.?);
             server.returnHeadBuffer(conn);
             conn.stream.head_len = 0;
@@ -2784,6 +3405,9 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state == .l7_exchanging);
             assert(response.status >= 100);
             if (conn.stream.l7.upgrade_requested and response.status == 101) {
+                // The relay that follows is opaque bytes, so either end may
+                // keep speaking TLS: `beginTunnel` holds the slot's engine
+                // when the origin leg has one.
                 renderUpgradeAccepted(server, conn, response);
                 return false;
             }
@@ -2859,21 +3483,51 @@ pub fn Proxy(comptime IoType: type) type {
             const verdict = stickyVerdict(server, conn);
             const scratch = server.borrowRenderScratch();
             defer server.returnRenderScratch();
-            const rendered = render.renderResponseHead(
+            conn.stream.l7.response_framing = framingFromParsed(response.framing);
+
+            // Feed the framing tracker over the body excess that arrived
+            // coalesced with the head. Compression may only consider this
+            // body when the feed says it is the *whole* body; anything
+            // longer streams through the pump untouched.
+            const excess = upstreamHeadBytes(upstream)[response.head_len..upstream.head_len];
+            const feed = feedFraming(&conn.stream.l7.response_framing, excess);
+            if (feed.malformed) {
+                upstreamFailed(server, conn);
+                return;
+            }
+            const edits = responseEditsWithStamp(
+                server,
+                conn,
                 response,
-                !keep_downstream,
-                responseEditsWithStamp(
-                    server,
-                    conn,
-                    response,
-                    verdict,
-                    &scratch.response_edits,
-                    &scratch.sticky,
-                ),
-                false,
-                &scratch.head,
-                headBytes(server, conn),
-            ) catch {
+                verdict,
+                &scratch.response_edits,
+                &scratch.sticky,
+            );
+            const head = headBytes(server, conn);
+            if (compressedResponse(
+                server,
+                conn,
+                response,
+                keep_downstream,
+                edits,
+                excess[0..feed.consumed],
+                framingDoneOf(&conn.stream.l7.response_framing),
+                scratch,
+                head,
+            )) |head_write_len| {
+                commitResponse(server, conn, response, verdict, head_write_len);
+                return;
+            }
+            const head_write_len = plainResponse(
+                server,
+                conn,
+                response,
+                keep_downstream,
+                edits,
+                excess[0..feed.consumed],
+                scratch,
+                head,
+            ) orelse {
                 // The head no longer fits — after the #175 edits or the
                 // #178 stamp, or never did: an origin response the proxy
                 // cannot re-render is not the client's fault, so 502,
@@ -2881,25 +3535,144 @@ pub fn Proxy(comptime IoType: type) type {
                 upstreamFailed(server, conn);
                 return;
             };
-            assert(rendered.len >= 1);
-            conn.stream.l7.response_framing = framingFromParsed(response.framing);
+            commitResponse(server, conn, response, verdict, head_write_len);
+        }
 
-            // Feed the framing tracker over the body excess that arrived
-            // coalesced with the head.
-            const excess = upstreamHeadBytes(upstream)[response.head_len..upstream.head_len];
-            const feed = feedFraming(&conn.stream.l7.response_framing, excess);
-            if (feed.malformed) {
-                upstreamFailed(server, conn);
-                return;
+        /// Gzip the body when all of the conditions that make it safe are
+        /// true at once: the whole body is already in the upstream head
+        /// buffer, the client accepts gzip, the response is a plain `200`
+        /// with a known length, and nothing about it forbids a transform.
+        /// The returned slice lives in the shared compressor until the
+        /// caller copies it, which happens in this same synchronous step.
+        fn compressResponse(
+            server: *ServerType,
+            conn: *ConnType,
+            response: *const parser.ResponseHead,
+            body: []const u8,
+            whole_body: bool,
+        ) ?[]const u8 {
+            const min = conn.compress_min_bytes orelse return null;
+            const compressor = server.compressor orelse return null;
+            if (!whole_body) return null;
+            if (!conn.stream.l7.request_accepts_gzip) return null;
+            if (conn.stream.l7.request_method == .head) return null;
+            if (response.status != 200) return null;
+            switch (response.framing) {
+                .content_length => {},
+                .none, .chunked, .until_close => return null,
             }
-            const head_write_len = coalesceResponseExcess(
+            if (body.len == 0) return null;
+            if (body.len < min or body.len > compress_module.max_body_bytes) return null;
+            if (parser.headerValue(response.headers, "content-encoding") != null) return null;
+            if (parser.headerValue(response.headers, "cache-control")) |value| {
+                if (containsIgnoreCase(value, "no-transform")) return null;
+            }
+            const content_type = parser.headerValue(response.headers, "content-type") orelse
+                return null;
+            if (!compressibleType(content_type)) return null;
+            return compressor.compress(body);
+        }
+
+        /// Render and stage the compressed answer, or null to fall through
+        /// to the plain path. The length is returned rather than committed
+        /// here so `renderResponse` keeps its single commit point.
+        fn compressedResponse(
+            server: *ServerType,
+            conn: *ConnType,
+            response: *const parser.ResponseHead,
+            keep_downstream: bool,
+            edits: []const filter.AppliedHeaderEdit,
+            body: []const u8,
+            whole_body: bool,
+            scratch: *RenderScratch,
+            head: []u8,
+        ) ?u32 {
+            const compressed = compressResponse(
                 server,
                 conn,
-                @intCast(rendered.len),
-                excess[0..feed.consumed],
-            );
+                response,
+                body,
+                whole_body,
+            ) orelse return null;
+            const rendered = render.renderResponseHeadFull(
+                response,
+                !keep_downstream,
+                edits,
+                false,
+                @intCast(compressed.len),
+                true,
+                &scratch.head,
+                head,
+            ) catch return null;
+            if (rendered.len + compressed.len > head.len) return null;
+            @memcpy(head[rendered.len..][0..compressed.len], compressed);
+            // The body rides the head write; nothing follows from the
+            // upstream slot except its release at the finish.
+            conn.stream.l7.response_excess_len = 0;
+            return @intCast(rendered.len + compressed.len);
+        }
 
-            commitResponse(server, conn, response, verdict, head_write_len);
+        /// Render the uncompressed answer and coalesce whatever body rode in
+        /// with the origin head. Null means the head did not fit.
+        fn plainResponse(
+            server: *ServerType,
+            conn: *ConnType,
+            response: *const parser.ResponseHead,
+            keep_downstream: bool,
+            edits: []const filter.AppliedHeaderEdit,
+            body: []const u8,
+            scratch: *RenderScratch,
+            head: []u8,
+        ) ?u32 {
+            const rendered = render.renderResponseHeadFull(
+                response,
+                !keep_downstream,
+                edits,
+                false,
+                null,
+                false,
+                &scratch.head,
+                head,
+            ) catch return null;
+            assert(rendered.len >= 1);
+            return coalesceResponseExcess(server, conn, @intCast(rendered.len), body);
+        }
+
+        /// The media types this path will compress. Deliberately a closed
+        /// prefix list rather than "anything not image/": compressing an
+        /// already-compressed container costs CPU and adds bytes.
+        fn compressibleType(value: []const u8) bool {
+            const end = std.mem.indexOfScalar(u8, value, ';') orelse value.len;
+            const media = std.mem.trim(u8, value[0..end], " \t");
+            const prefixes = [_][]const u8{
+                "text/",
+                "application/json",
+                "application/javascript",
+                "application/xml",
+                "application/xhtml+xml",
+                "application/x-ndjson",
+                "image/svg+xml",
+            };
+            for (prefixes) |prefix| {
+                if (std.ascii.startsWithIgnoreCase(media, prefix)) return true;
+            }
+            return false;
+        }
+
+        /// ASCII case-insensitive substring, bounded by the header value's
+        /// own length. Used for `Cache-Control: no-transform`, a token
+        /// inside a comma-separated list rather than a value of its own.
+        fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+            assert(needle.len >= 1);
+            if (needle.len > haystack.len) return false;
+            var index: usize = 0;
+            while (index + needle.len <= haystack.len) : (index += 1) {
+                if (std.ascii.eqlIgnoreCase(
+                    haystack[index..][0..needle.len],
+                    needle,
+                )) return true;
+            }
+            return false;
         }
 
         /// The point of no return: from here the origin's answer is *this
@@ -3209,35 +3982,94 @@ pub fn Proxy(comptime IoType: type) type {
         /// origin's EOF; any other framing's EOF is a truncation the client
         /// must see, and every failure tears down.
         const ResponseBodyPolicy = struct {
-            // -- the TLS transform, client side (§4) --
+            // -- the TLS transforms on this leg (§4) --
             //
-            // This leg reads plaintext from the origin and writes to the
-            // client, so only the write half transforms. The recv side
-            // needs no override at all.
+            // The response leg reads from the origin and writes to the
+            // client: `transformIn` decrypts a TLS origin into the relay
+            // half, and `transformOut` encrypts toward a terminated
+            // client. Either, both, or neither may apply.
 
-            /// Encrypt the framed chunk once, before the first send — a
-            /// resume must not re-encrypt bytes already gone. The chunk is
-            /// bounded by the relay buffer, which is already within what
-            /// one record carries.
+            /// A TLS origin's ciphertext lands in the engine's record
+            /// buffer; its plaintext lands in the relay half, which is what
+            /// the plaintext path reads directly.
+            pub fn recvBuffer(conn: *ConnType) []u8 {
+                if (conn.stream.upstream.?.tls) |engine| return engine.recvBuffer();
+                return conn.stream.relay_buffer.?.upstream_to_client;
+            }
+
+            /// Decrypt the wire chunk into the relay half so framing — and
+            /// the downstream transform, when there is one — sees the same
+            /// bytes the plaintext path would have read.
+            ///
+            /// The half is sized to one *wire* record whenever an
+            /// origin-side transform exists (see `Config.
+            /// effectiveRelayBufferBytes`). That is deliberate: one drive
+            /// step can complete a full record and a small one, because
+            /// the engine's record buffer holds a whole wire record and
+            /// anything past it. Every record strips its own overhead, so
+            /// the step's plaintext is always narrower than that bound.
+            pub fn transformIn(conn: *ConnType, chunk: []u8) ?[]const u8 {
+                const engine = conn.stream.upstream.?.tls orelse return chunk;
+                var out: ResponsePlaintext = .{ .conn = conn };
+                engine.received(chunk.len, &out.sink()) catch {
+                    conn.server.counters.increment("tls_relay_failed");
+                    return null;
+                };
+                if (out.overflow) {
+                    // Only reachable if the pool was sized below one wire
+                    // record — a construction bug, not an origin's. The
+                    // pump's answer for an unstageable chunk is teardown.
+                    conn.server.counters.increment("tls_relay_failed");
+                    return null;
+                }
+                return conn.stream.relay_buffer.?.upstream_to_client[0..out.len];
+            }
+
+            /// An empty transform may be a close_notify and nothing else —
+            /// the in-band EOF the pump must not read past.
+            pub fn transformEnded(conn: *ConnType) bool {
+                const engine = conn.stream.upstream.?.tls orelse return false;
+                return engine.peerClosed();
+            }
+
+            /// Encrypt the framed chunk before the first send — a resume
+            /// must not re-encrypt bytes already gone.
+            ///
+            /// Chunked rather than one send, because the framed window can
+            /// be wider than one emitted record: a decrypt step may yield
+            /// a full record plus a fragment of the next, and both travel
+            /// through framing as one chunk. Splitting into legal records
+            /// is always allowed; the outbox is two records wide, so the
+            /// loop runs at most twice.
             pub fn transformOut(conn: *ConnType, consumed: u32) bool {
                 const engine = conn.tls orelse return true;
-                if (engine.outboundRoom() < TlsEngine.emitted_record_bytes_max) {
-                    conn.server.counters.increment("tls_relay_failed");
-                    return false;
+                assert(consumed <= conn.stream.relay_buffer.?.upstream_to_client.len);
+                var remaining = conn.stream.relay_buffer.?.upstream_to_client[0..consumed];
+                // Bounded: every iteration appends one record and the
+                // outbox holds at most two, so this terminates by `room`.
+                while (remaining.len > 0) {
+                    if (engine.outboundRoom() < TlsEngine.emitted_record_bytes_max) {
+                        conn.server.counters.increment("tls_relay_failed");
+                        return false;
+                    }
+                    const chunk: u32 = @intCast(@min(
+                        remaining.len,
+                        constants.tls_app_chunk_bytes,
+                    ));
+                    assert(chunk >= 1);
+                    engine.sendApp(remaining[0..chunk]) catch {
+                        conn.server.counters.increment("tls_relay_failed");
+                        return false;
+                    };
+                    remaining = remaining[chunk..];
                 }
-                engine.sendApp(
-                    conn.stream.relay_buffer.?.upstream_to_client[0..consumed],
-                ) catch {
-                    conn.server.counters.increment("tls_relay_failed");
-                    return false;
-                };
                 return true;
             }
 
             pub fn sendSlice(conn: *ConnType) []const u8 {
                 if (conn.tls) |engine| return engine.outbound();
                 const state = &conn.stream.directions[
-                    @intFromEnum(StreamType.Direction.upstream_to_client)
+                    @backingInt(StreamType.Direction.upstream_to_client)
                 ];
                 if (state.owed() == 0) return &.{};
                 return state.pending(conn.stream.relay_buffer.?.upstream_to_client);
@@ -3248,7 +4080,7 @@ pub fn Proxy(comptime IoType: type) type {
             /// pump's contract for a transforming send.
             pub fn creditSend(conn: *ConnType, sent: u32) void {
                 const state = &conn.stream.directions[
-                    @intFromEnum(StreamType.Direction.upstream_to_client)
+                    @backingInt(StreamType.Direction.upstream_to_client)
                 ];
                 if (conn.tls) |engine| {
                     engine.outboundSent(sent);
@@ -3324,6 +4156,38 @@ pub fn Proxy(comptime IoType: type) type {
                 assert(conn.stream.l7.response_leg == .pumping_body);
                 assert(conn.stream.l7.pending_verdict == .none); // response_started.
                 return false;
+            }
+        };
+
+        /// Where a TLS origin's decrypted body bytes land: the relay
+        /// buffer's upstream→client half, which is also what the plaintext
+        /// path reads and what `sendSlice` forwards.
+        const ResponsePlaintext = struct {
+            conn: *ConnType,
+            len: u32 = 0,
+            overflow: bool = false,
+            closed: bool = false,
+
+            fn sink(self: *ResponsePlaintext) UpstreamTls.Sink {
+                return .{ .ctx = self, .appData = append, .closed = peerClosed };
+            }
+
+            fn append(ctx: *anyopaque, bytes: []const u8) void {
+                const self: *ResponsePlaintext = @ptrCast(@alignCast(ctx));
+                // RFC 8446 §6.1: anything after a close_notify is ignored.
+                if (self.closed) return;
+                const buffer = self.conn.stream.relay_buffer.?.upstream_to_client;
+                if (self.len + bytes.len > buffer.len) {
+                    self.overflow = true;
+                    return;
+                }
+                @memcpy(buffer[self.len..][0..bytes.len], bytes);
+                self.len += @intCast(bytes.len);
+            }
+
+            fn peerClosed(ctx: *anyopaque) void {
+                const self: *ResponsePlaintext = @ptrCast(@alignCast(ctx));
+                self.closed = true;
             }
         };
 
@@ -3423,10 +4287,26 @@ pub fn Proxy(comptime IoType: type) type {
         /// teardown cannot close a connection it no longer owns. Under
         /// upstream pressure the parked deadline shortens (§8 watermarks)
         /// so idle parked sockets free their slots before the 503 wall.
+        ///
+        /// A TLS slot parks exactly like a plaintext one, keeping its
+        /// engine: the session's keys are the expensive part, and the
+        /// engine is quiescent between requests by construction. The
+        /// engine rides the slot through the idle list and is returned
+        /// only when the connection is actually closed (reap, drain,
+        /// teardown or a checkout that found it unusable).
         fn parkUpstream(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
             const upstream = conn.stream.upstream.?;
             assert(!upstream.parked);
+            // A TLS session can park only while it can still carry a
+            // request: connected, not peer-closed, and with no ciphertext
+            // left in the outbox. Anything else is closed now — a parked
+            // slot that cannot be reused is worse than a fresh dial, and
+            // the next request would spend its one replay discovering it.
+            if (!parkedReusable(upstream)) {
+                detachUpstream(server, conn);
+                return;
+            }
             // The exchange's head bytes go back before the slot parks
             // (§5): the response leg is settled, so the client-write
             // channel no longer references them — asserted, because the
@@ -3698,6 +4578,12 @@ pub fn Proxy(comptime IoType: type) type {
         /// the request leg already done.
         fn replayEligible(conn: *const ConnType) bool {
             assert(conn.state == .l7_exchanging);
+            // A TLS try replays exactly like a plaintext one: the request
+            // head is still in `conn.head` (no body chunk was pumped), so
+            // a fresh dial re-encrypts it under the new session's keys.
+            // The stale session itself is never reused — `beginReplay`
+            // closes it and releases its engine — which is what makes the
+            // rebuild a fresh dial rather than an attempt to resume.
             if (!conn.stream.l7.upstream_was_reused) {
                 return false;
             }
@@ -3776,6 +4662,7 @@ pub fn Proxy(comptime IoType: type) type {
             assert(request.head_len == conn.stream.l7.request_head_len);
             conn.stream.l7 = .{
                 .request_method = conn.stream.l7.request_method,
+                .request_accepts_gzip = conn.stream.l7.request_accepts_gzip,
                 .request_framing = framingFromParsed(request.framing),
                 .request_head_len = conn.stream.l7.request_head_len,
                 .client_keep_alive = conn.stream.l7.client_keep_alive,
@@ -3986,9 +4873,15 @@ pub fn Proxy(comptime IoType: type) type {
             // read (the ring was empty, so no buffer was ever bound), the
             // request's bytes wait unread in the socket, and a kept
             // connection would re-arm onto those same bytes and shed them
-            // forever. Comptime, so the resync rule — whose asserts require
-            // at least one byte read — is never consulted on that rung.
-            const may_keep = comptime !std.mem.eql(u8, counter, "l7_shed_head_buffers");
+            // forever. A rate-limited answer closes for a different
+            // reason: the body may be unread, so there is no synchronized
+            // point to keep from, and the client is the one being told to
+            // slow down. Comptime, so the resync rule — whose asserts
+            // require at least one byte read — is never consulted on
+            // either rung.
+            const may_keep = comptime !std.mem.eql(u8, counter, "l7_shed_head_buffers") and
+                !std.mem.eql(u8, counter, "l7_rate_limited") and
+                !std.mem.eql(u8, counter, "l7_conn_limited");
             const keep = commitStaticVerdict(server, conn, status, counter, may_keep);
             conn.state = .l7_responding;
             armStaticAnswer(server, conn, status, comptime shed.proxyStatusCauseFor(counter), keep);
@@ -4147,21 +5040,25 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state == .l7_responding);
             assert(page.keep_head_len <= page.keep.len);
             assert(page.close_head_len <= page.close.len);
-            const head_only = conn.stream.l7.request_method == .head;
-            const bytes = if (keep)
-                (if (head_only) page.keep[0..page.keep_head_len] else page.keep)
-            else
-                (if (head_only) page.close[0..page.close_head_len] else page.close);
-            assert(bytes.len >= 1);
+            // The one selection point: the persistence the caller chose,
+            // the request's recorded `Accept-Encoding` verdict, and the
+            // HEAD rule. `select` returns an arena slice either way, so
+            // the send stays one write from memory.
+            const answer = page.select(
+                if (keep) .keep else .close,
+                conn.stream.l7.request_accepts_gzip,
+                conn.stream.l7.request_method == .head,
+            );
+            assert(answer.bytes.len >= 1);
             // A configured page is shared arena memory exactly as the
             // comptime statics are shared server memory, so its `Date`
             // slot is stamped under the same claim (#234). The slot sits
             // in the head, so the HEAD prefix carries it too.
-            server.stampStaticDate(if (keep) page.keep_date else page.close_date);
+            server.stampStaticDate(answer.date);
             server.claimStaticSend(conn);
             const then: stream_module.ClientWrite.Then =
                 if (keep) .next_request else .lingering_close;
-            armClientWrite(server, conn, bytes, then);
+            armClientWrite(server, conn, answer.bytes, then);
         }
 
         /// Answer a matched `respond` action from its configured body
@@ -4382,6 +5279,17 @@ pub fn Proxy(comptime IoType: type) type {
                 "l7_not_implemented",
                 "l7_no_route",
                 "l7_filtered",
+                // A rate limit is an operator policy like a filter
+                // reject: nothing of this proxy's ran out, and the rule
+                // was written by the deployment.
+                "l7_rate_limited",
+                // A connection cap is the same shape of operator policy:
+                // a client holding more than its share, not a resource
+                // this proxy ran out of.
+                "l7_conn_limited",
+                // A WAF hit is policy refusing the request, exactly what
+                // `.rejected` means; the counter keeps it separable.
+                "l7_waf_blocked",
             };
             for (rejects) |name| {
                 if (std.mem.eql(u8, counter, name)) return .rejected;

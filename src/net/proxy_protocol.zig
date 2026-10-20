@@ -594,14 +594,14 @@ test "proxy protocol v1: incomplete lines wait, hopeless ones do not" {
 test "proxy protocol v1: the 107-byte line bound is exact" {
     // "PROXY UNKNOWN " + filler + CRLF: UNKNOWN ignores the filler, so
     // the only judgment left is the length's.
-    const line_105 = "PROXY UNKNOWN " ++ ("x" ** 91) ++ "\r\n";
+    const line_105 = "PROXY UNKNOWN " ++ @as([91]u8, @splat('x')) ++ "\r\n";
     comptime assert(line_105.len == 107);
     try expectClient(line_105, null, 107);
-    const line_108 = "PROXY UNKNOWN " ++ ("x" ** 92) ++ "\r\n";
+    const line_108 = "PROXY UNKNOWN " ++ @as([92]u8, @splat('x')) ++ "\r\n";
     comptime assert(line_108.len == 108);
     try expectVerdict(line_108, .invalid);
     // 107 bytes and still no CRLF: no v1 line can be forming.
-    try expectVerdict("PROXY UNKNOWN " ++ ("x" ** 93), .invalid);
+    try expectVerdict("PROXY UNKNOWN " ++ @as([93]u8, @splat('x')), .invalid);
 }
 
 test "proxy protocol v1: field discipline is strict" {
@@ -646,8 +646,8 @@ test "proxy protocol v2: the binary form parses to its client" {
     // INET6 with a mapped source unwraps to the IPv4 client (one client,
     // one hash, however conveyed).
     const mapped = v2_signature ++ "\x21\x21\x00\x24" ++
-        ("\x00" ** 10) ++ "\xff\xff" ++ "\xc6\x33\x64\x01" ++
-        ("\x00" ** 15) ++ "\x01" ++ "\xdc\x04" ++ "\x01\xbb";
+        @as([10]u8, @splat(0)) ++ "\xff\xff" ++ "\xc6\x33\x64\x01" ++
+        @as([15]u8, @splat(0)) ++ "\x01" ++ "\xdc\x04" ++ "\x01\xbb";
     comptime assert(mapped.len == 52);
     try expectClient(mapped, client_v4, 52);
 }
@@ -659,9 +659,9 @@ test "proxy protocol v2: LOCAL and non-TCP families keep the observed peer" {
     // PROXY over UNSPEC, DGRAM, and UNIX: valid statements about peers
     // this TCP listener cannot route by.
     try expectClient(v2_signature ++ "\x21\x00\x00\x00", null, 16);
-    const dgram = v2_signature ++ "\x21\x12\x00\x0c" ++ ("\x00" ** 12);
+    const dgram = v2_signature ++ "\x21\x12\x00\x0c" ++ @as([12]u8, @splat(0));
     try expectClient(dgram, null, 28);
-    const unix = v2_signature ++ "\x21\x31\x00\xd8" ++ ("\x00" ** 216);
+    const unix = v2_signature ++ "\x21\x31\x00\xd8" ++ @as([216]u8, @splat(0));
     comptime assert(unix.len == 232);
     try expectClient(unix, null, 232);
 }

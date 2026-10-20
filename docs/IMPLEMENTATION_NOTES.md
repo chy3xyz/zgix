@@ -1024,6 +1024,14 @@ measurement above still describes what a stock zoxy does. See
 "The 100k band is round-trip bound, not CPU bound" below for why the
 ceiling moved.
 
+**Superseded a third time, 2026-10-18.** The tunnel relay's transform
+learned the same chunking loop, so `LimitRelayBufferOverTlsRecord`
+retired: a terminating listener may take the full 32 KiB ceiling too.
+The per-record cap remains `tls_app_chunk_bytes` inside every encrypting
+transform, and each TLS engine's outbox is a fixed number of records —
+now three, so a tunnel's two-direction burst plus the control record a
+decrypt step may answer with all fit.
+
 **Loopback, one machine, one session.** The direction should hold or
 strengthen on a real network — fewer round trips is fewer syscalls
 whatever the RTT — but the magnitude is not a deployment figure until the

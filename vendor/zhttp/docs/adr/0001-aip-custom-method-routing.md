@@ -1,0 +1,15 @@
+# AIP-136 custom-method routing via inline `:` in the route pattern
+
+The Router gains first-class support for Google AIP-136 custom methods (`POST /users/123:archive`) as a third routing axis alongside HTTP method and path. We picked **inline `:verb` appended to the last segment of the route pattern** (`/users/:id:archive`) over a separate `action` field on `Route` or a different sigil, because it mirrors the URL syntax 1:1 and keeps the route table visually equivalent to the URLs it serves. The Action is exposed on `Request.action: ?[]const u8` and matched exactly — a Route with no Action does not match a URL with one, and vice versa.
+
+## Consequences
+
+- **Breaking change for literal `:` in path-parameter values.** A request like `GET /items/SKU-123:foo` against `GET /items/:sku` previously captured `sku = "SKU-123:foo"`; it now captures `sku = "SKU-123"` and parses `foo` as the Action, so the route no longer matches unless the Action is declared. Acceptable because `:` is reserved by RFC 3986 / AIP-136 and rarely appears in resource identifiers.
+- **Two meanings of `:` in a Route Pattern.** Leading `:` introduces a path parameter (`:id`); non-leading `:` on the last segment introduces an Action (`:id:archive`). The Router doc comment must explain this; the alternative (using a different sigil like `@archive`) was rejected because it diverges from the AIP URL syntax.
+- **Action validation is strict for patterns, lenient for URLs.** Action names match `[A-Za-z][A-Za-z0-9]*`. In Route Patterns, empty actions, non-conforming characters, actions on catch-all segments, and actions not on the last segment are `@compileError`. In incoming URLs, a non-leading `:` followed by a valid camelCase tail is an Action; any other `:tail` (invalid characters, empty, multiple `:` in one segment) is treated as literal content of the last segment — `Request.action` stays `null` and existing literal/param routes can still match. Asymmetric strictness is deliberate: route declarations should be unambiguous, but incoming URLs that happen to contain `:` in non-AIP forms shouldn't suddenly start 404-ing.
+
+## Considered alternatives
+
+- **Separate `action: ?[]const u8` field on `Route`.** Rejected: doubles the way an action can be expressed (in the path string or in the field), and breaks symmetry with the URL shape.
+- **Different sigil (e.g. `@archive`).** Rejected: AIP-136 specifies `:` and most readers will be Googling AIP docs; introducing our own sigil makes the routing layer harder to map onto the spec.
+- **No constraint on `Route.method` for Action routes.** Rejected. We initially planned to leave `method` orthogonal, but AIP-136 explicitly mandates POST for custom methods, and accepting any method makes it possible to declare semantically invalid routes that look fine. Declaring an Action with any method other than POST is now a `@compileError`. The `:listFoo` / `:search` GET exception in some Google APIs is rare and out of scope — users who need it can declare a plain GET route on the same path and switch on `request.action` themselves.

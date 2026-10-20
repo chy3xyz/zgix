@@ -5,6 +5,12 @@
 //! SYN/ACK as its answer, while an `http` check goes on to send a
 //! request and require the configured status — the difference between
 //! knowing the port accepts and knowing the application answered.
+//! An `http` check on a cluster that dials TLS runs the same exchange
+//! through an `UpstreamTls` engine: the request is encrypted, the
+//! response is decrypted into the probe's own buffer, and the status is
+//! judged by the same parser. A `tcp` check on such a cluster stays a
+//! plain dial because it was only ever asking for the SYN/ACK; the
+//! origin's encryption is irrelevant to that question.
 //! Anything else (refused, unreachable, timed out, a wrong status, a
 //! head that will not parse, kernel pressure) is a fail. `fall`
 //! consecutive fails eject an endpoint from balancing and close its
@@ -56,6 +62,7 @@ const config_module = @import("../config.zig");
 const constants = @import("../constants.zig");
 const Io = @import("../io/io.zig");
 const parser = @import("../http/parser.zig");
+const UpstreamTls = @import("../tls/UpstreamTls.zig");
 const upstream = @import("upstream.zig");
 
 const assert = std.debug.assert;
@@ -153,6 +160,10 @@ pub fn Checker(comptime IoType: type) type {
             none,
             pass,
             fail,
+            /// The probe could not run — today only a TLS cluster whose
+            /// engine pool is exhausted. It is not an endpoint verdict:
+            /// the next sweep tries again rather than counting a fall.
+            skip,
         };
 
         /// One probe: the endpoint it was handed, the verdict it has
@@ -181,6 +192,20 @@ pub fn Checker(comptime IoType: type) type {
             /// must end an armed send or recv shuts the socket down instead,
             /// which makes the op complete — and must do so exactly once.
             shutdown_done: bool,
+            /// The pooled TLS engine for an `http` probe against a TLS
+            /// cluster, acquired when the dial lands and released by
+            /// `closeSocket` once the armed set is empty — the same
+            /// release-when-quiescent rule as the socket, so a deadline or
+            /// drain cannot strand a slot.
+            engine: ?*UpstreamTls,
+            /// Which data leg is armed. The legs are strictly serial, so
+            /// this is how a send/recv delivery knows whether it is moving
+            /// handshake ciphertext, request ciphertext, or plaintext.
+            leg: Leg,
+            /// A TLS response record carried more plaintext than the
+            /// response buffer holds. An incomplete head then has no room
+            /// left to arrive in, which is the oversize-head verdict.
+            response_overflow: bool,
             /// The rendered request, and how much of it has gone out.
             request: [constants.health_check_request_bytes_max]u8,
             request_len: u32,
@@ -224,6 +249,27 @@ pub fn Checker(comptime IoType: type) type {
                 _pad: u3 = 0,
             };
 
+            /// One data leg at a time, exactly as the plaintext probe had
+            /// them. A TLS probe splits the same send/recv pair into the
+            /// handshake's flights and the exchange's records; the op
+            /// budget is unchanged because a leg is still one op.
+            const Leg = enum(u8) {
+                none,
+                /// Plaintext request bytes to the socket.
+                request_send,
+                /// Plaintext response bytes from the socket.
+                response_recv,
+                /// Flushing the engine's outbox: ClientHello or a later
+                /// handshake flight.
+                tls_handshake_send,
+                /// Reading records into the engine while handshaking.
+                tls_handshake_recv,
+                /// Flushing encrypted request records.
+                tls_request_send,
+                /// Reading records and decrypting them into the response.
+                tls_response_recv,
+            };
+
             fn init(
                 probe: *Probe,
                 arena: std.mem.Allocator,
@@ -240,6 +286,9 @@ pub fn Checker(comptime IoType: type) type {
                 probe.pending_verdict = .none;
                 probe.socket = null;
                 probe.shutdown_done = false;
+                probe.engine = null;
+                probe.leg = .none;
+                probe.response_overflow = false;
                 probe.request_len = 0;
                 probe.request_sent = 0;
                 probe.response_len = 0;
@@ -278,6 +327,12 @@ pub fn Checker(comptime IoType: type) type {
                 assert(cluster.check != null);
                 assert(endpoint_index < cluster.endpoints.len);
                 assert(probe.pending_verdict == .none);
+                // A settled probe releases both, so a live one here means
+                // the previous settle did not finish its release.
+                assert(probe.engine == null);
+                assert(probe.leg == .none);
+                assert(probe.socket == null);
+                probe.response_overflow = false;
                 const server = checker.server;
                 const check = &cluster.check.?;
                 probe.target_cluster = cluster_index;
@@ -327,7 +382,11 @@ pub fn Checker(comptime IoType: type) type {
                         // probe, not its verdict: the socket is stored and
                         // carries the request and response legs.
                         probe.socket = socket;
-                        probe.beginRequest(socket);
+                        if (probe.targetUsesTls()) {
+                            probe.beginTlsHandshake(socket);
+                        } else {
+                            probe.beginRequest(socket);
+                        }
                         probe.settle();
                         return;
                     }
@@ -335,6 +394,8 @@ pub fn Checker(comptime IoType: type) type {
                     // a socket that was never stored cannot leak (§9). The
                     // same holds for a dial that lands after its own verdict
                     // or into a drain: there is nothing left to send it.
+                    // A TLS cluster changes nothing here: a tcp check never
+                    // wanted the encrypted session, only the dial's answer.
                     checker.server.io.closeNow(socket);
                 } else |_| {}
                 if (checker.state == .stopping) {
@@ -366,14 +427,21 @@ pub fn Checker(comptime IoType: type) type {
                 probe.settle();
             }
 
-            /// Render this probe's request and start writing it. The render
-            /// cannot fail: `health_check_request_bytes_max` is derived from
-            /// the path and Host bounds the loader already enforced (§5).
-            fn beginRequest(probe: *Probe, socket: IoType.Socket) void {
+            /// Whether this probe's cluster dials TLS. Only an http check
+            /// asks: a tcp check on the same cluster closes its socket in
+            /// the dial's delivery and never builds a session.
+            fn targetUsesTls(probe: *const Probe) bool {
+                const cluster = &probe.checker.server.config.clusters[probe.target_cluster];
+                assert(cluster.check != null);
+                return cluster.tls != null;
+            }
+
+            /// Render this probe's request. The render cannot fail:
+            /// `health_check_request_bytes_max` is derived from the path and
+            /// Host bounds the loader already enforced (§5).
+            fn renderRequest(probe: *Probe) void {
                 const checker = probe.checker;
                 assert(checker.state == .probing);
-                assert(!probe.armed.send);
-                assert(!probe.armed.recv);
                 const check = checker.checkOf(probe.target_cluster);
                 assert(check.kind == .http);
                 const http = check.http.?;
@@ -398,7 +466,49 @@ pub fn Checker(comptime IoType: type) type {
                 probe.request_sent = 0;
                 probe.response_len = 0;
                 assert(probe.request_len >= 1);
+            }
+
+            /// Render and start writing the request over a plaintext socket.
+            fn beginRequest(probe: *Probe, socket: IoType.Socket) void {
+                assert(!probe.armed.send);
+                assert(!probe.armed.recv);
+                probe.renderRequest();
                 probe.armSend(socket);
+            }
+
+            /// Take an engine for the probe's lifetime and start the ClientHello.
+            /// The runtime table, not the config block, is the capability: a
+            /// server that never loaded upstream TLS cannot build a session,
+            /// so the probe skips exactly as an exhausted pool does.
+            fn beginTlsHandshake(probe: *Probe, socket: IoType.Socket) void {
+                const checker = probe.checker;
+                assert(checker.state == .probing);
+                assert(probe.engine == null);
+                assert(probe.socket != null);
+                const server = checker.server;
+                const index = probe.target_cluster;
+                if (index >= server.cluster_tls.len or server.cluster_tls[index] == null) {
+                    probe.skipProbe();
+                    return;
+                }
+                const engine = server.acquireUpstreamTlsEngine(index) catch {
+                    // Exhaustion is our resource wall, not the origin's
+                    // verdict (§8): skip this probe and let the next tick
+                    // ask again rather than counting a fall against it.
+                    probe.skipProbe();
+                    return;
+                };
+                probe.engine = engine;
+                engine.start();
+                probe.armTlsOutbound(socket, .tls_handshake_send);
+            }
+
+            /// A probe that could not run keeps its endpoint's streaks
+            /// untouched; `settle` still drains its deadline and advances
+            /// the sweep, so the pool gets another chance next tick.
+            fn skipProbe(probe: *Probe) void {
+                assert(probe.pending_verdict == .none);
+                probe.pending_verdict = .skip;
             }
 
             fn armSend(probe: *Probe, socket: IoType.Socket) void {
@@ -406,6 +516,7 @@ pub fn Checker(comptime IoType: type) type {
                 assert(checker.state == .probing);
                 assert(!probe.armed.send);
                 assert(probe.request_sent < probe.request_len);
+                probe.leg = .request_send;
                 probe.armed.send = true;
                 checker.server.io.send(
                     socket,
@@ -418,10 +529,92 @@ pub fn Checker(comptime IoType: type) type {
                 assert(probe.armedCount() <= constants.health_probe_ops_max);
             }
 
+            /// Flush whatever the engine staged. Only called with a
+            /// non-empty outbox: an empty one is the moment to decide
+            /// whether to read, not to send nothing.
+            fn armTlsOutbound(probe: *Probe, socket: IoType.Socket, leg: Leg) void {
+                const checker = probe.checker;
+                assert(checker.state == .probing);
+                assert(!probe.armed.send);
+                assert(probe.engine != null);
+                const staged = probe.engine.?.outbound();
+                assert(staged.len >= 1);
+                probe.leg = leg;
+                probe.armed.send = true;
+                checker.server.io.send(
+                    socket,
+                    staged,
+                    &probe.op_send,
+                    Probe,
+                    probe,
+                    onProbeSend,
+                );
+                assert(probe.armedCount() <= constants.health_probe_ops_max);
+            }
+
+            /// Read wire bytes where the engine expects them. Ciphertext
+            /// never lands in `response`; decrypting here is what keeps the
+            /// TLS probe judging the same bytes as the plaintext one.
+            fn armTlsRecv(probe: *Probe, socket: IoType.Socket, leg: Leg) void {
+                const checker = probe.checker;
+                assert(checker.state == .probing);
+                assert(!probe.armed.recv);
+                assert(probe.engine != null);
+                const destination = probe.engine.?.recvBuffer();
+                assert(destination.len >= 1);
+                probe.leg = leg;
+                probe.armed.recv = true;
+                checker.server.io.recv(
+                    socket,
+                    destination,
+                    &probe.op_recv,
+                    Probe,
+                    probe,
+                    onProbeRecv,
+                );
+                assert(probe.armedCount() <= constants.health_probe_ops_max);
+            }
+
+            /// The handshake is finished: render the request and encrypt
+            /// the first chunk into the outbox.
+            fn beginTlsRequest(probe: *Probe, socket: IoType.Socket) void {
+                assert(probe.checker.state == .probing);
+                assert(probe.engine != null);
+                assert(probe.engine.?.isConnected());
+                probe.renderRequest();
+                if (!probe.stageTlsRequest()) {
+                    probe.pending_verdict = .fail;
+                    return;
+                }
+                probe.armTlsOutbound(socket, .tls_request_send);
+            }
+
+            /// Encrypt the next plaintext chunk. `request_sent` counts
+            /// plaintext, so a record's ciphertext overhead never leaks
+            /// into the request's length.
+            fn stageTlsRequest(probe: *Probe) bool {
+                const engine = probe.engine orelse unreachable;
+                const remaining = probe.request[probe.request_sent..probe.request_len];
+                assert(remaining.len >= 1);
+                assert(engine.outboxEmpty());
+                const chunk: u32 = @intCast(@min(
+                    remaining.len,
+                    @as(usize, constants.tls_app_chunk_bytes),
+                ));
+                engine.sendApp(remaining[0..chunk]) catch return false;
+                probe.request_sent += chunk;
+                assert(probe.request_sent <= probe.request_len);
+                assert(!engine.outboxEmpty());
+                return true;
+            }
+
             fn onProbeSend(probe: *Probe, result: Io.SendError!u32) void {
                 const checker = probe.checker;
                 assert(probe.armed.send);
                 probe.armed.send = false;
+                const leg = probe.leg;
+                assert(leg != .none);
+                probe.leg = .none;
                 if (checker.state == .stopping) {
                     checker.continueStop();
                     return;
@@ -442,21 +635,74 @@ pub fn Checker(comptime IoType: type) type {
                     probe.settle();
                     return;
                 };
-                probe.request_sent += sent;
-                assert(probe.request_sent <= probe.request_len);
                 // A verdict already reached (the deadline fired and shut this
                 // socket down) ends the probe here: arming another leg would
                 // only spend an op to be told what is already known.
                 if (probe.pending_verdict == .none) {
-                    const socket = probe.socket.?;
-                    if (probe.request_sent < probe.request_len) {
-                        // A short write is ordinary (§6): resume where it left off.
-                        probe.armSend(socket);
-                    } else {
-                        probe.armRecv(socket);
-                    }
+                    probe.resumeSend(probe.socket.?, leg, sent);
                 }
                 probe.settle();
+            }
+
+            /// Credit a send to whichever leg armed it and take the next
+            /// step. TLS sends may be partial at either layer: a short write
+            /// re-arms the same staged bytes, while a whole record leaves
+            /// room to encrypt the next request chunk.
+            fn resumeSend(probe: *Probe, socket: IoType.Socket, leg: Leg, sent: u32) void {
+                assert(probe.checker.state == .probing);
+                assert(probe.pending_verdict == .none);
+                assert(sent >= 1);
+                switch (leg) {
+                    .request_send => {
+                        probe.request_sent += sent;
+                        assert(probe.request_sent <= probe.request_len);
+                        if (probe.request_sent < probe.request_len) {
+                            // A short write is ordinary (§6): resume where it
+                            // left off.
+                            probe.armSend(socket);
+                        } else {
+                            probe.armRecv(socket);
+                        }
+                    },
+                    .tls_handshake_send => {
+                        probe.engine.?.outboundSent(sent);
+                        probe.pumpTlsHandshake(socket);
+                    },
+                    .tls_request_send => {
+                        const engine = probe.engine.?;
+                        engine.outboundSent(sent);
+                        if (!engine.outboxEmpty()) {
+                            probe.armTlsOutbound(socket, .tls_request_send);
+                        } else if (probe.request_sent < probe.request_len) {
+                            if (!probe.stageTlsRequest()) {
+                                probe.pending_verdict = .fail;
+                                return;
+                            }
+                            probe.armTlsOutbound(socket, .tls_request_send);
+                        } else {
+                            probe.armTlsRecv(socket, .tls_response_recv);
+                        }
+                    },
+                    else => unreachable,
+                }
+            }
+
+            /// The outbox has drained: either a flight must still go out,
+            /// the handshake is complete and the request may start, or the
+            /// next server flight must be read.
+            fn pumpTlsHandshake(probe: *Probe, socket: IoType.Socket) void {
+                const engine = probe.engine orelse unreachable;
+                if (!engine.outboxEmpty()) {
+                    probe.armTlsOutbound(socket, .tls_handshake_send);
+                } else if (engine.isConnected()) {
+                    probe.beginTlsRequest(socket);
+                } else if (engine.peerClosed()) {
+                    // close_notify before Finished is a session that can
+                    // never carry the request.
+                    probe.pending_verdict = .fail;
+                } else {
+                    probe.armTlsRecv(socket, .tls_handshake_recv);
+                }
             }
 
             fn armRecv(probe: *Probe, socket: IoType.Socket) void {
@@ -464,6 +710,7 @@ pub fn Checker(comptime IoType: type) type {
                 assert(checker.state == .probing);
                 assert(!probe.armed.recv);
                 assert(probe.response_len < probe.response.len);
+                probe.leg = .response_recv;
                 probe.armed.recv = true;
                 checker.server.io.recv(
                     socket,
@@ -480,6 +727,9 @@ pub fn Checker(comptime IoType: type) type {
                 const checker = probe.checker;
                 assert(probe.armed.recv);
                 probe.armed.recv = false;
+                const leg = probe.leg;
+                assert(leg != .none);
+                probe.leg = .none;
                 if (checker.state == .stopping) {
                     checker.continueStop();
                     return;
@@ -496,22 +746,110 @@ pub fn Checker(comptime IoType: type) type {
                     probe.settle();
                     return;
                 };
+                // A deadline may already have shut the socket down; the
+                // bytes that still arrived are op accounting, not progress.
+                if (probe.pending_verdict == .none) {
+                    switch (leg) {
+                        .response_recv => probe.resumePlainRecv(probe.socket.?, received),
+                        .tls_handshake_recv => probe.resumeHandshakeRecv(probe.socket.?, received),
+                        .tls_response_recv => probe.resumeTlsResponse(probe.socket.?, received),
+                        else => unreachable,
+                    }
+                }
+                probe.settle();
+            }
+
+            fn resumePlainRecv(probe: *Probe, socket: IoType.Socket, received: u32) void {
+                assert(received >= 1);
                 probe.response_len += received;
                 assert(probe.response_len <= probe.response.len);
-                if (probe.pending_verdict == .none) {
-                    probe.judgeResponse();
-                }
+                probe.judgeResponse();
                 if (probe.pending_verdict == .none) {
                     // The head is still arriving. A full buffer with no head
                     // in it is the §7 oversize-head verdict, not a shortfall.
                     if (probe.response_len == probe.response.len) {
                         probe.pending_verdict = .fail;
                     } else {
-                        probe.armRecv(probe.socket.?);
+                        probe.armRecv(socket);
                     }
                 }
-                probe.settle();
             }
+
+            /// Handshake plaintext is not expected before the probe sends
+            /// its request, so anything volunteered is dropped. A closed
+            /// session that never connected is a failed probe.
+            fn resumeHandshakeRecv(probe: *Probe, socket: IoType.Socket, received: u32) void {
+                const engine = probe.engine orelse unreachable;
+                var sink: DiscardSink = .{};
+                engine.received(received, &sink.sink()) catch {
+                    probe.pending_verdict = .fail;
+                    return;
+                };
+                probe.pumpTlsHandshake(socket);
+            }
+
+            /// Decrypt a record into the response buffer, then judge it with
+            /// the same parser the plaintext probe uses. A buffer that filled
+            /// without a complete head is the oversize-head verdict.
+            fn resumeTlsResponse(probe: *Probe, socket: IoType.Socket, received: u32) void {
+                const engine = probe.engine orelse unreachable;
+                var sink: ResponseSink = .{ .probe = probe };
+                engine.received(received, &sink.sink()) catch {
+                    probe.pending_verdict = .fail;
+                    return;
+                };
+                probe.judgeResponse();
+                if (probe.pending_verdict != .none) return;
+                if (probe.response_overflow or probe.response_len == probe.response.len) {
+                    probe.pending_verdict = .fail;
+                    return;
+                }
+                probe.armTlsRecv(socket, .tls_response_recv);
+            }
+
+            /// Accumulates decrypted application data in the probe's own
+            /// response buffer. Overflow is recorded rather than asserted:
+            /// the peer chooses how much a record carries, and an origin
+            /// that answers with more than the data path would accept has
+            /// not answered this check.
+            const ResponseSink = struct {
+                probe: *Probe,
+
+                fn sink(self: *ResponseSink) UpstreamTls.Sink {
+                    return .{ .ctx = self, .appData = appData, .closed = closed };
+                }
+
+                fn appData(ctx: *anyopaque, bytes: []const u8) void {
+                    const self: *ResponseSink = @ptrCast(@alignCast(ctx));
+                    const probe = self.probe;
+                    const room = probe.response.len - probe.response_len;
+                    const take = @min(room, bytes.len);
+                    @memcpy(probe.response[probe.response_len..][0..take], bytes[0..take]);
+                    probe.response_len += @intCast(take);
+                    if (take < bytes.len) probe.response_overflow = true;
+                }
+
+                fn closed(ctx: *anyopaque) void {
+                    _ = ctx;
+                }
+            };
+
+            /// Handshake plaintext is discarded; the engine's own state
+            /// carries `close_notify`, so no callback has to.
+            const DiscardSink = struct {
+                fn sink(self: *DiscardSink) UpstreamTls.Sink {
+                    return .{ .ctx = self, .appData = appData, .closed = closed };
+                }
+
+                fn appData(ctx: *anyopaque, bytes: []const u8) void {
+                    _ = ctx;
+                    _ = bytes;
+                }
+
+                fn closed(ctx: *anyopaque) void {
+                    _ = ctx;
+                }
+            };
 
             /// Judge what has arrived so far, leaving the verdict `.none`
             /// while the head is merely incomplete. The head parser is the
@@ -607,10 +945,12 @@ pub fn Checker(comptime IoType: type) type {
                 }
             }
 
-            /// The probe's socket, once no op can reference it. Closing is
-            /// synchronous for the same reason `continueTeardown`'s is: by
-            /// here the armed set is empty, so nothing is left to deliver
-            /// against this fd (§5).
+            /// The probe's socket and engine, once no op can reference either.
+            /// Closing is synchronous for the same reason
+            /// `continueTeardown`'s is: by here the armed set is empty, so
+            /// nothing is left to deliver against this fd or this session
+            /// (§5). The engine is released exactly here — one release point
+            /// for the verdict path and the drain path alike.
             fn closeSocket(probe: *Probe) void {
                 // This probe's own ops, not the prober's: a sibling probe
                 // may still be mid-flight against a different endpoint,
@@ -621,7 +961,13 @@ pub fn Checker(comptime IoType: type) type {
                     probe.checker.server.io.closeNow(socket);
                     probe.socket = null;
                 }
+                if (probe.engine) |engine| {
+                    probe.checker.server.releaseUpstreamTlsEngine(engine);
+                    probe.engine = null;
+                }
                 probe.shutdown_done = false;
+                probe.leg = .none;
+                probe.response_overflow = false;
             }
 
             /// The delivery that empties this probe's armed set applies the
@@ -646,10 +992,13 @@ pub fn Checker(comptime IoType: type) type {
                 probe.closeSocket();
                 const verdict = probe.pending_verdict;
                 probe.pending_verdict = .none;
-                if (verdict == .pass) {
-                    checker.witnessPass(probe.target_cluster, probe.target_endpoint);
-                } else {
-                    checker.witnessFail(probe.target_cluster, probe.target_endpoint);
+                switch (verdict) {
+                    .pass => checker.witnessPass(probe.target_cluster, probe.target_endpoint),
+                    .fail => checker.witnessFail(probe.target_cluster, probe.target_endpoint),
+                    // Nothing ran, so the endpoint's streaks mean what they
+                    // meant before; the next sweep tries the pool again.
+                    .skip => {},
+                    .none => unreachable,
                 }
                 checker.dispatchNext();
             }
@@ -863,11 +1212,16 @@ pub fn Checker(comptime IoType: type) type {
         }
 
         /// The simulator's leak invariant (§9): a leaked armed op is a
-        /// leak like any other. The probe socket needs no term — it is
-        /// closed inside the connect delivery and never held across
-        /// callbacks.
+        /// leak like any other, and so is an engine the probe did not hand
+        /// back. A live probe always has an armed op (its deadline at
+        /// minimum), so the second check is the one that can catch a
+        /// release path that stopped one short.
         pub fn isQuiescent(checker: *const Self) bool {
-            return checker.armedCount() == 0;
+            if (checker.armedCount() != 0) return false;
+            for (checker.probes) |*probe| {
+                if (probe.engine != null) return false;
+            }
+            return true;
         }
 
         pub fn armedCount(checker: *const Self) u32 {

@@ -34,10 +34,23 @@ const router = @import("http/router.zig");
 const filter = @import("http/filter.zig");
 const Io = @import("io/io.zig");
 const parser = @import("http/parser.zig");
+const rate_limit = @import("rate_limit.zig");
 const Server = @import("Server.zig").Server;
 const SimIo = @import("io/SimIo.zig");
-const Credentials = @import("tls/Credentials.zig");
+const CredentialSet = @import("tls/CredentialSet.zig");
+const ClusterTls = @import("tls/ClusterTls.zig");
+const TestServer = @import("tls/TestServer.zig").TestServer;
 const TlsClient = @import("tls/TestClient.zig").TestClient(SimIo);
+
+/// Zig 0.17 removed array multiplication (`a ** n`). Multi-byte repeats are
+/// still useful in fixtures, so spell the one operation out at comptime.
+fn repeatBytes(comptime bytes: []const u8, comptime times: usize) [bytes.len * times]u8 {
+    var result: [bytes.len * times]u8 = undefined;
+    for (0..times) |i| {
+        @memcpy(result[i * bytes.len ..][0..bytes.len], bytes);
+    }
+    return result;
+}
 
 const assert = std.debug.assert;
 
@@ -561,11 +574,17 @@ const Http1Bed = struct {
     config: config_module.Config,
     server: ServerSim,
     origin: HttpOrigin,
+    /// The TLS origin for the `origin_tls` scenarios; its listener is
+    /// started only then, and it is otherwise idle test scaffolding.
+    tls_origin: TestServer,
     client: HttpClient,
     client2: HttpClient,
     drain_timer_completion: SimIo.Completion,
     origin_stop_completion: SimIo.Completion,
-    tls_credentials: [1]?Credentials,
+    tls_credentials: [1]?CredentialSet,
+    /// One runtime per cluster, handed to `Server.setClusterTls` before
+    /// `start`; null when the cluster dials plaintext.
+    cluster_tls: [1]?ClusterTls.Runtime,
 
     const idle_timeout_ms: u32 = 1000;
     /// Deliberately 20× tighter than the idle timeout so a test can witness
@@ -605,6 +624,10 @@ const Http1Bed = struct {
         /// standing in for what `main` does — this file runs under the Io
         /// seam, where a filesystem is what does not exist.
         tls: bool = false,
+        /// Dial the origin over TLS, for the active-check scenarios: the
+        /// cluster carries a `tls` block and the origin runs a real
+        /// server handshake. Verification is off, so no CA file exists.
+        origin_tls: bool = false,
         /// Socket-ring size, null for SimIo's own default (§9). The default
         /// is narrower than a head buffer, so no delivery can fill one in a
         /// single read; a scenario that needs the shape production takes
@@ -628,6 +651,21 @@ const Http1Bed = struct {
         max_body_bytes: u64 = constants.request_body_bytes_default,
         /// The #237 keep-alive request cap; 0 is unlimited.
         keepalive_requests: u32 = constants.keepalive_requests_default,
+        /// The listener's per-client token bucket (§7), null by default
+        /// so every pre-existing scenario is unlimited. The bed builds
+        /// its `Config` directly, so this stands in for what the loader
+        /// would have resolved from a `rate_limit` block.
+        rate_limit: ?rate_limit.Policy = null,
+        /// The bucket table's width; must be nonzero exactly when
+        /// `rate_limit` is, mirroring the loader's own rule.
+        rate_limit_entries: u32 = 0,
+        /// The listener's per-client connection cap (§7), null by
+        /// default. The bed builds its `Config` directly, so this stands
+        /// in for what the loader would have resolved.
+        conn_limit_max: ?u32 = null,
+        /// The connection table's width; nonzero exactly when
+        /// `conn_limit_max` is.
+        conn_limit_entries: u32 = 0,
         /// Put an endpoint nothing listens on *ahead* of the origin, so
         /// the first pick of an `rr` cluster is always the one that
         /// refuses and the retry is the only way to reach the origin.
@@ -679,6 +717,10 @@ const Http1Bed = struct {
         /// existing scenarios are unfiltered. A test supplies compiled
         /// rules to drive the filter reject/edit paths.
         request_filters: []const filter.Rule = &.{},
+        /// The listener-level WAF-lite denylist; null (the default) so
+        /// every pre-existing scenario is unfiltered. A test supplies a
+        /// compiled `filter.Waf` to drive the before-routing block.
+        waf: ?filter.Waf = null,
         /// The listener's #175 response filter rules; empty by default
         /// on the same terms.
         response_filters: []const filter.ResponseRule = &.{},
@@ -686,9 +728,19 @@ const Http1Bed = struct {
         /// leaves `X-Forwarded-For` untouched, as every pre-existing
         /// scenario expects.
         forwarded: ?config_module.Config.Listener.Forwarded = null,
+        /// The same block's companion headers. Off by default, like the
+        /// mode itself.
+        forwarded_real_ip: bool = false,
+        forwarded_proto: bool = false,
+        /// `compress.min_bytes`, or null (off).
+        compress_min_bytes: ?u32 = null,
         /// The #300 opt-in; off by default, so every pre-existing
         /// scenario still asserts on pages with no `Proxy-Status`.
         proxy_status: bool = false,
+        /// The listener's `Alt-Svc` advertisement (RFC 7838); null (the
+        /// default) so every pre-existing scenario still asserts on
+        /// heads with no advertisement.
+        h3_advertise: ?[]const u8 = null,
         /// Accept on a socket file instead of a TCP port (#303). Off by
         /// default: every pre-existing scenario is about something other
         /// than which family the *client* leg speaks.
@@ -701,6 +753,9 @@ const Http1Bed = struct {
         /// scenario keeps paying nothing for it; a test that turns it on
         /// reads the emitted lines straight out of SimIo's virtual sink.
         access_log: bool = false,
+        /// Whether the bed's one route writes access-log lines. Default
+        /// true; false is the per-route `access_log: false` opt-out.
+        route_access_log: bool = true,
         /// The #140 headers each line records; empty for every
         /// pre-existing scenario, so their lines stay byte-identical.
         /// Names must already be lowercase — the loader lowercases, and
@@ -775,17 +830,28 @@ const Http1Bed = struct {
             .bind_mode = null,
             .routes = &bed.routes,
             .request_filters = options.request_filters,
+            .waf = options.waf,
             .response_filters = options.response_filters,
             .protocol = .http,
             .upgrades = options.upgrades,
             .max_body_bytes = options.max_body_bytes,
             .keepalive_requests = options.keepalive_requests,
+            .rate_limit = options.rate_limit,
+            .conn_limit_max = options.conn_limit_max,
             .forwarded = options.forwarded,
+            .forwarded_real_ip = options.forwarded_real_ip,
+            .forwarded_proto = options.forwarded_proto,
+            .compress_min_bytes = options.compress_min_bytes,
             .proxy_status = options.proxy_status,
+            .h3_advertise = options.h3_advertise,
             // Paths nothing reads: the bed embeds the PEMs, so what this
             // states is only that the listener terminates.
             .tls = if (options.tls)
-                .{ .cert_path = "cert.pem", .key_path = "key.pem" }
+                .{ .certificates = &.{.{
+                    .cert_path = "cert.pem",
+                    .key_path = "key.pem",
+                    .names = &.{},
+                }} }
             else
                 null,
         }};
@@ -816,6 +882,9 @@ const Http1Bed = struct {
         bed.arena_state = std.heap.ArenaAllocator.init(gpa);
         errdefer bed.arena_state.deinit();
         const arena = bed.arena_state.allocator();
+        // Every bed owns the slot; only the `origin_tls` scenarios start
+        // it. The default keeps `closeRemaining` safe on all the rest.
+        bed.tls_origin = .{};
 
         var adversary: SimIo.Adversary = .{ .partial_io = options.partial_io };
         if (options.inbox_bytes) |bytes| {
@@ -832,8 +901,11 @@ const Http1Bed = struct {
             .buffer_group_bytes = options.head_buffer_bytes,
         });
         bed.installEndpoints(options);
-        bed.clusters = .{.{ .name = "origin", .endpoints = bed.endpoints[0..bed.endpoints_count], .check = options.check, .passive_ejection = options.passive_ejection, .max_inflight = options.max_inflight, .pick = options.pick, .hash_key = options.hash_key, .retries = options.retries }};
-        bed.routes = .{.{ .host = options.route_host, .prefix = options.route_prefix, .cluster_index = 0 }};
+        bed.clusters = .{.{ .name = "origin", .endpoints = bed.endpoints[0..bed.endpoints_count], .check = options.check, .passive_ejection = options.passive_ejection, .max_inflight = options.max_inflight, .pick = options.pick, .hash_key = options.hash_key, .retries = options.retries, .tls = if (options.origin_tls) .{
+            .server_name = fixture_host_name,
+            .verify = false,
+        } else null }};
+        bed.routes = .{.{ .host = options.route_host, .prefix = options.route_prefix, .cluster_index = 0, .access_log = options.route_access_log }};
         bed.installListener(options);
         bed.buildConfig(options);
         try bed.server.init(arena, &bed.sim_io, &bed.config, .{
@@ -849,8 +921,14 @@ const Http1Bed = struct {
                 0,
             .tls_engines = if (options.tls) options.conn_slots else 0,
             .tunnels = options.tunnels,
+            .rate_limit_entries = options.rate_limit_entries,
+            .conn_limit_entries = options.conn_limit_entries,
         });
         try bed.loadTlsCredentials(arena, options.tls);
+        bed.cluster_tls = .{if (options.origin_tls) .{
+            .server_name = fixture_host_name,
+        } else null};
+        bed.server.setClusterTls(&bed.cluster_tls);
         try bed.server.start();
         bed.origin = .{
             .response = options.origin_response,
@@ -860,17 +938,30 @@ const Http1Bed = struct {
             .interim_then_close_after_served = options.origin_interim_then_close_after_served,
             .close_second_at_accept = options.close_second_at_accept,
         };
-        if (options.origin_listens) {
-            if (options.unix_origin) {
-                try bed.origin.startUnix(&bed.sim_io, origin_socket_path);
-            } else {
-                try bed.origin.start(&bed.sim_io, originAddress());
-            }
-        }
+        if (options.origin_listens) try bed.startOrigin(arena, options);
         bed.client = .{ .send_delay_ms = options.send_delay_ms };
         bed.client2 = .{};
         bed.drain_timer_completion = .{};
         bed.origin_stop_completion = .{};
+    }
+
+    /// Start whichever origin shape the scenario asked for. Split from
+    /// `setUp` so the TLS fixtures do not crowd its length budget.
+    fn startOrigin(bed: *Http1Bed, arena: std.mem.Allocator, options: Options) !void {
+        if (options.origin_tls) {
+            assert(!options.unix_origin);
+            try bed.tls_origin.start(
+                &bed.sim_io,
+                arena,
+                originAddress(),
+                fixture_cert_pem,
+                fixture_key_pem,
+            );
+        } else if (options.unix_origin) {
+            try bed.origin.startUnix(&bed.sim_io, origin_socket_path);
+        } else {
+            try bed.origin.start(&bed.sim_io, originAddress());
+        }
     }
 
     /// A sweep-observation scenario cannot let the client drive the drain
@@ -915,10 +1006,12 @@ const Http1Bed = struct {
     fn loadTlsCredentials(bed: *Http1Bed, arena: std.mem.Allocator, on: bool) !void {
         bed.tls_credentials = .{null};
         if (!on) return;
-        bed.tls_credentials[0] = try Credentials.load(
+        bed.tls_credentials[0] = try CredentialSet.load(
             arena,
-            fixture_cert_pem,
-            fixture_key_pem,
+            &.{.{
+                .cert_pem = fixture_cert_pem,
+                .key_pem = fixture_key_pem,
+            }},
             // Deterministic signatures, so a seeded run replays a
             // byte-exact handshake (§9). Never set in production.
             .{ .deterministic_nonce = true },
@@ -927,6 +1020,7 @@ const Http1Bed = struct {
     }
 
     fn tearDown(bed: *Http1Bed) void {
+        bed.tls_origin.closeRemaining();
         if (bed.tls_credentials[0]) |*credentials| {
             credentials.deinit();
         }
@@ -946,6 +1040,7 @@ const Http1Bed = struct {
 
     fn expectDrained(bed: *Http1Bed) !void {
         bed.origin.closeRemaining();
+        bed.tls_origin.closeRemaining();
         try std.testing.expect(bed.server.isIdle());
         try std.testing.expect(bed.server.reconcile());
         try std.testing.expect(bed.sim_io.sockets.isFullyReleased());
@@ -1031,7 +1126,7 @@ test "l7: oversize request line is 414, oversize header section is 431" {
         try bed.setUp(std.testing.allocator, .{ .seed = 2 });
         defer bed.tearDown();
 
-        const long_target = "/" ++ ("a" ** 9000);
+        const long_target = "/" ++ @as([9000]u8, @splat('a'));
         try bed.exchange("GET " ++ long_target ++ " HTTP/1.1\r\n");
 
         try std.testing.expectEqualStrings(
@@ -1046,7 +1141,7 @@ test "l7: oversize request line is 414, oversize header section is 431" {
         try bed.setUp(std.testing.allocator, .{ .seed = 3 });
         defer bed.tearDown();
 
-        const filler = "X-Filler: " ++ ("v" ** 200) ++ "\r\n";
+        const filler = "X-Filler: " ++ @as([200]u8, @splat('v')) ++ "\r\n";
         var request: [10000]u8 = undefined;
         var len: usize = 0;
         const prefix = "GET / HTTP/1.1\r\nHost: a\r\n";
@@ -1130,9 +1225,9 @@ test "l7: a head that fits on arrival but not after forwarding is 431" {
         // arrival size is what rejects it.
         const rules = [_]filter.Rule{.{
             .match = .{},
-            .actions = &.{.{ .rewrite_prefix = .{ .from = "/r", .to = "/" ++ ("b" ** 5000) } }},
+            .actions = &.{.{ .rewrite_prefix = .{ .from = "/r", .to = "/" ++ @as([5000]u8, @splat('b')) } }},
         }};
-        const request = "GET /r/" ++ ("c" ** 4000) ++ " HTTP/1.1\r\nHost: o\r\n\r\n";
+        const request = "GET /r/" ++ @as([4000]u8, @splat('c')) ++ " HTTP/1.1\r\nHost: o\r\n\r\n";
 
         var bed: Http1Bed = undefined;
         try bed.setUp(std.testing.allocator, .{
@@ -1202,6 +1297,162 @@ test "l7: an absolute-form target routes on its authority, not on Host" {
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_absolute_form"));
         try bed.expectDrained();
     }
+}
+
+test "l7: forwarded companions carry the observed client and scheme" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 67,
+        .forwarded = .replace,
+        .forwarded_real_ip = true,
+        .forwarded_proto = true,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    // The client's own copies are lies; the block says to write ours.
+    try bed.exchange(
+        "GET /x HTTP/1.1\r\nHost: o\r\nX-Real-IP: 9.9.9.9\r\n" ++
+            "X-Forwarded-Proto: ftp\r\n\r\n",
+    );
+
+    var storage: parser.HeaderStorage = undefined;
+    const forwarded = try forwardedRequest(&bed, &storage);
+    // The bed's simulated client address; the observed peer, not the
+    // spoofed `X-Real-IP` the request carried.
+    try std.testing.expectEqualStrings(
+        "198.51.100.1",
+        parser.headerValue(forwarded.headers, "x-real-ip").?,
+    );
+    try std.testing.expectEqualStrings(
+        "http",
+        parser.headerValue(forwarded.headers, "x-forwarded-proto").?,
+    );
+    // Exactly one of each: the inbound copies were suppressed, not
+    // appended beside the values this hop wrote.
+    var real_ip_count: u32 = 0;
+    var proto_count: u32 = 0;
+    for (forwarded.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "x-real-ip")) real_ip_count += 1;
+        if (std.ascii.eqlIgnoreCase(header.name, "x-forwarded-proto")) proto_count += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 1), real_ip_count);
+    try std.testing.expectEqual(@as(u32, 1), proto_count);
+    try bed.expectDrained();
+}
+
+test "l7: X-Forwarded-Proto says https on a terminated listener" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 68,
+        .tls = true,
+        .forwarded = .replace,
+        .forwarded_real_ip = true,
+        .forwarded_proto = true,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = "GET /x HTTP/1.1\r\nHost: o\r\n\r\n",
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed };
+    wind_down.attach(&client);
+    try bed.sim_io.run();
+
+    var storage: parser.HeaderStorage = undefined;
+    const forwarded = try forwardedRequest(&bed, &storage);
+    try std.testing.expectEqualStrings(
+        "https",
+        parser.headerValue(forwarded.headers, "x-forwarded-proto").?,
+    );
+    try std.testing.expectEqualStrings(
+        "198.51.100.1",
+        parser.headerValue(forwarded.headers, "x-real-ip").?,
+    );
+    try bed.expectDrained();
+}
+
+test "l7: a small coalesced response is gzip-compressed for a gzip client" {
+    const body = comptime blk: {
+        var bytes: [2048]u8 = undefined;
+        @memset(&bytes, 'a');
+        break :blk bytes;
+    };
+    const response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n" ++
+        "Content-Length: 2048\r\n\r\n" ++ body;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 69,
+        .origin_response = response,
+        .compress_min_bytes = 64,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange(
+        "GET /x HTTP/1.1\r\nHost: o\r\nAccept-Encoding: gzip\r\n" ++
+            "Connection: close\r\n\r\n",
+    );
+
+    const bytes = bed.client.response();
+    var storage: parser.HeaderStorage = undefined;
+    const rendered = try parser.parseResponseHead(bytes, false, &storage, .get);
+    const header = bytes[0..rendered.head_len];
+    try std.testing.expect(std.mem.indexOf(u8, header, "Content-Encoding: gzip") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "Vary: Accept-Encoding") != null);
+    const length = switch (rendered.framing) {
+        .content_length => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    const gzipped = bytes[rendered.head_len..][0..length];
+    try std.testing.expect(gzipped.len < body.len);
+    try std.testing.expectEqual(@as(u8, 0x1f), gzipped[0]);
+    try std.testing.expectEqual(@as(u8, 0x8b), gzipped[1]);
+
+    // Decode it: the magic number alone would pass a broken stream.
+    var out: [2048]u8 = undefined;
+    var input: std.Io.Reader = .fixed(gzipped);
+    var history: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompress: std.compress.flate.Decompress = .init(&input, .gzip, &history);
+    try decompress.reader.readSliceAll(&out);
+    try std.testing.expectEqualStrings(&body, &out);
+    try bed.expectDrained();
+}
+
+test "l7: a response without Accept-Encoding is not compressed" {
+    const body = comptime blk: {
+        var bytes: [2048]u8 = undefined;
+        @memset(&bytes, 'a');
+        break :blk bytes;
+    };
+    const response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n" ++
+        "Content-Length: 2048\r\n\r\n" ++ body;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 70,
+        .origin_response = response,
+        .compress_min_bytes = 64,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /x HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    const bytes = bed.client.response();
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "Content-Encoding") == null);
+    var storage: parser.HeaderStorage = undefined;
+    const rendered = try parser.parseResponseHead(bytes, false, &storage, .get);
+    const length = switch (rendered.framing) {
+        .content_length => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(u32, 2048), length);
+    try std.testing.expectEqualStrings(
+        &body,
+        bytes[rendered.head_len..][0..length],
+    );
+    try bed.expectDrained();
 }
 
 test "l7: an unsupported absolute-form scheme is 400" {
@@ -1808,6 +2059,77 @@ test "l7: a filter reject answers its policy status before the origin is dialed"
     try bed.expectDrained();
 }
 
+test "l7: a listener waf blocks a query hit before routing, then a clean request forwards" {
+    // The denylist is literal and case-insensitive. `select` needs no
+    // space, so it is expressible in a raw request-target (a space would
+    // have to arrive encoded and then would not match — the documented
+    // literal-only limitation).
+    const waf: filter.Waf = .{
+        .patterns = &.{ "../", "select" },
+        .status = 403,
+    };
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 29,
+        .waf = waf,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    // Two separate client connections: the first is blocked, the second
+    // is clean and must reach the origin.
+    bed.client.next = &bed.client2;
+    bed.client2.request = "GET /clean?q=hello HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    try bed.exchange("GET /search?q=SeLeCt HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client2.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n" ++ expected_date ++
+            "Connection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        bed.client2.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_waf_blocked"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_filtered"));
+    // One accept, one request: the blocked connection never dialed.
+    try std.testing.expectEqual(@as(u32, 1), bed.origin.accepted_count);
+    try std.testing.expectEqual(@as(u32, 1), bed.origin.requests_served);
+    try bed.expectDrained();
+}
+
+test "l7: a query_contains filter predicate refuses before the origin is dialed" {
+    const rules = [_]filter.Rule{.{
+        .match = .{ .query_contains = "debug=true" },
+        .actions = &.{.{ .reject = 429 }},
+    }};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 30,
+        .request_filters = &rules,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    // Mixed case in the raw query still matches; the rule is terminal, so
+    // the origin sees nothing.
+    try bed.exchange("GET /ok?Debug=True HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n" ++ expected_date ++
+            "Connection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_filtered"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_waf_blocked"));
+    try std.testing.expectEqual(@as(u32, 0), bed.origin.accepted_count);
+    try std.testing.expectEqual(@as(u32, 0), bed.origin.requests_served);
+    try bed.expectDrained();
+}
+
 test "l7: a request the filter does not match is proxied untouched" {
     // The same /admin rule; a GET to /public matches nothing, so it routes
     // and reaches the origin normally — the filter is a no-op (§7).
@@ -1946,6 +2268,83 @@ test "l7: a head-ring shed answers 503 and always closes" {
     try bed.expectDrained();
 }
 
+test "l7: a listener rate limit answers a second client 429 and closes" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 71,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        // One request per minute, one-token burst: the first connection
+        // spends the bucket, so any second request inside the window is
+        // refused no matter which connection carries it.
+        .rate_limit = .{ .requests = 1, .window_ms = 60_000, .burst = 1 },
+        .rate_limit_entries = 1,
+    });
+    defer bed.tearDown();
+
+    // The first connection stays open on keep-alive, so the second
+    // arrives while it is still live. SimIo derives both clients from
+    // the same loopback address, and the bucket key deliberately ignores
+    // ports: these are one client to the limiter.
+    bed.client.drain_on_finish = false;
+    bed.client2.send_delay_ms = 100;
+    bed.client2.request = "GET /second HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    bed.client2.start(&bed.sim_io, &bed.server, Http1Bed.bindAddress());
+    try bed.exchange("GET /first HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        bed.client.response(),
+    );
+    // `respond` forces this rung closed: the request's body may be
+    // unread, so there is no message boundary to keep serving from.
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n" ++ expected_date ++
+            "Connection: close\r\n\r\n",
+        bed.client2.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_rate_limited"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_rate_limit_full"));
+    try bed.expectDrained();
+}
+
+test "l7: a listener connection cap answers a second client 503 and closes" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 72,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        // One connection per client identity. The key ignores ports, so
+        // both SimIo loopback clients are one identity to the table.
+        .conn_limit_max = 1,
+        .conn_limit_entries = 8,
+    });
+    defer bed.tearDown();
+
+    // The first connection keeps serving, so its count stays held while
+    // the second client arrives. Its second request proves the count is
+    // per connection, not per request: it must not hit the cap it holds.
+    bed.client.drain_on_finish = false;
+    bed.client.second_request = "GET /again HTTP/1.1\r\nHost: o\r\n\r\n";
+    bed.client2.send_delay_ms = 100;
+    bed.client2.request = "GET /second HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    bed.client2.start(&bed.sim_io, &bed.server, Http1Bed.bindAddress());
+    try bed.exchange("GET /first HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" ++
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        bed.client.response(),
+    );
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n" ++ expected_date ++
+            "Connection: close\r\n\r\n",
+        bed.client2.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_conn_limited"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_conn_limit_full"));
+    try bed.expectDrained();
+}
+
 test "l7: keep-alive returns the head buffer between requests" {
     // The §5 headline: an idle keep-alive connection holds no head
     // bytes. Observed through the watermark counter rather than a
@@ -2026,7 +2425,7 @@ test "l7: the configured head size is the accepted head size" {
 
     // 1100 path bytes: past the 1024 buffer with no newline in sight —
     // the request line alone overflows, which is the 414 shape.
-    const oversize = "GET /" ++ ("a" ** 1100) ++ " HTTP/1.1\r\nHost: o\r\n\r\n";
+    const oversize = "GET /" ++ @as([1100]u8, @splat('a')) ++ " HTTP/1.1\r\nHost: o\r\n\r\n";
     bed.client2.send_delay_ms = 50;
     bed.client2.request = oversize;
     bed.client2.start(&bed.sim_io, &bed.server, Http1Bed.bindAddress());
@@ -2763,7 +3162,7 @@ test "l7: an origin response head the proxy cannot parse is 502" {
         // nowhere to land.
         const unterminated = "HTTP/1.1 200 OK\r\nX-Pad: ";
         const response = unterminated ++
-            ("p" ** (constants.head_buffer_bytes_default - unterminated.len));
+            @as([constants.head_buffer_bytes_default - unterminated.len]u8, @splat('p'));
 
         var bed: Http1Bed = undefined;
         try bed.setUp(std.testing.allocator, .{ .seed = 8, .origin_response = response });
@@ -3266,6 +3665,75 @@ test "l7: a header-keyed cluster stamps nothing (#178)" {
     try bed.expectDrained();
 }
 
+test "l7: h3_advertise appends Alt-Svc to the rendered response head" {
+    // The value is config text the operator writes verbatim (RFC 7838),
+    // so the whole rendered head is pinned byte-exact: the injected line
+    // lands after the origin's headers, ahead of the close announcement.
+    // The "unset" half of the gate is every neighbouring test's
+    // exact-byte assertion — none of their heads carry the line.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 36,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .h3_advertise = "h3=\":4443\"; ma=3600",
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET / HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n" ++
+            "Alt-Svc: h3=\":4443\"; ma=3600\r\n" ++
+            "Connection: close\r\n\r\nhi",
+        bed.client.response(),
+    );
+    try bed.expectDrained();
+}
+
+test "l7: h3_advertise rides beside the #178 stamp at the full filter budget" {
+    // The scratch-slot arithmetic this shares: `header_edits_max` filter
+    // edits plus the stamp slot plus the advertisement slot are exactly
+    // `response_edits_max`, the ceiling the renderer asserts against.
+    // A full house must render — not overflow into the 502 the head-fit
+    // path answers — and the injected lines keep filter order, then
+    // stamp, then advertisement.
+    const rules = [_]filter.ResponseRule{
+        .{ .match = .{}, .edits = &.{
+            .{ .kind = .add, .name = "X-One", .value = "1" },
+            .{ .kind = .add, .name = "X-Two", .value = "2" },
+        } },
+    };
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 37,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .response_filters = &rules,
+        .pick = .hash,
+        .hash_key = .{ .cookie = "zoxy-srv" },
+        .h3_advertise = "h3=\":4443\"; ma=3600",
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET / HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    var expected_buffer: [512]u8 = undefined;
+    const expected = std.fmt.bufPrint(
+        &expected_buffer,
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n" ++
+            "X-One: 1\r\n" ++
+            "X-Two: 2\r\n" ++
+            "Set-Cookie: zoxy-srv={s}; Path=/; HttpOnly\r\n" ++
+            "Alt-Svc: h3=\":4443\"; ma=3600\r\n" ++
+            "Connection: close\r\n\r\nhi",
+        .{&bedEndpointTag(&bed)},
+    ) catch unreachable;
+    try std.testing.expectEqualStrings(expected, bed.client.response());
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_sticky_assigned"));
+    try bed.expectDrained();
+}
+
 /// A hand-rendered #159 page for the directed tests: exactly what the
 /// loader's `renderStaticPage` produces for a text body, so the serve
 /// path's output can be pinned byte-for-byte here without a loader round
@@ -3302,6 +3770,122 @@ fn TestPage(comptime status: u16, comptime reason: []const u8, comptime body: []
 
 const test_page_body = "gone\n";
 const TestNotFound = TestPage(404, "Not Found", test_page_body);
+
+/// A loader-built config for the gzip scenarios: the real `bodies` →
+/// `error_pages` / `respond` path, so the pages under test carry the
+/// load-time gzip variants a hand-rendered `TestPage` cannot. The bed
+/// only borrows the rules and pages; the arena is the caller's.
+const gzip_fixture_json =
+    \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a",
+    \\  "request_filters":[{"match":{"path_prefix":"/robots.txt"},
+    \\  "actions":[{"respond":{"status":200,"body":"robots"}}]}]}}],
+    \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+    \\ "bodies":{"robots":{"inline":"User-agent: *\n","content_type":"text/plain"},
+    \\  "oops":{"inline":"gone\n","content_type":"text/plain"}},
+    \\ "error_pages":{"404":"oops"},
+    \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+;
+
+/// Decompress a gzip body at test time through the std implementation
+/// the loader compressed with — the witness that the wire carried the
+/// configured bytes, not merely bytes that start like a gzip member.
+fn testGunzip(compressed: []const u8) ![]u8 {
+    var reader: std.Io.Reader = .fixed(compressed);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompress: std.compress.flate.Decompress = .init(&reader, .gzip, &window);
+    return decompress.reader.allocRemaining(std.testing.allocator, .limited(4096));
+}
+
+test "l7: a respond page serves its gzip variant when accepted" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const fixture = try config_module.parse(arena_state.allocator(), gzip_fixture_json);
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 46,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .request_filters = fixture.listeners[0].request_filters,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange(
+        "GET /robots.txt HTTP/1.1\r\nHost: o\r\nAccept-Encoding: gzip\r\n" ++
+            "Connection: close\r\n\r\n",
+    );
+    const response = bed.client.response();
+    var storage: parser.HeaderStorage = undefined;
+    const head = try parser.parseResponseHead(response, false, &storage, .get);
+    try std.testing.expectEqual(@as(u16, 200), head.status);
+    try std.testing.expectEqualStrings(
+        "gzip",
+        parser.headerValue(head.headers, "content-encoding").?,
+    );
+    try std.testing.expectEqualStrings(
+        "Accept-Encoding",
+        parser.headerValue(head.headers, "vary").?,
+    );
+    const body = response[head.head_len..];
+    try std.testing.expectEqual(parser.BodyFraming{ .content_length = body.len }, head.framing);
+    const decoded = try testGunzip(body);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualStrings("User-agent: *\n", decoded);
+    try bed.expectDrained();
+}
+
+test "l7: a respond page stays plain without Accept-Encoding" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const fixture = try config_module.parse(arena_state.allocator(), gzip_fixture_json);
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 47,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .request_filters = fixture.listeners[0].request_filters,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /robots.txt HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+    const response = bed.client.response();
+    var storage: parser.HeaderStorage = undefined;
+    const head = try parser.parseResponseHead(response, false, &storage, .get);
+    try std.testing.expectEqual(@as(?[]const u8, null), parser.headerValue(head.headers, "content-encoding"));
+    try std.testing.expectEqualStrings("User-agent: *\n", response[head.head_len..]);
+    try bed.expectDrained();
+}
+
+test "l7: a configured error page honors Accept-Encoding too" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const fixture = try config_module.parse(arena_state.allocator(), gzip_fixture_json);
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 48,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .route_prefix = "/api",
+        .error_pages = fixture.error_pages,
+    });
+    defer bed.tearDown();
+
+    // `/nope` misses the only route, so the 404 takes the configured page
+    // — and, because the client named gzip, its compressed variant.
+    try bed.exchange(
+        "GET /nope HTTP/1.1\r\nHost: o\r\nAccept-Encoding: gzip\r\n" ++
+            "Connection: close\r\n\r\n",
+    );
+    const response = bed.client.response();
+    var storage: parser.HeaderStorage = undefined;
+    const head = try parser.parseResponseHead(response, false, &storage, .get);
+    try std.testing.expectEqual(@as(u16, 404), head.status);
+    try std.testing.expectEqualStrings(
+        "gzip",
+        parser.headerValue(head.headers, "content-encoding").?,
+    );
+    const body = response[head.head_len..];
+    const decoded = try testGunzip(body);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualStrings("gone\n", decoded);
+    try bed.expectDrained();
+}
 
 test "l7: a configured 404 page serves where the empty static did (#159)" {
     var bed: Http1Bed = undefined;
@@ -4502,6 +5086,26 @@ fn onlyAccessLogLine(bed: *const Http1Bed) ![]const u8 {
     return std.mem.trimEnd(u8, sink, "\n");
 }
 
+test "l7: a route may opt out of the access log without opting out of counters" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 58,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .access_log = true,
+        .route_access_log = false,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /quiet HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    // No line reached the sink, but the exchange was still observed.
+    try std.testing.expectEqual(@as(usize, 0), bed.sim_io.sinkBytes().len);
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("access_log_lines"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    try bed.expectDrained();
+}
+
 /// The one access-log line containing `needle`, for scenarios that emit
 /// several. Fails when it is not exactly one, so a needle that matched
 /// every line — or none — is a test bug rather than a passing assertion.
@@ -4931,6 +5535,38 @@ test "health: an http probe passes on the expected status" {
         bed.origin.conns[0].request_buffer[0..bed.origin.conns[0].request_len],
         "GET /health HTTP/1.1\r\n",
     ) != null);
+    try bed.expectDrained();
+}
+
+test "health: an http probe runs the exchange over TLS" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 64,
+        // The cluster carries a `tls` block and the origin terminates a
+        // real handshake: the probe must encrypt the GET, decrypt the
+        // 200, and judge it with the same parser as the plaintext case.
+        .origin_tls = true,
+        .check = .{
+            .kind = .http,
+            .timeout_ms = 200,
+            .http = .{ .path = "/health" },
+        },
+        .health_interval_ms = 30,
+    });
+    defer bed.tearDown();
+
+    bed.armDrainTimer(140);
+    try bed.sim_io.run();
+
+    try std.testing.expect(bed.server.counters.get("health_probes_sent") >= 2);
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("health_probes_failed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("health_endpoint_down"));
+    try std.testing.expect(bed.server.health.healthy[0]);
+    try std.testing.expect(bed.tls_origin.accepted_count >= 2);
+    // A probe that stopped after the handshake would leave `served`
+    // behind `accepted_count`; the count is what proves the decrypted
+    // request arrived and the encrypted response went back.
+    try std.testing.expect(bed.tls_origin.served >= 2);
     try bed.expectDrained();
 }
 
@@ -5421,30 +6057,25 @@ test "l7: close_notify between requests writes no access-log line" {
     try bed.expectDrained();
 }
 
-test "l7: a terminated head that fits with a body that does not is 413, not 431" {
-    // The one L7 state only termination can reach. A plaintext read
-    // cannot deliver more than the head buffer holds, but one TLS record
-    // decrypts up to 16 KiB at once — so a client that sends its head and
-    // a large payload in a single record overruns the buffer with bytes
-    // that are *body*, not headers.
-    //
-    // Which answer is honest depends on what those bytes were, so the
-    // parser is asked: telling a client its headers are too large when
-    // its body is sends it chasing the wrong thing.
+test "l7: a terminated head that shares a record with a body forwards the body" {
+    // One TLS record decrypts up to 16 KiB at once, so a client that
+    // sends its head and a large payload together hands the proxy both in
+    // one step. The engine's plaintext destination is a record wide, not
+    // a head wide: the payload is retained and pumped rather than
+    // mistaken for an oversized head (431) or refused as a body that had
+    // nowhere to land (413).
     var bed: Http1Bed = undefined;
     try bed.setUp(std.testing.allocator, .{
         .seed = 52,
         .tls = true,
-        // The floor. Also the case the head limit had to stop conflating
-        // with the engine's own: this is *below* the decrypt floor, so a
-        // buffer-length capacity would have admitted 32 KiB of head here.
+        // The floor: the *head* still has to fit in 1 KiB.
         .head_buffer_bytes = constants.head_buffer_bytes_min,
         .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
     });
     defer bed.tearDown();
 
-    // A valid, small head followed by a body that will not fit — one
-    // write, so the proxy decrypts both out of the same record.
+    // A valid, small head followed by a legal body — one write, so the
+    // proxy decrypts both out of the same record.
     const head = "POST /x HTTP/1.1\r\nHost: o\r\nContent-Length: 4000\r\n\r\n";
     var request: [4096]u8 = undefined;
     @memcpy(request[0..head.len], head);
@@ -5459,13 +6090,18 @@ test "l7: a terminated head that fits with a body that does not is 413, not 431"
     wind_down.attach(&client);
     try bed.sim_io.run();
 
-    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_body_too_large"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_body_too_large"));
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_headers_too_large"));
-    // The client is told in terms it can act on: 413, decrypted.
+    // The origin received the head and every byte the framing claimed —
+    // the 45-byte tail past `Content-Length` is a pipelined next request,
+    // not this one's body, and must not be forwarded.
+    const forwarded = bed.origin.conns[0].request_buffer[0..bed.origin.conns[0].request_len];
+    try std.testing.expectEqualSlices(u8, request[0 .. head.len + 4000], forwarded);
+    // And the client got the origin's answer.
     try std.testing.expect(std.mem.startsWith(
         u8,
         client.app_received[0..client.app_received_len],
-        "HTTP/1.1 413 Content Too Large\r\n",
+        "HTTP/1.1 200 OK\r\n",
     ));
     try bed.expectDrained();
 }
@@ -5485,7 +6121,7 @@ test "l7: a terminated listener honours the configured head limit" {
 
     // A header section comfortably over the 1 KiB limit and comfortably
     // under the engine's 32 KiB buffer — the window the bug lived in.
-    const filler = "X-Pad: " ++ ("p" ** 2000) ++ "\r\n";
+    const filler = "X-Pad: " ++ @as([2000]u8, @splat('p')) ++ "\r\n";
     const request = "GET /x HTTP/1.1\r\nHost: o\r\n" ++ filler ++ "\r\n";
 
     var client: TlsClient = undefined;
@@ -5506,6 +6142,45 @@ test "l7: a terminated listener honours the configured head limit" {
         client.app_received[0..client.app_received_len],
         "HTTP/1.1 431 ",
     ));
+    try bed.expectDrained();
+}
+
+test "l7: a stale parked TLS upstream takes the one free replay" {
+    // The upstream-TLS counterpart of the plaintext stale-checkout test.
+    // The first exchange parks a TLS session; the origin (TestServer)
+    // closes the socket after answering, so the next checkout is stale.
+    // The request head is still intact in conn.head, so the replay dials
+    // a fresh session and re-encrypts it rather than handing the client
+    // a 502.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 66,
+        // The cluster dials TLS; the client side stays plaintext, so the
+        // only transform under test is the upstream one.
+        .origin_tls = true,
+    });
+    defer bed.tearDown();
+
+    // The second request rides the same client connection: the first
+    // parks the TLS session, the origin closes it, and this checkout is
+    // stale. `Connection: close` keeps the transcript to exactly two
+    // responses.
+    bed.client.second_request = "GET /two HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    try bed.exchange("GET /one HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        bed.server.counters.get("upstream_replayed"),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        bed.server.counters.get("tls_relay_failed"),
+    );
+    // Two connections reached the TLS origin: the first try's, and the
+    // replay's. One accept would mean the stale session carried the
+    // second request after all.
+    try std.testing.expect(bed.tls_origin.accepted_count >= 2);
+    try std.testing.expect(bed.tls_origin.served >= 2);
     try bed.expectDrained();
 }
 
@@ -5910,9 +6585,10 @@ test "l7: an origin that only ever sends interims is cut at the bound" {
     // overrun is counted apart from a malformed head: nothing was
     // malformed, the bound is what ran out.
     var bed: Http1Bed = undefined;
+    const interim_flood = repeatBytes("HTTP/1.1 103 Early Hints\r\n\r\n", 12);
     try bed.setUp(std.testing.allocator, .{
         .seed = 302,
-        .origin_response = "HTTP/1.1 103 Early Hints\r\n\r\n" ** 12,
+        .origin_response = &interim_flood,
     });
     defer bed.tearDown();
 
@@ -6241,7 +6917,7 @@ test "l7: a declared body over the cap is refused before the origin is dialed" {
     defer bed.tearDown();
 
     try bed.exchange("POST /upload HTTP/1.1\r\nHost: o\r\n" ++
-        "Content-Length: 64\r\n\r\n" ++ ("x" ** 64));
+        "Content-Length: 64\r\n\r\n" ++ @as([64]u8, @splat('x')));
 
     try std.testing.expectEqualStrings(
         "HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
@@ -6272,8 +6948,8 @@ test "l7: a chunked body cannot slip past the cap by announcing no size" {
     // Two 16-byte chunks: the first already passes the 8-byte cap.
     try bed.exchange("POST /upload HTTP/1.1\r\nHost: o\r\n" ++
         "Transfer-Encoding: chunked\r\n\r\n" ++
-        "10\r\n" ++ ("x" ** 16) ++ "\r\n" ++
-        "10\r\n" ++ ("y" ** 16) ++ "\r\n0\r\n\r\n");
+        "10\r\n" ++ @as([16]u8, @splat('x')) ++ "\r\n" ++
+        "10\r\n" ++ @as([16]u8, @splat('y')) ++ "\r\n0\r\n\r\n");
 
     // Coalesced with its head, so the cap is met before the response leg
     // is armed and the client still earns a status. A body large enough
@@ -6303,7 +6979,7 @@ test "l7: a body under the cap, and an opted-out listener, are untouched" {
     defer bed.tearDown();
 
     try bed.exchange("POST /upload HTTP/1.1\r\nHost: o\r\n" ++
-        "Content-Length: 64\r\nConnection: close\r\n\r\n" ++ ("x" ** 64));
+        "Content-Length: 64\r\nConnection: close\r\n\r\n" ++ @as([64]u8, @splat('x')));
 
     try std.testing.expectEqualStrings(
         "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
@@ -6334,7 +7010,7 @@ test "l7: a chunked body that outgrows the cap while streaming is cut" {
     // reaches the body pump rather than riding in with the head.
     try bed.exchange("POST /upload HTTP/1.1\r\nHost: o\r\n" ++
         "Transfer-Encoding: chunked\r\n\r\n" ++
-        "6000\r\n" ++ ("z" ** 24576) ++ "\r\n0\r\n\r\n");
+        "6000\r\n" ++ @as([24576]u8, @splat('z')) ++ "\r\n0\r\n\r\n");
 
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_body_cut_mid_stream"));
     // Not the answered rung, and not a framing verdict: the body was

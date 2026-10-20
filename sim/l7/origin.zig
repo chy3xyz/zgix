@@ -19,6 +19,14 @@ const constants = zoxy.constants;
 
 const assert = std.debug.assert;
 
+/// The interim-flood response is a compile-time constant. Naming it at
+/// module scope gives the slice `response_bytes` points at static
+/// lifetime; a temporary from the assignment would die with the branch.
+const interim_flood_response = canon.repeatBytes(
+    canon.interim_hints,
+    constants.interim_responses_max + 2,
+);
+
 /// Per-connection origin behavior: the well-behaved framings, then the
 /// misbehavior matrix (§9 adversarial-origin coverage). Clean seeds pin
 /// every connection to `sized`.
@@ -505,8 +513,7 @@ pub fn HttpOrigin(comptime IoType: type) type {
                     .interim_flood => {
                         // Never answers: the proxy's own bound is what
                         // ends this, which is the whole point of the mode.
-                        conn.response_bytes = canon.interim_hints **
-                            (zoxy.constants.interim_responses_max + 2);
+                        conn.response_bytes = &interim_flood_response;
                         conn.drain_only = true;
                         conn.armRecv();
                     },

@@ -52,6 +52,12 @@ pub const body = "zoxy-smoke-origin\n";
 pub const large_path = "/large";
 pub const large_body_bytes: u32 = 32 * 1024;
 
+/// The largest request body this origin will read. Sized for the smoke
+/// gate's echo exchanges, not for a workload: a body past this is a
+/// harness typo, and dropping the connection says so without a bound
+/// that needs its own policy.
+pub const request_body_bytes_max: u32 = 4 * 1024;
+
 /// Requests one connection may serve before the origin closes it. A
 /// bound, not a policy (TIGER_STYLE): the harness sends two orders of
 /// magnitude fewer, so reaching it means the peer is looping.
@@ -71,7 +77,7 @@ const large_response = renderResponse(&large_body);
 /// A fixed non-uniform fill. Nothing here compresses or dedupes, but a
 /// constant byte would make an accidental short read look identical to a
 /// correct one in a dump.
-const large_body: [large_body_bytes]u8 = blk: {
+pub const large_body: [large_body_bytes]u8 = blk: {
     @setEvalBranchQuota(8 * large_body_bytes);
     var bytes: [large_body_bytes]u8 = undefined;
     for (&bytes, 0..) |*byte, index| byte.* = @truncate(index);
@@ -105,12 +111,19 @@ comptime {
     // claim about the head rather than about the body's front.
     assert(large_response.len > large_body_bytes);
     assert(large_response.len - large_body_bytes < 1024);
+    // An echo body is written into the same single write buffer as an
+    // ordinary response, so the bound has to leave room for its head.
+    assert(request_body_bytes_max + 256 <= large_response.len);
 }
 
 /// One serve task's storage. Static, indexed by task, so a task's buffers
 /// do not ride its thread stack.
 const TaskBuffers = struct {
     read: [request_head_bytes_max]u8 = undefined,
+    /// Echoed request bodies, held apart from the writer's own buffer:
+    /// that buffer is where the response is being framed, so a body read
+    /// into it would be overwritten by the head that quotes its length.
+    body: [request_body_bytes_max]u8 = undefined,
     /// Sized for the larger response, so either leaves in a single write
     /// — which is the whole point of the large one.
     write: [large_response.len]u8 = undefined,
@@ -242,30 +255,85 @@ fn serveConnection(origin: *Origin, stream: Io.net.Stream, buffers: *TaskBuffers
     var writer = stream.writer(origin.io, &buffers.write);
     var served: u32 = 0;
     while (served < requests_per_connection_max) : (served += 1) {
-        const large = readRequestHead(&reader.interface) orelse return;
-        // One `writeAll` into a buffer that holds the whole thing, then
-        // one flush: the large response has to reach the kernel as a
-        // single write or the delivery it exists to provoke is split
-        // before zoxy ever sees it.
-        writer.interface.writeAll(if (large) large_response else response) catch return;
+        const request = readRequest(&reader.interface) orelse return;
+        // The body is consumed even when it will not be echoed: leaving it
+        // in the socket would make the next head start mid-body, and a
+        // desync here would look like a proxy defect from the far side.
+        const request_body = readRequestBody(&reader.interface, request.framing, &buffers.body) orelse return;
+        if (request.upgrade) {
+            // A handshake, then opaque bytes both ways. The tag rides the
+            // 101 so the access log's origin-header join covers the tunnel
+            // lines too — they are exchanges this origin served.
+            writer.interface.writeAll(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n" ++
+                    "Connection: Upgrade\r\n" ++ tag_header ++ ": " ++ tag_value ++ "\r\n\r\n",
+            ) catch return;
+            writer.interface.flush() catch return;
+            _ = origin.served.fetchAdd(1, .monotonic);
+            // Raw echo until the peer closes. The buffered reader serves
+            // anything it already holds before touching the socket, so a
+            // client that pipelined its first frame is not lost.
+            while (true) {
+                const n = reader.interface.readSliceShort(&buffers.body) catch return;
+                if (n == 0) return;
+                writer.interface.writeAll(buffers.body[0..n]) catch return;
+                writer.interface.flush() catch return;
+            }
+        }
+        if (request.echo) {
+            // Echoes are framed with a Content-Length like every other
+            // response this origin sends, so the gate's reader needs no
+            // second framing arm. The head and body share the writer's
+            // buffer and leave on the one flush below.
+            writer.interface.print(
+                "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n" ++
+                    "Content-Type: application/octet-stream\r\n" ++
+                    tag_header ++ ": " ++ tag_value ++ "\r\n\r\n",
+                .{request_body.len},
+            ) catch return;
+            writer.interface.writeAll(request_body) catch return;
+        } else {
+            // One `writeAll` into a buffer that holds the whole thing, then
+            // one flush: the large response has to reach the kernel as a
+            // single write or the delivery it exists to provoke is split
+            // before zoxy ever sees it.
+            writer.interface.writeAll(if (request.large) large_response else response) catch return;
+        }
         writer.interface.flush() catch return;
         _ = origin.served.fetchAdd(1, .monotonic);
     }
 }
 
-/// Read one request head. Only its target matters — one of two responses
-/// is chosen by it and nothing else in the head changes a byte — so the
-/// answer is whether that target was the large one. Null means the
-/// connection is over: an orderly close between requests (what a proxy
-/// draining its parked connections looks like), a reset, or a head this
-/// origin will not read past.
+/// What the head decided, and all a response needs: which static body to
+/// send, whether the request asked for its body back, whether it is an
+/// upgrade handshake, and how the body is framed.
+const Request = struct {
+    large: bool,
+    echo: bool,
+    upgrade: bool,
+    framing: BodyFraming,
+};
+
+const BodyFraming = union(enum) {
+    none,
+    content_length: usize,
+    chunked,
+};
+
+/// Read one request head. Null means the connection is over: an orderly
+/// close between requests (what a proxy draining its parked connections
+/// looks like), a reset, or a head this origin will not read past.
 ///
-/// No body is read, because none is ever sent: the harness issues GETs
-/// and zoxy's health probes are GETs, so a request with a body would be a
-/// desync this origin should not paper over.
-fn readRequestHead(reader: *Io.Reader) ?bool {
+/// The body is not read here, only the framing that says how much of it
+/// follows — the caller consumes it before answering, which is what lets
+/// a POST echo without turning the next request into a desync.
+fn readRequest(reader: *Io.Reader) ?Request {
     assert(reader.buffer.len == request_head_bytes_max);
     var large = false;
+    var echo = false;
+    var content_length: ?usize = null;
+    var chunked = false;
+    var upgrade = false;
     var lines: u32 = 0;
     // Every legal head is bounded by its own blank line; the cap is the
     // header count a broken peer could otherwise dribble forever. Two
@@ -280,23 +348,109 @@ fn readRequestHead(reader: *Io.Reader) ?bool {
         // The blank line ends the head. Both spellings are accepted: what
         // arrives here is zoxy's rendering, and the gate is not the place
         // to re-litigate its CRLF discipline (§7 already does).
-        if (line.len == 0) return large;
-        if (line.len == 1 and line[0] == '\r') return large;
-        if (lines == 0) large = requestsLarge(line);
+        if (line.len == 0 or (line.len == 1 and line[0] == '\r')) {
+            return .{
+                .large = large,
+                .echo = echo,
+                .upgrade = upgrade,
+                .framing = if (chunked)
+                    .chunked
+                else if (content_length) |length|
+                    .{ .content_length = length }
+                else
+                    .none,
+            };
+        }
+        if (lines == 0) {
+            const request_line = requestLineOf(line);
+            large = request_line.large;
+            echo = request_line.echo;
+            continue;
+        }
+        const header = std.mem.trimEnd(u8, line, "\r");
+        if (std.ascii.startsWithIgnoreCase(header, "content-length:")) {
+            const value = std.mem.trim(u8, header["content-length:".len..], " \t");
+            content_length = std.fmt.parseUnsigned(usize, value, 10) catch return null;
+        } else if (std.ascii.startsWithIgnoreCase(header, "transfer-encoding:")) {
+            const value = std.mem.trim(u8, header["transfer-encoding:".len..], " \t");
+            chunked = std.ascii.eqlIgnoreCase(value, "chunked");
+        } else if (std.ascii.startsWithIgnoreCase(header, "upgrade:")) {
+            upgrade = true;
+        }
     }
     assert(lines == lines_max);
     return null;
 }
 
-/// Does this request line ask for `large_path`? Matched on the target
-/// alone, and only as a whole word: `/largest` is an ordinary target, and
-/// answering it with 32 KiB would make a typo in the harness look like a
-/// proxy bug.
-fn requestsLarge(request_line: []const u8) bool {
+const RequestLine = struct {
+    large: bool,
+    echo: bool,
+};
+
+/// What the request line asks for: `large_path` answered with the bulk
+/// body, and a POST answered by echoing its body. The target is matched
+/// as a whole word — `/largest` is an ordinary target, and answering it
+/// with 32 KiB would make a typo in the harness look like a proxy bug.
+fn requestLineOf(request_line: []const u8) RequestLine {
     assert(request_line.len >= 1);
-    const target_start = (std.mem.indexOfScalar(u8, request_line, ' ') orelse return false) + 1;
-    if (target_start >= request_line.len) return false;
+    const method_end = std.mem.indexOfScalar(u8, request_line, ' ') orelse return .{
+        .large = false,
+        .echo = false,
+    };
+    const method = request_line[0..method_end];
+    const target_start = method_end + 1;
+    if (target_start >= request_line.len) return .{ .large = false, .echo = false };
     const rest = request_line[target_start..];
     const target_end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
-    return std.mem.eql(u8, rest[0..target_end], large_path);
+    return .{
+        .large = std.mem.eql(u8, rest[0..target_end], large_path),
+        .echo = std.mem.eql(u8, method, "POST"),
+    };
+}
+
+/// Consume exactly the body `framing` describes, into `storage`, and
+/// return it. Null is a broken peer (a body past `storage`, a malformed
+/// chunk, a close mid-body) and ends the connection rather than guessing
+/// where the next head begins.
+///
+/// Chunked bodies are decoded here because the echo is compared against
+/// the bytes the harness sent: forwarding chunk framing back would pass a
+/// length check while proving nothing about the body's content.
+fn readRequestBody(reader: *Io.Reader, framing: BodyFraming, storage: []u8) ?[]const u8 {
+    assert(storage.len <= request_body_bytes_max);
+    switch (framing) {
+        .none => return storage[0..0],
+        .content_length => |length| {
+            if (length > storage.len) return null;
+            reader.readSliceAll(storage[0..length]) catch return null;
+            return storage[0..length];
+        },
+        .chunked => {
+            var filled: usize = 0;
+            while (true) {
+                const taken = reader.takeDelimiter('\n') catch return null;
+                const line = taken orelse return null;
+                const size_line = std.mem.trimEnd(u8, line, "\r");
+                const size_end = std.mem.indexOfScalar(u8, size_line, ';') orelse size_line.len;
+                const size = std.fmt.parseUnsigned(usize, size_line[0..size_end], 16) catch return null;
+                if (size == 0) {
+                    // Trailers end at the blank line; the harness sends
+                    // none, but a peer may, and leaving them unread would
+                    // be the same desync as leaving the body.
+                    while (true) {
+                        const trailer_taken = reader.takeDelimiter('\n') catch return null;
+                        const trailer = trailer_taken orelse return null;
+                        if (trailer.len == 0 or (trailer.len == 1 and trailer[0] == '\r')) {
+                            return storage[0..filled];
+                        }
+                    }
+                }
+                if (size > storage.len - filled) return null;
+                reader.readSliceAll(storage[filled..][0..size]) catch return null;
+                filled += size;
+                const terminator = reader.take(2) catch return null;
+                if (!std.mem.eql(u8, terminator, "\r\n")) return null;
+            }
+        },
+    }
 }

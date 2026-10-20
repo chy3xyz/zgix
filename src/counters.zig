@@ -135,6 +135,35 @@ pub const Counters = struct {
     /// (403/404/429/400). A reject, not a shed; same persistence rule as
     /// `l7_no_route`.
     l7_filtered: Value = Value.init(0),
+    /// A request shed by its listener's per-client token bucket (§7),
+    /// answered `429`. A policy reject like `l7_filtered` — the request
+    /// was admitted and answered, so it stays out of `reconcile`'s shed
+    /// sum — but its own counter because the two diagnoses differ: a
+    /// filter names a request this deployment never serves, where this
+    /// names a client that asked too often.
+    l7_rate_limited: Value = Value.init(0),
+    /// A request the rate limiter allowed because its table had no free
+    /// slot within the bounded probe. **Fail-open by design**: refusing
+    /// an untracked client would turn a memory bound into an outage.
+    /// Pure observability, and a rising count is the operator's signal
+    /// to widen `limits.rate_limit_entries`, not a fault to fix.
+    l7_rate_limit_full: Value = Value.init(0),
+    /// A request refused because its client already holds the listener's
+    /// `conn_limit.max` concurrent connections, answered `503`. A policy
+    /// reject like `l7_rate_limited`, and counted apart for the same
+    /// reason: one diagnoses a client asking too often, the other a
+    /// client holding too many sockets.
+    l7_conn_limited: Value = Value.init(0),
+    /// A request the connection cap allowed because its table had no free
+    /// slot within the bounded probe. **Fail-open by design**, and the
+    /// signal to widen `limits.conn_limit_entries`.
+    l7_conn_limit_full: Value = Value.init(0),
+    /// A listener-level WAF-lite denylist matched the request head —
+    /// canonical path, raw query, or a header value. Answered with the
+    /// configured reject status before routing, so the origin was never
+    /// dialed. Kept apart from `l7_filtered`: a literal catch and a
+    /// request rule's verdict are different operator facts.
+    l7_waf_blocked: Value = Value.init(0),
     /// A §7 filter rule answered the request with a redirect (#176):
     /// one of the closed statuses plus a Location rendered per request.
     /// `l7_filtered`'s sibling — admitted and answered, so outside
@@ -573,6 +602,60 @@ pub const Counters = struct {
     shed_draining: Value = Value.init(0),
     /// Drain deadline tore down stragglers (§8).
     drained_at_deadline: Value = Value.init(0),
+    /// The experimental HTTP/3 path (the `h3_listeners` QUIC surface)
+    /// reports through the `h3_*` fields below, beside the HTTP/1.1
+    /// counters above: same exposition, same exit tally, no separate
+    /// plane. Deliberately outside `reconcile` — the gate identity is
+    /// the §5/§8 TCP admission ladder, and the h3 path owns none of it:
+    /// a QUIC session sits in its own slot reservation (one fixed arena
+    /// per session, priced in the fd demand) and never touches
+    /// `accepted`/`admitted`/`completed`.
+    ///
+    /// An h3 request is one request head handed to the request handler,
+    /// counted at entry — before the exchange-slot acquire, so a request
+    /// answered `503` below is witnessed exactly like one that dialed.
+    h3_requests: Value = Value.init(0),
+    /// h3: an origin answer relayed to the client. The proxy-generated
+    /// verdicts are counted in their own counters beside it, the
+    /// `l7_responses` precedent, so a scrape reads completed exchanges
+    /// apart from failures (`h3_bad_gateway`, `h3_gateway_timeout`,
+    /// `h3_shed_busy`, `h3_no_route`) — and every request lands in
+    /// exactly one of the five, the sum a deployment's h3 traffic
+    /// answers to.
+    h3_responses: Value = Value.init(0),
+    /// h3: the exchange answered `502` — the dial failed, the origin's
+    /// bytes would not parse, or its reply broke framing mid-body. The
+    /// `l7_bad_gateway` sibling: counted once per exchange at the single
+    /// verdict commit, whichever of those causes produced it.
+    h3_bad_gateway: Value = Value.init(0),
+    /// h3: the per-exchange upstream deadline fired with no complete
+    /// answer at the client — the request-deadline verdict (RFC 9110
+    /// §15.6.5), the h3 sibling of `l7_gateway_timeout`. Only the timer
+    /// path answers `504`, so this counter can never outrun the timer
+    /// that committed it, the inequality `l7_gateway_timeout` rides.
+    h3_gateway_timeout: Value = Value.init(0),
+    /// h3: every exchange slot was already carrying a request when this
+    /// one arrived; answered `503` without a dial. A shed the TCP ladder
+    /// would file under `l7_shed_*`, kept apart from the response
+    /// verdicts because no exchange ever began for it.
+    h3_shed_busy: Value = Value.init(0),
+    /// h3: no route matched the request's host/header/prefix conjunction,
+    /// answered 404 without a dial — the `l7_no_route` sibling, and a
+    /// real operational signal once a route table is fully dimensional:
+    /// a probe against a mistyped host is traffic this counter alone
+    /// files. Counted with the shed's stack-built facts: like the shed,
+    /// no exchange ever began for it, and like every answer bucket it
+    /// fires exactly once per request it names.
+    h3_no_route: Value = Value.init(0),
+    /// h3: QUIC sessions that took a listener connection slot. A counter
+    /// of opens, not a gauge — the live level is the listener's own
+    /// occupancy, and "is the feature being used" is a question the
+    /// history answers (`tunnels_established`'s reasoning).
+    h3_connections: Value = Value.init(0),
+    /// h3: sessions released from their slot — idle reap, error, and
+    /// listener teardown alike — so opened minus closed is exactly the
+    /// live occupancy, on every path that can end a session.
+    h3_connections_closed: Value = Value.init(0),
 
     /// One counter cell. A plain `u64`, not `std.atomic.Value(u64)`.
     ///
@@ -629,9 +712,10 @@ pub const Counters = struct {
     /// else.
     pub const names: []const []const u8 = blk: {
         var collected: []const []const u8 = &.{};
-        for (@typeInfo(Counters).@"struct".fields) |field| {
-            if (field.type != Value) continue;
-            collected = collected ++ [_][]const u8{field.name};
+        const info = @typeInfo(Counters).@"struct";
+        for (info.field_names, info.field_types) |name, FieldType| {
+            if (FieldType != Value) continue;
+            collected = collected ++ [_][]const u8{name};
         }
         break :blk collected;
     };
@@ -749,9 +833,10 @@ pub const Counters = struct {
             total += "# TYPE ".len + name_len + " counter\n".len;
             total += name_len + " ".len + u64_digits_max + "\n".len;
         }
-        for (@typeInfo(Gauges).@"struct".fields) |field| {
-            assert(field.type == u32);
-            const name_len = metric_prefix.len + field.name.len;
+        const gauge_info = @typeInfo(Gauges).@"struct";
+        for (gauge_info.field_names, gauge_info.field_types) |name, FieldType| {
+            assert(FieldType == u32);
+            const name_len = metric_prefix.len + name.len;
             total += "# TYPE ".len + name_len + " gauge\n".len;
             total += name_len + " ".len + u32_digits_max + "\n".len;
         }
@@ -787,16 +872,16 @@ pub const Counters = struct {
             ) catch unreachable;
             cursor += written.len;
         }
-        inline for (@typeInfo(Gauges).@"struct".fields) |field| {
+        inline for (@typeInfo(Counters.Gauges).@"struct".field_names) |name| {
             // Same argument as the counter loop above, against the gauge
             // half of the bound: the format string is comptime and every
             // gauge is a u32, whose widest rendering `render_bytes_max`
             // reserves 10 digits for.
             const written = std.fmt.bufPrint(
                 buffer[cursor..],
-                "# TYPE " ++ metric_prefix ++ field.name ++ " gauge\n" ++
-                    metric_prefix ++ field.name ++ " {d}\n",
-                .{@field(gauges, field.name)},
+                "# TYPE " ++ metric_prefix ++ name ++ " gauge\n" ++
+                    metric_prefix ++ name ++ " {d}\n",
+                .{@field(gauges, name)},
             ) catch unreachable;
             cursor += written.len;
         }
@@ -1097,7 +1182,7 @@ pub const Labeled = struct {
         client_error,
         server_error,
 
-        pub const count = @typeInfo(StatusClass).@"enum".fields.len;
+        pub const count = @typeInfo(StatusClass).@"enum".field_names.len;
 
         /// The `class` label's value, which is Prometheus convention and
         /// the same spelling `passive_ejection`'s config accepts.
@@ -1400,7 +1485,7 @@ pub const Labeled = struct {
         assert(status >= 100);
         assert(status <= 599);
         const class = StatusClass.of(status);
-        const class_at = @as(usize, cluster_index) * StatusClass.count + @intFromEnum(class);
+        const class_at = @as(usize, cluster_index) * StatusClass.count + @backingInt(class);
         assert(class_at < labeled.cluster_responses.len);
         const class_previous = labeled.cluster_responses[class_at].add(1);
         assert(class_previous < std.math.maxInt(u64));
@@ -1531,7 +1616,7 @@ pub const Labeled = struct {
         ) catch unreachable;
         for (labeled.cluster_labels, 0..) |label, cluster_index| {
             inline for (comptime std.enums.values(StatusClass)) |class| {
-                const at = cluster_index * StatusClass.count + @intFromEnum(class);
+                const at = cluster_index * StatusClass.count + @backingInt(class);
                 // The label is rendered `{cluster="x"}`, so the class
                 // joins it by replacing the closing brace — one splice
                 // rather than a second label table to keep in step.
@@ -1870,10 +1955,10 @@ test "counters: render emits Prometheus exposition for every field" {
         search = at + "# TYPE ".len;
     }
     var field_count: usize = 0;
-    inline for (@typeInfo(Counters).@"struct".fields) |field| {
-        if (field.type == Counters.Value) field_count += 1;
+    inline for (@typeInfo(Counters).@"struct".field_types) |FieldType| {
+        if (FieldType == Counters.Value) field_count += 1;
     }
-    field_count += @typeInfo(Counters.Gauges).@"struct".fields.len;
+    field_count += @typeInfo(Counters.Gauges).@"struct".field_names.len;
     try std.testing.expectEqual(field_count, type_lines);
 }
 
@@ -1904,14 +1989,14 @@ test "counters: render bound holds at the maximum value" {
     // and every gauge at maxInt(u32) — the widest possible sample lines —
     // so a saturated proxy never truncates or overruns the buffer.
     var counters: Counters = .{};
-    inline for (@typeInfo(Counters).@"struct".fields) |field| {
-        if (field.type == Counters.Value) {
-            @field(counters, field.name).set(std.math.maxInt(u64));
+    inline for (@typeInfo(Counters).@"struct".field_names, @typeInfo(Counters).@"struct".field_types) |name, FieldType| {
+        if (FieldType == Counters.Value) {
+            @field(counters, name).set(std.math.maxInt(u64));
         }
     }
     var gauges: Counters.Gauges = undefined;
-    inline for (@typeInfo(Counters.Gauges).@"struct".fields) |field| {
-        @field(gauges, field.name) = std.math.maxInt(u32);
+    inline for (@typeInfo(Counters.Gauges).@"struct".field_names) |name| {
+        @field(gauges, name) = std.math.maxInt(u32);
     }
     var buffer: [Counters.render_bytes_max]u8 = undefined;
     const text = counters.render(&gauges, &buffer);
@@ -1943,16 +2028,16 @@ test "counters: the gate identity sums exactly today's admission rungs" {
         "shed_draining",
     };
     comptime var actual_count: usize = 0;
-    inline for (@typeInfo(Counters).@"struct".fields) |field| {
-        if (field.type != Counters.Value) continue;
-        if (!comptime std.mem.startsWith(u8, field.name, Counters.shed_prefix)) continue;
+    inline for (@typeInfo(Counters).@"struct".field_names, @typeInfo(Counters).@"struct".field_types) |field_name, FieldType| {
+        if (FieldType != Counters.Value) continue;
+        if (!comptime std.mem.startsWith(u8, field_name, Counters.shed_prefix)) continue;
         actual_count += 1;
         comptime var listed = false;
         inline for (expected) |name| {
-            if (comptime std.mem.eql(u8, name, field.name)) listed = true;
+            if (comptime std.mem.eql(u8, name, field_name)) listed = true;
         }
         if (!listed) {
-            std.debug.print("unlisted shed counter: {s}\n", .{field.name});
+            std.debug.print("unlisted shed counter: {s}\n", .{field_name});
             return error.UnlistedShedCounter;
         }
     }
@@ -2132,11 +2217,11 @@ test "counters: labeled render speaks the exposition dialect" {
     labeled.incrementEndpoint(.responses, labeled_test_keys.key(0, 1));
     labeled.incrementCluster(.l7_shed_inflight, 1);
 
-    var l7 = [_]u16{0} ** labeled_test_keys.count;
-    var l4 = [_]u16{0} ** labeled_test_keys.count;
+    var l7: [labeled_test_keys.count]u16 = @splat(0);
+    var l4: [labeled_test_keys.count]u16 = @splat(0);
     l7[labeled_test_keys.key(0, 0)] = 3;
     l4[labeled_test_keys.key(0, 0)] = 2;
-    var healthy = [_]bool{true} ** labeled_test_keys.count;
+    var healthy: [labeled_test_keys.count]bool = @splat(true);
     healthy[labeled_test_keys.key(0, 1)] = false;
     const views: Labeled.LiveViews = .{
         .load = .{ .l7 = &l7, .l4 = &l4 },
@@ -2224,9 +2309,9 @@ test "counters: labeled render bound is exact at the maximum values" {
     // The widest live view either owner can produce: both u16 tables
     // saturated (the inflight bound is their sum, not a u32's), and a
     // healthy verdict — "1" — on every checked endpoint.
-    var l7 = [_]u16{std.math.maxInt(u16)} ** labeled_test_keys.count;
-    var l4 = [_]u16{std.math.maxInt(u16)} ** labeled_test_keys.count;
-    const healthy = [_]bool{true} ** labeled_test_keys.count;
+    var l7: [labeled_test_keys.count]u16 = @splat(std.math.maxInt(u16));
+    var l4: [labeled_test_keys.count]u16 = @splat(std.math.maxInt(u16));
+    const healthy: [labeled_test_keys.count]bool = @splat(true);
     const views: Labeled.LiveViews = .{
         .load = .{ .l7 = &l7, .l4 = &l4 },
         .healthy = &healthy,

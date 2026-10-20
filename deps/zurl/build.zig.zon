@@ -1,0 +1,39 @@
+.{
+    .name = .zurl,
+    .version = "0.0.0",
+    .fingerprint = 0x2ef103580a0b50f9, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    // ONE dependency, deliberately, and the argument for it is in
+    // docs/RESEARCH.md rather than in this comment: hparse's head scanner is
+    // faster than the one it replaces, and zoxy-io/zurl and zoxy-io/hparse are
+    // bumped together, so the n-way-agreement cost rule 6 was written about is
+    // not the cost this pin actually carries.
+    //
+    // What rule 6 protected is still protected. hparse is std-only and
+    // backend-agnostic: it takes a byte slice and writes spans, so it drags in
+    // no async runtime and no TLS stack, and a consumer that already pins zio
+    // or a TLS library still cannot end up with two copies of one through
+    // zurl. That was always the real claim; "zero" was the cheap way to
+    // guarantee it.
+    //
+    // NOT lazy. It was lazy while it was an experiment reachable only through
+    // -Dhparse; src/parser.zig imports it now, so a lazy pin would just be a
+    // fetch failure deferred to first use.
+    .dependencies = .{
+        // upstream: git+https://github.com/zoxy-io/hparse#2dcaf4599dcd22628fcc6b7c5ea7a666d2ac8cc1
+        // + Zig 0.17 compatibility delta (build script, repetition, @Int)
+        .hparse = .{ .path = "../hparse" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        // build.zig declares steps that reference these, so a dependent
+        // resolving those lazy paths needs them in the package.
+        "bench",
+        "smoke",
+        "cli",
+        "LICENSE",
+        "README.md",
+    },
+}

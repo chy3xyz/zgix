@@ -48,6 +48,16 @@ pub const protected_names = [_][]const u8{
 /// opposite of forwarding one.
 pub const forwarded_for_name = "X-Forwarded-For";
 
+/// The nginx-compatible client-address header, written only when a
+/// listener's `forwarded` block asks for it. Public for the filter-edit
+/// guard, on `forwarded_for_name`'s reasoning: a constant here would be
+/// one address for every client.
+pub const real_ip_name = "X-Real-IP";
+
+/// The scheme this listener received, written only when asked. Same
+/// guard: a constant would lie on the plaintext listener beside it.
+pub const forwarded_proto_name = "X-Forwarded-Proto";
+
 /// The second header this proxy writes on the client's behalf, and for a
 /// stricter reason (#240): RFC 9110 §7.6.2 requires each intermediary to
 /// replace the received value with its own decrement. Public for the same
@@ -76,8 +86,8 @@ comptime {
     for (protected_names) |name| {
         assert(parser.classifyHeaderName(name).protected());
     }
-    for (@typeInfo(parser.HeaderName).@"enum".fields) |field| {
-        const tag: parser.HeaderName = @enumFromInt(field.value);
+    for (@typeInfo(parser.HeaderName).@"enum".field_values) |value| {
+        const tag: parser.HeaderName = @fromBackingInt(@intCast(value));
         if (tag.hopByHop()) assert(nameListHas(&hop_by_hop_names, tag.text()));
         if (tag.protected()) assert(nameListHas(&protected_names, tag.text()));
         // `isHopByHop` tests hop-by-hop first, so a name in both sets
@@ -113,7 +123,37 @@ pub const HeadScratch = struct {
 /// suppresses the source copies of its name, a set/add appends its
 /// (config-validated, injection-safe) line — proxy-managed names can never
 /// appear here, the filter compiler forbids them.
+/// The pre-companion entry point: renders exactly as `renderRequestHeadFull`
+/// with no `X-Real-IP`/`X-Forwarded-Proto`. Kept so the directed render
+/// tests state the common shape without two trailing `null`s; the proxy
+/// calls the full form, and its integration tests cover the companions.
 pub fn renderRequestHead(
+    request: *const parser.RequestHead,
+    target: parser.CanonicalTarget,
+    edits: []const filter.AppliedHeaderEdit,
+    inject_close: bool,
+    forwarded_for: ?[]const u8,
+    max_forwards: ?[]const u8,
+    keep_upgrade: bool,
+    scratch: *HeadScratch,
+    buffer: []u8,
+) error{Oversize}![]const u8 {
+    return renderRequestHeadFull(
+        request,
+        target,
+        edits,
+        inject_close,
+        forwarded_for,
+        null,
+        null,
+        max_forwards,
+        keep_upgrade,
+        scratch,
+        buffer,
+    );
+}
+
+pub fn renderRequestHeadFull(
     request: *const parser.RequestHead,
     target: parser.CanonicalTarget,
     edits: []const filter.AppliedHeaderEdit,
@@ -129,6 +169,12 @@ pub fn renderRequestHead(
     /// deliberate: the trust rule is a security decision with a counter
     /// attached, and a byte-assembler should have access to neither.
     forwarded_for: ?[]const u8,
+    /// `X-Real-IP`, assembled by the caller from the same observed peer
+    /// as `forwarded_for`, or null when the block did not ask for it.
+    real_ip: ?[]const u8,
+    /// `X-Forwarded-Proto`, `"http"` or `"https"` from the listener that
+    /// received the request, or null when the block did not ask for it.
+    forwarded_proto: ?[]const u8,
     /// The decremented `Max-Forwards` to emit, or null to leave whatever
     /// arrived exactly as it arrived (#240) — which is every request but
     /// an `OPTIONS` that carried a budget.
@@ -182,24 +228,21 @@ pub fn renderRequestHead(
         edits,
         .{
             .forwarded_for = forwarded_for != null,
+            .real_ip = real_ip != null,
+            .proto = forwarded_proto != null,
             .host = request.authority != null,
             .max_forwards = max_forwards != null,
         },
         keep_upgrade,
         scratch,
     );
-    if (forwarded_for) |value| {
-        assert(value.len >= 1);
-        try staging.appendHeaderLine(forwarded_for_name, value);
-    }
-    // The hop budget RFC 9110 §7.6.2 has each intermediary decrement
-    // (#240). Written here for the same reason the forwarded line is:
-    // the caller did the arithmetic and the check that goes with it, and
-    // this file is a byte-assembler with no business deciding either.
-    if (max_forwards) |value| {
-        assert(value.len >= 1);
-        try staging.appendHeaderLine(max_forwards_name, value);
-    }
+    try appendForwardingHeaders(
+        &staging,
+        forwarded_for,
+        real_ip,
+        forwarded_proto,
+        max_forwards,
+    );
     // A carried upgrade announces the opposite of a close: this hop is
     // continuing, in a different protocol. The two are mutually exclusive
     // by construction — an exchange that becomes a tunnel is never the
@@ -218,24 +261,86 @@ pub fn renderRequestHead(
     return staging.buffer[0..staging.len];
 }
 
+/// The proxy-written forwarding and hop-budget lines, in one place: each
+/// is written for the same reason — the caller computed the value from
+/// what it observed, and the inbound copy was suppressed above so the
+/// two spellings cannot disagree — and each is optional on the listener's
+/// block.
+fn appendForwardingHeaders(
+    staging: *Staging,
+    forwarded_for: ?[]const u8,
+    real_ip: ?[]const u8,
+    forwarded_proto: ?[]const u8,
+    max_forwards: ?[]const u8,
+) error{Oversize}!void {
+    if (forwarded_for) |value| {
+        assert(value.len >= 1);
+        try staging.appendHeaderLine(forwarded_for_name, value);
+    }
+    if (real_ip) |value| {
+        assert(value.len >= 1);
+        try staging.appendHeaderLine(real_ip_name, value);
+    }
+    if (forwarded_proto) |value| {
+        assert(value.len >= 1);
+        try staging.appendHeaderLine(forwarded_proto_name, value);
+    }
+    // RFC 9110 §7.6.2 has each intermediary replace the received budget
+    // with its own decrement (#240).
+    if (max_forwards) |value| {
+        assert(value.len >= 1);
+        try staging.appendHeaderLine(max_forwards_name, value);
+    }
+}
+
 /// Renders the downstream status line and end-to-end headers. The
 /// origin's version and reason phrase are preserved verbatim;
 /// `inject_close` announces that the proxy will close the downstream
 /// connection after this response (§7). `edits` are the matched
 /// response filters' header edits (#175), applied by the same
 /// suppress-and-append machinery the request render uses — empty when
-/// the listener configured none, which is most listeners; the one slot
-/// past `header_edits_max` is the #178 Set-Cookie stamp, which rides
-/// this same machinery rather than owning a second injection path.
+/// the listener configured none, which is most listeners; the two slots
+/// past `header_edits_max` are the #178 Set-Cookie stamp and the h3
+/// `Alt-Svc` advertisement, which ride this same machinery rather than
+/// owning a second injection path.
 /// Overflow is the caller's 502: an origin response that cannot be
 /// re-rendered after edits is not the client's fault.
+/// The pre-compression entry point: renders exactly as
+/// `renderResponseHeadFull` with the origin's own framing. Kept so the
+/// directed tests state the common shape; the proxy calls the full form.
 pub fn renderResponseHead(
+    response: *const parser.ResponseHead,
+    inject_close: bool,
+    edits: []const filter.AppliedHeaderEdit,
+    keep_upgrade: bool,
+    scratch: *HeadScratch,
+    buffer: []u8,
+) error{Oversize}![]const u8 {
+    return renderResponseHeadFull(
+        response,
+        inject_close,
+        edits,
+        keep_upgrade,
+        null,
+        false,
+        scratch,
+        buffer,
+    );
+}
+
+pub fn renderResponseHeadFull(
     response: *const parser.ResponseHead,
     inject_close: bool,
     edits: []const filter.AppliedHeaderEdit,
     /// True when this response is the `101` completing an upgrade this
     /// proxy is carrying (#180), the mirror of the request-side flag.
     keep_upgrade: bool,
+    /// Overrides the origin's `Content-Length` when the proxy changes the
+    /// body (compression). Null forwards the origin's framing untouched.
+    response_body_length: ?u32,
+    /// Whether `Content-Encoding: gzip` / `Vary: Accept-Encoding` describe
+    /// this body. Only ever set beside a `response_body_length`.
+    compressed: bool,
     /// The caller's scratch for this render (see `HeadScratch`).
     scratch: *HeadScratch,
     buffer: []u8,
@@ -244,6 +349,7 @@ pub fn renderResponseHead(
     assert(response.status <= 599);
     assert(edits.len <= constants.response_edits_max);
     assert(buffer.len <= std.math.maxInt(u32));
+    assert(!compressed or response_body_length != null);
 
     var staging = Staging{ .buffer = buffer };
     try staging.append(switch (response.version) {
@@ -261,12 +367,20 @@ pub fn renderResponseHead(
         response.headers,
         response.connection_nominates_header,
         edits,
-        // Every suppression is request-side: a response carries no
-        // header this proxy writes on the client's behalf.
-        .{},
+        // The only response-side suppression: a body the proxy changed
+        // must not state the origin's length beside its own.
+        .{ .content_length = response_body_length != null },
         keep_upgrade,
         scratch,
     );
+    if (response_body_length) |length| {
+        var digits: [10]u8 = undefined;
+        const text = std.fmt.bufPrint(&digits, "{d}", .{length}) catch unreachable;
+        try staging.appendHeaderLine("Content-Length", text);
+    }
+    if (compressed) {
+        try staging.append("Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n");
+    }
     // A carried upgrade announces the opposite of a close: this hop is
     // continuing, in a different protocol. The two are mutually exclusive
     // by construction — an exchange that becomes a tunnel is never the
@@ -408,6 +522,11 @@ const Suppress = struct {
     /// chain is untrusted, under `append` because the caller already
     /// folded it into the line it will write.
     forwarded_for: bool = false,
+    /// `X-Real-IP` and `X-Forwarded-Proto`, written by the same block.
+    /// Inbound copies are suppressed for the same reason: two spellings
+    /// of "who connected" that disagree is the disagreement §7 refuses.
+    real_ip: bool = false,
+    proto: bool = false,
     /// The `Host` an absolute-form authority overruled (#233). RFC 9112
     /// §3.2.2 has the received Host ignored in favour of the target's
     /// authority, and a request carrying both would hand the origin the
@@ -417,6 +536,10 @@ const Suppress = struct {
     /// §7.6.2 requires the *updated* value travel, so the received one
     /// must not travel beside it.
     max_forwards: bool = false,
+    /// The origin's `Content-Length` when the proxy is about to write its
+    /// own (a compressed body). The two must not both travel: a receiver
+    /// that believed the origin's number would stop mid-stream.
+    content_length: bool = false,
 
     /// Whether this hop writes any of the three. Hoisted out of the
     /// header walk for the same reason `has_suppressing_edit` is: all
@@ -426,7 +549,8 @@ const Suppress = struct {
     /// walk rather than a tag dispatch on every header (§9: the render is
     /// the top user-CPU cost under load).
     fn any(suppress: Suppress) bool {
-        return suppress.forwarded_for or suppress.host or suppress.max_forwards;
+        return suppress.forwarded_for or suppress.real_ip or suppress.proto or
+            suppress.host or suppress.max_forwards or suppress.content_length;
     }
 
     fn claims(suppress: Suppress, tag: parser.HeaderName) bool {
@@ -436,8 +560,11 @@ const Suppress = struct {
         assert(suppress.any());
         return switch (tag) {
             .x_forwarded_for => suppress.forwarded_for,
+            .x_real_ip => suppress.real_ip,
+            .x_forwarded_proto => suppress.proto,
             .host => suppress.host,
             .max_forwards => suppress.max_forwards,
+            .content_length => suppress.content_length,
             else => false,
         };
     }
@@ -473,7 +600,8 @@ fn appendEndToEndHeaders(
     scratch: *HeadScratch,
 ) error{Oversize}!void {
     assert(headers.len <= constants.headers_max);
-    // One slot past the filter budget: the #178 Set-Cookie stamp.
+    // Slots past the filter budget: the #178 Set-Cookie stamp and the h3
+    // `Alt-Svc` advertisement.
     assert(edits.len <= constants.response_edits_max);
     // Collect the Connection header value(s) once (usually zero or one).
     // Re-finding them inside the per-header hop-by-hop test made the walk
@@ -568,7 +696,8 @@ fn collectNominations(
 /// copies must not be forwarded (`add` never suppresses — it appends).
 fn suppressedByEdit(name: []const u8, edits: []const filter.AppliedHeaderEdit) bool {
     assert(name.len >= 1);
-    // One slot past the filter budget: the #178 Set-Cookie stamp.
+    // Slots past the filter budget: the #178 Set-Cookie stamp and the h3
+    // `Alt-Svc` advertisement.
     assert(edits.len <= constants.response_edits_max);
     for (edits) |edit| {
         switch (edit.kind) {

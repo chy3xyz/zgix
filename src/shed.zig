@@ -167,6 +167,7 @@ pub fn proxyStatusCauseFor(comptime rung: []const u8) ProxyStatusCause {
     if (std.mem.startsWith(u8, rung, "l7_shed_")) return .limit;
     if (std.mem.eql(u8, rung, "l7_no_route")) return .no_route;
     if (std.mem.eql(u8, rung, "l7_filtered")) return .denied;
+    if (std.mem.eql(u8, rung, "l7_waf_blocked")) return .denied;
     if (std.mem.eql(u8, rung, "l7_gateway_timeout")) return .timeout;
     return .none;
 }
@@ -402,8 +403,8 @@ pub const StaticTable = struct {
 
     /// The #240 answer for one persistence choice.
     pub fn getOptions(table: *StaticTable, persistence: Persistence) StaticResponse {
-        const template = options_templates[@intFromEnum(persistence)];
-        const slot = &table.options[@intFromEnum(persistence)];
+        const template = options_templates[@backingInt(persistence)];
+        const slot = &table.options[@backingInt(persistence)];
         assert(template.date_offset + date_bytes <= template.bytes.len);
         return .{
             .bytes = slot[0..template.bytes.len],
@@ -458,8 +459,8 @@ pub const StaticTable = struct {
     ) StaticResponse {
         if (proxy_status) {
             if (comptime variantIndex(status, cause)) |index| {
-                const template = proxy_status_templates[index][@intFromEnum(persistence)];
-                const slot = &table.proxy_status_storage[index][@intFromEnum(persistence)];
+                const template = proxy_status_templates[index][@backingInt(persistence)];
+                const slot = &table.proxy_status_storage[index][@backingInt(persistence)];
                 assert(template.date_offset + date_bytes <= template.bytes.len);
                 return .{
                     .bytes = slot[0..template.bytes.len],
@@ -468,8 +469,8 @@ pub const StaticTable = struct {
             }
         }
         const index = comptime staticStatusIndex(status).?;
-        const template = templates[index][@intFromEnum(persistence)];
-        const slot = &table.storage[index][@intFromEnum(persistence)];
+        const template = templates[index][@backingInt(persistence)];
+        const slot = &table.storage[index][@backingInt(persistence)];
         assert(template.date_offset + date_bytes <= template.bytes.len);
         return .{
             .bytes = slot[0..template.bytes.len],
@@ -550,12 +551,27 @@ pub const static_statuses = [_]u16{ 400, 403, 404, 408, 413, 414, 429, 431, 501,
 /// vocabulary is cheap, shrinking a documented one is not.
 pub const page_statuses = [_]u16{200} ++ static_statuses;
 
+/// One complete response variant, with the head's length recorded so a
+/// HEAD request sends the prefix of that same buffer. `bytes` is the
+/// whole response; `date` is the slot inside its head.
+pub const PageVariant = struct {
+    bytes: []const u8,
+    head_len: u32,
+    date: *[date_bytes]u8,
+};
+
 /// One pre-rendered page (#159): both persistence variants of a
 /// complete response — status line, framing, content type, body — each
 /// in one contiguous arena buffer, with the head's length recorded so a
 /// HEAD request sends the prefix of that same buffer. Rendered at load
 /// and immutable after, so serving one is the comptime-static path
 /// unchanged: one send, no assembly, no acquisition.
+///
+/// `gzip_keep` and `gzip_close` are the same response with the body
+/// pre-compressed at load: their heads carry `Content-Encoding: gzip`,
+/// `Vary: Accept-Encoding` and the compressed length, and their bodies
+/// are the gzip bytes. Null only on a page the loader did not render
+/// (the directed tests' and simulator's hand-built pages).
 ///
 /// It lives here rather than in `config.zig` because both sides of the
 /// serving path need to name the type and neither may import the
@@ -574,6 +590,52 @@ pub const StaticPage = struct {
     /// region the serving path writes.
     keep_date: *[date_bytes]u8,
     close_date: *[date_bytes]u8,
+    gzip_keep: ?PageVariant = null,
+    gzip_close: ?PageVariant = null,
+
+    /// The variant a request selects: the gzip rendering when the
+    /// client accepts it and one was built, the plain rendering
+    /// otherwise. `head_only` is RFC 9110's HEAD rule — the head is a
+    /// prefix of the very response a GET would have received, so a
+    /// gzip-accepting HEAD advertises the compressed length and coding
+    /// without carrying the body. Pure selection: every candidate is
+    /// arena memory, so the serving path still sends one slice.
+    pub fn select(
+        page: *const StaticPage,
+        persistence: Persistence,
+        accept_gzip: bool,
+        head_only: bool,
+    ) StaticResponse {
+        if (accept_gzip) {
+            const gzip = switch (persistence) {
+                .keep => page.gzip_keep,
+                .close => page.gzip_close,
+            };
+            if (gzip) |variant| {
+                assert(variant.head_len <= variant.bytes.len);
+                return .{
+                    .bytes = if (head_only) variant.bytes[0..variant.head_len] else variant.bytes,
+                    .date = variant.date,
+                };
+            }
+        }
+        const bytes = switch (persistence) {
+            .keep => page.keep,
+            .close => page.close,
+        };
+        const head_len = switch (persistence) {
+            .keep => page.keep_head_len,
+            .close => page.close_head_len,
+        };
+        assert(head_len <= bytes.len);
+        return .{
+            .bytes = if (head_only) bytes[0..head_len] else bytes,
+            .date = switch (persistence) {
+                .keep => page.keep_date,
+                .close => page.close_date,
+            },
+        };
+    }
 };
 
 /// Whether `error_pages` may carry this status (#159) — membership in
@@ -704,6 +766,45 @@ test "shed: an opted-in listener names the cause it refused for" {
     );
 }
 
+test "shed: page selection prefers gzip and HEAD keeps the GET's head" {
+    var keep_date: [date_bytes]u8 = undefined;
+    var close_date: [date_bytes]u8 = undefined;
+    var gzip_keep_date: [date_bytes]u8 = undefined;
+    var gzip_close_date: [date_bytes]u8 = undefined;
+    const page: StaticPage = .{
+        .status = 200,
+        .keep = "plain-keep-body",
+        .close = "plain-close-body",
+        .keep_head_len = 10,
+        .close_head_len = 11,
+        .keep_date = &keep_date,
+        .close_date = &close_date,
+        .gzip_keep = .{
+            .bytes = "gz-keep-body",
+            .head_len = 7,
+            .date = &gzip_keep_date,
+        },
+        .gzip_close = .{
+            .bytes = "gz-close-body",
+            .head_len = 8,
+            .date = &gzip_close_date,
+        },
+    };
+    // The accepted coding wins whole for a GET and head-only for a HEAD:
+    // the prefix is the same bytes a GET's response starts with.
+    try std.testing.expectEqualStrings("gz-keep-body", page.select(.keep, true, false).bytes);
+    try std.testing.expectEqualStrings("gz-keep", page.select(.keep, true, true).bytes);
+    try std.testing.expectEqualStrings("gz-close-body", page.select(.close, true, false).bytes);
+    try std.testing.expectEqualStrings("gz-close", page.select(.close, true, true).bytes);
+    // Without the opt-in the plain page is returned untouched, and the
+    // `Date` slot follows the chosen variant.
+    try std.testing.expectEqualStrings("plain-keep-body", page.select(.keep, false, false).bytes);
+    try std.testing.expectEqualStrings("plain-close", page.select(.close, false, true).bytes);
+    try std.testing.expectEqual(&keep_date, page.select(.keep, false, false).date);
+    try std.testing.expectEqual(&gzip_keep_date, page.select(.keep, true, false).date);
+    try std.testing.expectEqual(&gzip_close_date, page.select(.close, true, false).date);
+}
+
 test "shed: every token this proxy emits is one the registry defines" {
     // The set is closed and small, so it is checkable rather than
     // asserted: a token invented here would be a field a client cannot
@@ -715,8 +816,8 @@ test "shed: every token this proxy emits is one the registry defines" {
         "http_response_timeout",
     };
     var seen: usize = 0;
-    inline for (@typeInfo(ProxyStatusCause).@"enum".fields) |field| {
-        const cause: ProxyStatusCause = @enumFromInt(field.value);
+    inline for (@typeInfo(ProxyStatusCause).@"enum".field_values) |value| {
+        const cause: ProxyStatusCause = @fromBackingInt(@intCast(value));
         const token = comptime causeToken(cause) orelse continue;
         seen += 1;
         var found = false;

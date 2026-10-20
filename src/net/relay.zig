@@ -18,6 +18,7 @@ const conn_module = @import("Conn.zig");
 const stream_module = @import("Stream.zig");
 const pump = @import("pump.zig");
 const TlsEngine = @import("../tls/Engine.zig");
+const UpstreamTls = @import("../tls/UpstreamTls.zig");
 const Io = @import("../io/io.zig");
 
 const assert = std.debug.assert;
@@ -64,7 +65,7 @@ pub fn Relay(comptime IoType: type) type {
                 }
 
                 fn state(conn: *ConnType) *stream_module.DirectionState {
-                    return &conn.stream.directions[@intFromEnum(direction)];
+                    return &conn.stream.directions[@backingInt(direction)];
                 }
 
                 pub fn beforeRecv(conn: *ConnType) void {
@@ -120,34 +121,39 @@ pub fn Relay(comptime IoType: type) type {
                 /// thing here as they do on an HTTP line — bytes that
                 /// crossed the wire to and from the client — rather than
                 /// bytes the origin happened to see.
-                pub fn afterFeed(conn: *ConnType, received: u32, fr: pump.FeedResult) void {
-                    _ = received;
+                pub fn afterFeed(conn: *ConnType, chunk_len: u32, fr: pump.FeedResult) void {
+                    _ = chunk_len;
                     if (direction == .client_to_upstream) {
                         conn.stream.log.bytes_in += fr.consumed;
                     }
                 }
 
                 pub fn afterSend(conn: *ConnType, sent: u32) void {
+                    // A staged close_notify is control traffic: it is not
+                    // application bytes the client received, and counting
+                    // it would make the access log depend on whether the
+                    // session said goodbye politely.
+                    if (state(conn).closing) return;
                     if (direction == .upstream_to_client) {
                         conn.stream.log.bytes_out += sent;
                     }
                 }
 
                 /// A FIN never arrives through here (relay has no length to
-                /// count down); the loop only leaves on EOF or teardown.
+                /// count down); only the staged close_notify does, and its
+                /// drain is what lets the write half finish.
                 pub fn framingDone(conn: *ConnType) bool {
-                    _ = conn;
-                    return false;
+                    return state(conn).closing;
                 }
 
                 pub fn onRecvError(server: *ServerType, conn: *ConnType, err: Io.RecvError) void {
                     if (err == error.EndOfStream) {
                         // Half-close (§6): propagate the FIN, keep the other
-                        // direction relaying under the deadline.
-                        state(conn).phase = .finished;
-                        server.io.shutdown(targetSocket(conn), .write);
-                        server.storeDeadline(conn, server.idleTimeoutMs());
-                        maybeFinish(server, conn);
+                        // direction relaying under the deadline. On a TLS
+                        // target the FIN is preceded by close_notify, which
+                        // is staged and drained before the write half shuts
+                        // down — a bare FIN there is a truncation.
+                        endReadSide(server, conn);
                         return;
                     }
                     server.witnessKernelPressure(.recv, err);
@@ -159,51 +165,108 @@ pub fn Relay(comptime IoType: type) type {
                     server.beginTeardown(conn);
                 }
 
-                /// Reached only through a transform that said its stream
-                /// ended: `feed` never yields 0 consumed bytes, so a plain
-                /// relay cannot get here at all. For TLS that is the
-                /// client's close_notify — it will send no more
-                /// application data, which is a half-close exactly like a
-                /// FIN and is told to the far side as one (§6).
-                ///
-                /// The distinction matters because no socket EOF need ever
-                /// follow: the TCP connection stays open for the other
-                /// direction, so a relay that waited for one would hold a
-                /// cleanly-ended session until the idle deadline reaped it.
-                pub fn onDrained(server: *ServerType, conn: *ConnType) void {
+                /// The read side is over: a socket FIN here, or a
+                /// close_notify through `onDrained`. Either way the target
+                /// hears it as a half-close; if the target speaks TLS that
+                /// means a close_notify record first, then SHUT_WR.
+                fn endReadSide(server: *ServerType, conn: *ConnType) void {
                     assert(conn.state == .relaying);
-                    assert(direction == .client_to_upstream);
-                    assert(conn.tls != null);
-                    assert(conn.tls.?.peerClosed());
-                    state(conn).phase = .finished;
+                    const direction_state = state(conn);
+                    assert(direction_state.phase != .finished);
+                    if (direction == .client_to_upstream) {
+                        if (upstreamEngine(conn)) |engine| {
+                            return closeThenFinish(server, conn, engine);
+                        }
+                    } else {
+                        if (conn.tls) |engine| {
+                            return closeThenFinish(server, conn, engine);
+                        }
+                    }
+                    finishWriteSide(server, conn);
+                }
+
+                /// Stage the target's close_notify and arm the send that
+                /// drains it. The read discipline guarantees the outbox is
+                /// empty here: a recv is armed only after the previous
+                /// send drained.
+                fn closeThenFinish(
+                    server: *ServerType,
+                    conn: *ConnType,
+                    engine: anytype,
+                ) void {
+                    engine.sendClose() catch {
+                        conn.server.counters.increment("tls_relay_failed");
+                        server.beginTeardown(conn);
+                        return;
+                    };
+                    const direction_state = state(conn);
+                    direction_state.closing = true;
+                    direction_state.phase = .sending;
+                    switch (direction) {
+                        .client_to_upstream => PumpClientToUpstream.armSend(server, conn),
+                        .upstream_to_client => PumpUpstreamToClient.armSend(server, conn),
+                    }
+                }
+
+                /// The close_notify (or the FIN, when there was nothing to
+                /// say) is on the wire: shut the write half and let the
+                /// other direction finish.
+                fn finishWriteSide(server: *ServerType, conn: *ConnType) void {
+                    const direction_state = state(conn);
+                    direction_state.closing = false;
+                    direction_state.phase = .finished;
                     server.io.shutdown(targetSocket(conn), .write);
                     server.storeDeadline(conn, server.idleTimeoutMs());
                     maybeFinish(server, conn);
                 }
 
-                /// Unreachable for L4: `framingDone` is always false.
-                pub fn onComplete(server: *ServerType, conn: *ConnType) void {
-                    _ = server;
-                    _ = conn;
-                    unreachable;
+                /// Reached only through a transform that said its stream
+                /// ended: the read side's close_notify. No socket EOF need
+                /// follow — the TCP connection stays open for the other
+                /// direction — so waiting for one would hold a cleanly
+                /// ended session until the idle deadline reaped it.
+                pub fn onDrained(server: *ServerType, conn: *ConnType) void {
+                    assert(conn.state == .relaying);
+                    assert(readPeerClosed(conn));
+                    endReadSide(server, conn);
                 }
 
-                // -- the TLS transform (§4, #125) --
-                //
-                // Only the client side transforms: this is termination, so
-                // the origin leg is plaintext in both directions. That
-                // makes the two hooks below asymmetric on purpose — the
-                // client→upstream direction decrypts what it reads, the
-                // upstream→client direction encrypts what it writes, and
-                // each leaves the other alone.
+                /// Only the staged close_notify reaches here; `framingDone`
+                /// is false for every ordinary relay send.
+                pub fn onComplete(server: *ServerType, conn: *ConnType) void {
+                    assert(conn.state == .relaying);
+                    assert(state(conn).closing);
+                    finishWriteSide(server, conn);
+                }
 
-                /// Ciphertext reads straight into the engine's record
+                /// Whether the read side's TLS session saw the peer's
+                /// close_notify. False on a plaintext read side, where the
+                /// stream ends at the socket instead.
+                fn readPeerClosed(conn: *const ConnType) bool {
+                    return switch (direction) {
+                        .client_to_upstream => if (conn.tls) |engine| engine.peerClosed() else false,
+                        .upstream_to_client => if (upstreamEngine(conn)) |engine| engine.peerClosed() else false,
+                    };
+                }
+
+                // -- the TLS transforms (§4, #125, #180) --
+                //
+                // Either end may speak TLS on a tunnel: the client side is
+                // termination, the origin side is upstream TLS, and both can
+                // be true at once. Each direction therefore decrypts its
+                // *read* side and encrypts its *write* side independently —
+                // the plaintext window between them is the relay half (or
+                // the client engine's buffer, where termination already put
+                // it).
+
+                /// Ciphertext reads straight into the read engine's record
                 /// buffer: reassembly happens there, and the plaintext
                 /// destination is where it decrypts *to*, so it cannot also
                 /// be the read target.
                 pub fn recvBuffer(conn: *ConnType) []u8 {
-                    if (direction == .client_to_upstream) {
-                        if (conn.tls) |engine| return engine.recvBuffer();
+                    switch (direction) {
+                        .client_to_upstream => if (conn.tls) |engine| return engine.recvBuffer(),
+                        .upstream_to_client => if (upstreamEngine(conn)) |engine| return engine.recvBuffer(),
                     }
                     return @field(conn.stream.relay_buffer.?, @tagName(direction));
                 }
@@ -214,16 +277,29 @@ pub fn Relay(comptime IoType: type) type {
                 /// KeyUpdate — which the pump reads on for; and nothing for
                 /// close_notify, which `transformEnded` tells apart.
                 pub fn transformIn(conn: *ConnType, chunk: []u8) ?[]const u8 {
-                    if (direction != .client_to_upstream) return chunk;
-                    const engine = conn.tls orelse return chunk;
-                    if (!hasOutboundRoom(conn.server, conn)) return null;
-                    var out: Decrypted = .{ .conn = conn };
-                    const sink = out.sink();
-                    engine.received(chunk.len, &sink) catch {
+                    if (direction == .client_to_upstream) {
+                        const engine = conn.tls orelse return chunk;
+                        if (!clientRoom(conn.server, conn)) return null;
+                        var out: Decrypted = .{ .conn = conn };
+                        const sink = out.sink();
+                        engine.received(chunk.len, &sink) catch {
+                            conn.server.counters.increment("tls_relay_failed");
+                            return null;
+                        };
+                        return engine.plaintext[0..out.len];
+                    }
+                    const engine = upstreamEngine(conn) orelse return chunk;
+                    if (!upstreamRoom(conn.server, conn)) return null;
+                    var out: OriginDecrypted = .{ .conn = conn };
+                    engine.received(chunk.len, &out.sink()) catch {
                         conn.server.counters.increment("tls_relay_failed");
                         return null;
                     };
-                    return engine.plaintext[0..out.len];
+                    if (out.overflow) {
+                        conn.server.counters.increment("tls_relay_failed");
+                        return null;
+                    }
+                    return conn.stream.relay_buffer.?.upstream_to_client[0..out.len];
                 }
 
                 /// An empty decrypt ends the stream only when the peer said
@@ -232,64 +308,70 @@ pub fn Relay(comptime IoType: type) type {
                 /// waits for bytes that will never come until the deadline
                 /// reaps a connection that said a clean goodbye.
                 pub fn transformEnded(conn: *ConnType) bool {
-                    if (direction != .client_to_upstream) return false;
-                    const engine = conn.tls orelse return false;
-                    return engine.peerClosed();
+                    return readPeerClosed(conn);
                 }
 
-                /// Encrypt the framed chunk once, before the first send —
-                /// a resume must not re-encrypt bytes already gone.
-                /// Chunked by the pump's own buffer, which is sized at
-                /// `relay_buffer_bytes` and so already within what the
-                /// engine accepts in one record. That last step is a
-                /// *loader* guarantee rather than a comptime one since
-                /// the relay ceiling rose past one record: a config that
-                /// terminates TLS is refused above `tls_app_chunk_bytes`
-                /// (`LimitRelayBufferOverTlsRecord`), and `sendApp`
-                /// asserts the same bound as a backstop.
+                /// Encrypt the framed chunk before the first send — a
+                /// resume must not re-encrypt bytes already gone. The
+                /// plaintext window can be wider than one emitted record
+                /// (an upstream-TLS tunnel half is a wire record wide), so
+                /// this chunks; the outbox holds two records.
                 pub fn transformOut(conn: *ConnType, consumed: u32) bool {
-                    if (direction != .upstream_to_client) return true;
+                    assert(consumed >= 1);
+                    if (direction == .client_to_upstream) {
+                        const engine = upstreamEngine(conn) orelse return true;
+                        const source: []const u8 = if (conn.tls) |client|
+                            client.plaintext[0..consumed]
+                        else
+                            conn.stream.relay_buffer.?.client_to_upstream[0..consumed];
+                        return encryptChunked(
+                            conn,
+                            engine,
+                            source,
+                            constants.tls_record_wire_bytes_max,
+                        );
+                    }
                     const engine = conn.tls orelse return true;
-                    if (!hasOutboundRoom(conn.server, conn)) return false;
-                    engine.sendApp(
+                    assert(consumed <= conn.stream.relay_buffer.?.upstream_to_client.len);
+                    return encryptChunked(
+                        conn,
+                        engine,
                         conn.stream.relay_buffer.?.upstream_to_client[0..consumed],
-                    ) catch {
-                        conn.server.counters.increment("tls_relay_failed");
-                        return false;
-                    };
-                    return true;
+                        TlsEngine.emitted_record_bytes_max,
+                    );
                 }
 
-                /// Plaintext leaves the buffer it decrypted into;
-                /// ciphertext leaves the outbox, which carries its own
-                /// cursor. Plain: the framed window still owed.
+                /// Plaintext leaves the buffer it decrypted into when the
+                /// target is plaintext; ciphertext leaves the target's
+                /// outbox, which carries its own cursor.
                 pub fn sendSlice(conn: *ConnType) []const u8 {
                     const direction_state = state(conn);
-                    if (conn.tls) |engine| {
-                        if (direction == .upstream_to_client) return engine.outbound();
-                        if (direction_state.owed() == 0) return &.{};
-                        return direction_state.pending(engine.plaintext);
+                    if (direction == .client_to_upstream) {
+                        if (upstreamEngine(conn)) |engine| return engine.outbound();
+                        if (conn.tls) |engine| {
+                            if (direction_state.owed() == 0) return &.{};
+                            return direction_state.pending(engine.plaintext);
+                        }
+                    } else {
+                        if (conn.tls) |engine| return engine.outbound();
                     }
                     if (direction_state.owed() == 0) return &.{};
                     return direction_state.pending(@field(conn.stream.relay_buffer.?, @tagName(direction)));
                 }
 
-                /// Credit whichever cursor tracks the wire. Only the
-                /// response direction diverges: the wire carries
-                /// ciphertext, which outnumbers the plaintext the debt
-                /// counts, so the debt settles all at once when the outbox
-                /// empties — the pump's stated contract for a transforming
-                /// send.
+                /// Credit whichever cursor tracks the wire. On an encrypted
+                /// target the wire carries ciphertext, which outnumbers the
+                /// plaintext the debt counts, so the debt settles all at
+                /// once when the outbox empties — the pump's stated
+                /// contract for a transforming send.
                 pub fn creditSend(conn: *ConnType, sent: u32) void {
                     const direction_state = state(conn);
-                    if (direction == .upstream_to_client) {
-                        if (conn.tls) |engine| {
-                            engine.outboundSent(sent);
-                            if (engine.outbound().len == 0 and direction_state.owed() >= 1) {
-                                direction_state.credit(direction_state.owed());
-                            }
-                            return;
+                    if (direction == .client_to_upstream) {
+                        if (upstreamEngine(conn)) |engine| {
+                            return creditEngine(engine, direction_state, sent);
                         }
+                    } else if (conn.tls) |engine| {
+                        return creditEngine(engine, direction_state, sent);
                     }
                     direction_state.credit(sent);
                 }
@@ -301,13 +383,73 @@ pub fn Relay(comptime IoType: type) type {
         /// Checked rather than asserted: the room depends on how fast the
         /// far side is draining, which is the peer's business, not an
         /// invariant of ours.
-        fn hasOutboundRoom(server: *ServerType, conn: *ConnType) bool {
+        fn clientRoom(server: *ServerType, conn: *ConnType) bool {
             assert(conn.state == .relaying);
             assert(conn.tls != null);
             if (conn.tls.?.outboundRoom() >= TlsEngine.emitted_record_bytes_max) return true;
             server.counters.increment("tls_relay_failed");
             server.beginTeardown(conn);
             return false;
+        }
+
+        fn upstreamRoom(server: *ServerType, conn: *ConnType) bool {
+            assert(conn.state == .relaying);
+            const engine = upstreamEngine(conn) orelse unreachable;
+            if (engine.outboundRoom() >= constants.tls_record_wire_bytes_max) return true;
+            server.counters.increment("tls_relay_failed");
+            server.beginTeardown(conn);
+            return false;
+        }
+
+        /// The TLS engine on the origin leg, or null for a plaintext dial.
+        fn upstreamEngine(conn: *const ConnType) ?*UpstreamTls {
+            const upstream = conn.stream.upstream orelse return null;
+            return upstream.tls;
+        }
+
+        /// Encrypt `bytes` into the target engine's outbox, one legal
+        /// record at a time. `room_min` is what the engine's staging
+        /// asserts before each send, which differs between the two engine
+        /// types.
+        fn encryptChunked(
+            conn: *ConnType,
+            engine: anytype,
+            bytes: []const u8,
+            room_min: usize,
+        ) bool {
+            var remaining = bytes;
+            // Bounded: every iteration appends one record and the outbox
+            // holds at most two, so this terminates by `room`.
+            while (remaining.len > 0) {
+                if (engine.outboundRoom() < room_min) {
+                    conn.server.counters.increment("tls_relay_failed");
+                    return false;
+                }
+                const chunk: u32 = @intCast(@min(
+                    remaining.len,
+                    constants.tls_app_chunk_bytes,
+                ));
+                assert(chunk >= 1);
+                engine.sendApp(remaining[0..chunk]) catch {
+                    conn.server.counters.increment("tls_relay_failed");
+                    return false;
+                };
+                remaining = remaining[chunk..];
+            }
+            return true;
+        }
+
+        /// Ciphertext outnumbers the plaintext the debt counts, so the
+        /// debt settles all at once when the outbox drains.
+        fn creditEngine(
+            engine: anytype,
+            state: *stream_module.DirectionState,
+            sent: u32,
+        ) void {
+            engine.outboundSent(sent);
+            if (engine.outbound().len == 0 and state.owed() >= 1) {
+                state.credit(state.owed());
+            }
         }
 
         /// Accumulates decrypted application data into the engine's
@@ -348,6 +490,38 @@ pub fn Relay(comptime IoType: type) type {
             }
         };
 
+        /// The origin leg's decrypted application data, landed in the
+        /// relay half this direction writes from. A separate sink because
+        /// the client-side `Decrypted` lands in the engine's own plaintext
+        /// buffer, and a tunnel can have both engines at once.
+        const OriginDecrypted = struct {
+            conn: *ConnType,
+            len: u32 = 0,
+            overflow: bool = false,
+            closed: bool = false,
+
+            fn sink(self: *OriginDecrypted) UpstreamTls.Sink {
+                return .{ .ctx = self, .appData = append, .closed = peerClosed };
+            }
+
+            fn append(ctx: *anyopaque, bytes: []const u8) void {
+                const self: *OriginDecrypted = @ptrCast(@alignCast(ctx));
+                if (self.closed) return;
+                const buffer = self.conn.stream.relay_buffer.?.upstream_to_client;
+                if (self.len + bytes.len > buffer.len) {
+                    self.overflow = true;
+                    return;
+                }
+                @memcpy(buffer[self.len..][0..bytes.len], bytes);
+                self.len += @intCast(bytes.len);
+            }
+
+            fn peerClosed(ctx: *anyopaque) void {
+                const self: *OriginDecrypted = @ptrCast(@alignCast(ctx));
+                self.closed = true;
+            }
+        };
+
         const PumpClientToUpstream = pump.Pump(IoType, .client_to_upstream, Policy(.client_to_upstream));
         const PumpUpstreamToClient = pump.Pump(IoType, .upstream_to_client, Policy(.upstream_to_client));
 
@@ -355,7 +529,7 @@ pub fn Relay(comptime IoType: type) type {
             assert(conn.state == .relaying);
             assert(conn.stream.upstream_socket != null);
             const client_to_upstream =
-                &conn.stream.directions[@intFromEnum(Direction.client_to_upstream)];
+                &conn.stream.directions[@backingInt(Direction.client_to_upstream)];
             if (client_to_upstream.owed() >= 1) {
                 // Payload that arrived coalesced behind a PROXY header
                 // (#142): the receive phase staged it at the buffer's

@@ -1,0 +1,36 @@
+.{
+    .name = .zssl,
+    .version = "0.0.1",
+    .fingerprint = 0x33674eab883287e6, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // libcrypto, built by Zig for the target — the same pin zoxy carries
+        // in its own build.zig.zon (see the audit prose there: OpenSSL rather
+        // than the BoringSSL family because `CRYPTO_set_mem_functions` is
+        // load-bearing for the zero-allocation budget; 3.5 is the LTS line,
+        // supported to April 2030; the fork adds pre-generated aarch64
+        // perlasm). The two pins must move together: zssl and zoxy link one
+        // libcrypto, and the profile harness would otherwise carry two.
+        //
+        // This pin is the crypto/ssl split, so the artifact is `crypto`
+        // rather than `openssl` and libssl is never compiled here — zssl
+        // is the TLS protocol layer, and linking a second one would be
+        // the exact thing DESIGN.md §2 forbids.
+        .openssl = .{
+            // upstream: git+https://github.com/zoxy-io/openssl?ref=main#0377b65001a49a33e5fd69f2ad561f0f9dcb0d69
+            .path = "../openssl",
+        },
+    },
+    // LICENSE ships with the package: MIT asks that the notice travel
+    // with copies, and a consumer's `zig fetch` gets only what is listed
+    // here.
+    .paths = .{
+        "LICENSE",
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "docs",
+        "scripts",
+        "README.md",
+    },
+}

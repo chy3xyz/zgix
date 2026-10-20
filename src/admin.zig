@@ -17,6 +17,12 @@
 //! regardless of method or path, so there is no routing, no head buffer,
 //! and no attack surface beyond a fixed-size drain. Generic over the Io
 //! backend like the rest of the data path, so the simulator drives it too.
+//!
+//! One section is appended to the rendering after the labeled breakdown
+//! when the embedder installs a status hook (`setStatusHook`): the
+//! experimental HTTP/3 path's per-listener rows (`h3_runtime`), which the
+//! admin reaches through an untyped pointer exactly like the seam's own
+//! witness reaches the counters — the admin plane names no h3 type.
 
 const std = @import("std");
 
@@ -40,6 +46,37 @@ pub const response_head =
 /// the buffer bound went from a comptime constant to a value `init`
 /// derives per server (`response.len`) and the memory banner prices
 /// (`Server.metricsBytes`).
+///
+/// The h3 listener-status section's worst case: four family rows per
+/// configured listener, each a family name + one bind label + one u64
+/// rendering, plus the four family headers. The bind renders as an
+/// address literal whose worst form — a bracketed IPv6 with port — fits
+/// 64 bytes; a u64's widest rendering is 20 digits. Reserved whether or
+/// not a hook is installed, the same unconditional-reservation terms the
+/// rest of this plane's budgets carry (§8).
+pub const h3_listener_status_bytes_max: usize = blk: {
+    const bind_max: usize = 64;
+    const digits_max: usize = 20; // len("18446744073709551615")
+    const header_max: usize = "# TYPE ".len + "zoxy_h3_listener_connections".len +
+        " counter\n".len;
+    const row_max: usize = "zoxy_h3_listener_connections".len +
+        "{bind=\"\"}".len + bind_max + " ".len + digits_max + "\n".len;
+    break :blk @as(usize, constants.h3_listeners_max) *
+        (4 * row_max + 4 * header_max + 16);
+};
+
+test "admin: the h3 listener-status bound covers a worst-case rendering" {
+    // Four rows plus the four headers per listener, at the widest family
+    // name, the longest bind the writer can render, and a 20-digit
+    // count — the bound must carry the shape it guards.
+    const row = "zoxy_h3_listener_connections".len + "{bind=\"".len +
+        64 + "\"}".len + " ".len + 20 + "\n".len;
+    const header = "# TYPE ".len + "zoxy_h3_listener_connections".len +
+        " counter\n".len;
+    const per_listener = 4 * row + 4 * header;
+    try std.testing.expect(h3_listener_status_bytes_max >=
+        @as(usize, constants.h3_listeners_max) * per_listener);
+}
 pub fn Admin(comptime IoType: type) type {
     const ServerType = @import("Server.zig").Server(IoType);
 
@@ -54,6 +91,12 @@ pub fn Admin(comptime IoType: type) type {
         state: State,
         /// Valid in `.sending`/`.draining`/`.closing` — the scrape client.
         socket: IoType.Socket,
+        /// The optional h3 status appender (`setStatusHook`): untyped
+        /// like every cross-plane seam, so this generic names no h3
+        /// type. Null in the simulator and wherever the config names no
+        /// h3 listener — the section then renders zero bytes.
+        status_ctx: ?*anyopaque,
+        status_append: ?*const fn (ctx: *anyopaque, buffer: []u8) usize,
         /// Absolute scrape deadline; a lazy tick-and-compare re-arms until
         /// it is due, then reaps (the §4 single-timer discipline).
         deadline_ns: u64,
@@ -123,10 +166,13 @@ pub fn Admin(comptime IoType: type) type {
             // of this buffer.
             admin.response = try arena.alloc(u8, response_head.len +
                 counters_module.Counters.render_bytes_max +
-                server.labeled.render_bytes_max);
+                server.labeled.render_bytes_max +
+                h3_listener_status_bytes_max);
             assert(admin.response.len <= std.math.maxInt(u32));
             admin.server = server;
             admin.bind_address = bind_address;
+            admin.status_ctx = null;
+            admin.status_append = null;
             admin.listening = false;
             admin.state = .off;
             admin.deadline_ns = 0;
@@ -150,6 +196,21 @@ pub fn Admin(comptime IoType: type) type {
             assert(admin.state == .off);
             assert(!admin.listening);
             admin.bind_address = bind_address;
+        }
+
+        /// Install the h3 listener-status appender before `start`. The
+        /// response buffer already reserves `h3_listener_status_bytes_max`
+        /// unconditionally (init ran before this), so the hook is pure
+        /// code — no budget answers to it.
+        pub fn setStatusHook(
+            admin: *Self,
+            ctx: *anyopaque,
+            append: *const fn (ctx: *anyopaque, buffer: []u8) usize,
+        ) void {
+            assert(admin.state == .off);
+            assert(!admin.listening);
+            admin.status_ctx = ctx;
+            admin.status_append = append;
         }
 
         /// Open the listener and arm the first accept, or stay off when no
@@ -267,7 +328,15 @@ pub fn Admin(comptime IoType: type) type {
                 &views,
                 admin.response[response_head.len + body.len ..],
             );
-            admin.response_len = @intCast(response_head.len + body.len + labeled.len);
+            var total = response_head.len + body.len + labeled.len;
+            if (admin.status_append) |append| {
+                const written = append(
+                    admin.status_ctx.?,
+                    admin.response[total..],
+                );
+                total += written;
+            }
+            admin.response_len = @intCast(total);
             admin.sent = 0;
             assert(admin.response_len >= response_head.len);
             assert(admin.response_len <= admin.response.len);

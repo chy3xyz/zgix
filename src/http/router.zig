@@ -51,6 +51,11 @@ pub const Route = struct {
     prefix: []const u8,
     header: ?HeaderMatch = null,
     cluster_index: u16,
+    /// Whether a request matched by this route is written to the access
+    /// log. Absent in config means true; a route may opt out of the line
+    /// without opting out of counters, metrics or the traffic itself —
+    /// nginx's `access_log off` at a location.
+    access_log: bool = true,
 };
 
 /// The cluster for a request's canonical `host` (null when the request
@@ -81,16 +86,28 @@ pub fn route(
     path: []const u8,
     headers: []const parser.Header,
 ) ?u16 {
+    const matched = find(routes, host, path, headers) orelse return null;
+    return matched.cluster_index;
+}
+
+/// The matched route itself, for the caller that needs more than the
+/// cluster — the access-log decision lives on the rule.
+pub fn find(
+    routes: []const Route,
+    host: ?[]const u8,
+    path: []const u8,
+    headers: []const parser.Header,
+) ?*const Route {
     assert(routes.len >= 1);
     assert(path.len >= 1);
     assert(path[0] == '/');
-    for (routes) |candidate| {
+    for (routes) |*candidate| {
         if (!hostMatches(candidate.host, host)) continue;
         if (candidate.header) |header_match| {
             if (!headerMatches(header_match, headers)) continue;
         }
         if (prefixMatches(candidate.prefix, path)) {
-            return candidate.cluster_index;
+            return candidate;
         }
     }
     return null;

@@ -2,6 +2,27 @@
     "listeners": [
         { "bind": "127.0.0.1:8080", "l4": { "cluster": "origin" } }
     ],
+    "h3_listeners": [
+        {
+            "bind": "127.0.0.1:4443",
+            "routes": [
+                { "prefix": "/", "cluster": "origin" }
+            ],
+            "tls": {
+                "cert": "src/tls/testdata/cert.pem",
+                "key": "src/tls/testdata/key.pem"
+            },
+            "error_pages": {
+                "no_route": "friendly-404"
+            }
+        }
+    ],
+    "bodies": {
+        "friendly-404": {
+            "inline": "nothing here matches your request",
+            "content_type": "text/plain"
+        }
+    },
     "clusters": {
         "origin": {
             "endpoints": ["127.0.0.1:9000", { "address": "127.0.0.1:9001", "weight": 3 }],

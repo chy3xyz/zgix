@@ -84,6 +84,13 @@ pub const HeaderName = enum(u8) {
     /// copies in O(1) like every other managed header, rather than
     /// comparing this spelling against every header of every request.
     x_forwarded_for,
+    /// The companion headers a `forwarded` block may also write: the
+    /// client address under its nginx spelling, and the scheme this
+    /// listener received. Tagged for the same suppression rule as
+    /// `x_forwarded_for` — if the proxy writes one, the client's copy
+    /// must not travel beside it.
+    x_real_ip,
+    x_forwarded_proto,
     /// RFC 9110 §7.6.2's hop budget, which an intermediary must check
     /// and *rewrite* rather than forward (#240). Tagged for the same
     /// reason `x_forwarded_for` is: the render suppresses the inbound
@@ -99,7 +106,7 @@ pub const HeaderName = enum(u8) {
             // it travels the whole chain — and what each hop owes it is a
             // *decrement*, not removal (#240); stripping it would tell the
             // next hop the budget was never set.
-            .other, .host, .content_length, .transfer_encoding, .x_forwarded_for, .max_forwards => false,
+            .other, .host, .content_length, .transfer_encoding, .x_forwarded_for, .x_real_ip, .x_forwarded_proto, .max_forwards => false,
         };
     }
 
@@ -116,7 +123,7 @@ pub const HeaderName = enum(u8) {
             // no framing and unroutes nothing, which is what this list is
             // for. What a filter must not do to it is a different rule,
             // enforced where filters are compiled.
-            .other, .connection, .keep_alive, .proxy_connection, .te, .upgrade, .x_forwarded_for, .max_forwards => false,
+            .other, .connection, .keep_alive, .proxy_connection, .te, .upgrade, .x_forwarded_for, .x_real_ip, .x_forwarded_proto, .max_forwards => false,
         };
     }
 
@@ -134,6 +141,8 @@ pub const HeaderName = enum(u8) {
             .te => "te",
             .upgrade => "upgrade",
             .x_forwarded_for => "x-forwarded-for",
+            .x_real_ip => "x-real-ip",
+            .x_forwarded_proto => "x-forwarded-proto",
             .max_forwards => "max-forwards",
         };
     }
@@ -159,7 +168,12 @@ pub fn classifyHeaderName(name: []const u8) HeaderName {
         14 => if (eql(name, "content-length")) .content_length else .other,
         15 => if (eql(name, "x-forwarded-for")) .x_forwarded_for else .other,
         16 => if (eql(name, "proxy-connection")) .proxy_connection else .other,
-        17 => if (eql(name, "transfer-encoding")) .transfer_encoding else .other,
+        9 => if (eql(name, "x-real-ip")) .x_real_ip else .other,
+        17 => length_17: {
+            if (eql(name, "transfer-encoding")) break :length_17 .transfer_encoding;
+            if (eql(name, "x-forwarded-proto")) break :length_17 .x_forwarded_proto;
+            break :length_17 .other;
+        },
         else => .other,
     };
     return tag;
@@ -175,8 +189,9 @@ comptime {
     // postcondition in `classifyHeaderName` cost ~540 instructions per
     // request — it is decidable here for free, and a runtime assert on a
     // fact the compiler already knows is the expensive way to be sure.
-    for (@typeInfo(HeaderName).@"enum".fields) |field| {
-        const tag: HeaderName = @enumFromInt(field.value);
+    const info = @typeInfo(HeaderName).@"enum";
+    for (info.field_values) |value| {
+        const tag: HeaderName = @fromBackingInt(@intCast(value));
         if (tag == .other) continue;
         assert(classifyHeaderName(tag.text()) == tag);
     }
@@ -613,8 +628,8 @@ pub fn parseResponseHead(
 /// why no "this name was truncated" flag is needed anywhere.
 const trailer_name_bytes_max: u8 = trailer_name_bytes: {
     var longest: u8 = 0;
-    for (@typeInfo(HeaderName).@"enum".fields) |field| {
-        const tag: HeaderName = @enumFromInt(field.value);
+    for (@typeInfo(HeaderName).@"enum".field_values) |value| {
+        const tag: HeaderName = @fromBackingInt(@intCast(value));
         longest = @max(longest, tag.text().len);
     }
     break :trailer_name_bytes longest + 1;
@@ -624,8 +639,8 @@ comptime {
     // The property above, said where a reviewer can check it: every
     // managed spelling fits with a byte to spare, so "the buffer filled"
     // and "longer than any managed name" are the same statement.
-    for (@typeInfo(HeaderName).@"enum".fields) |field| {
-        const tag: HeaderName = @enumFromInt(field.value);
+    for (@typeInfo(HeaderName).@"enum".field_values) |value| {
+        const tag: HeaderName = @fromBackingInt(@intCast(value));
         assert(tag.text().len < trailer_name_bytes_max);
     }
 }
@@ -949,6 +964,62 @@ pub fn headerValue(headers: []const Header, name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Whether the request's `Accept-Encoding` field list makes `gzip` an
+/// acceptable coding (RFC 9110 §12.5.3).
+///
+/// Parsed once, where the head is parsed, because the answer is a
+/// one-bit fact about this request and the head bytes are gone by the
+/// time a static answer renders. An explicit `gzip` entry overrides the
+/// `*` wildcard; `q=0` declines, and an unstated quality is 1. The loops
+/// are bounded by the header list and each value's commas — both are
+/// capped by the parser's own head limits.
+pub fn acceptsGzip(headers: []const Header) bool {
+    var gzip_seen = false;
+    var gzip_ok = false;
+    var wildcard_ok = false;
+    for (headers) |header| {
+        assert(header.name.len >= 1);
+        if (!std.ascii.eqlIgnoreCase(header.name, "accept-encoding")) continue;
+        var codings = std.mem.splitScalar(u8, header.value, ',');
+        while (codings.next()) |raw_coding| {
+            const coding = std.mem.trim(u8, raw_coding, " \t");
+            if (coding.len == 0) continue;
+            const semicolon = std.mem.indexOfScalar(u8, coding, ';') orelse coding.len;
+            const name = std.mem.trim(u8, coding[0..semicolon], " \t");
+            if (std.ascii.eqlIgnoreCase(name, "gzip")) {
+                gzip_seen = true;
+                gzip_ok = gzip_ok or codingQualityPositive(coding[semicolon..]);
+            } else if (std.mem.eql(u8, name, "*")) {
+                wildcard_ok = wildcard_ok or codingQualityPositive(coding[semicolon..]);
+            }
+        }
+    }
+    // Explicit wins over wildcard in both directions: `gzip;q=0, *`
+    // means gzip was named and refused, not that the wildcard revives
+    // it. With no explicit entry the wildcard speaks for it.
+    return if (gzip_seen) gzip_ok else wildcard_ok;
+}
+
+/// Whether one coding's parameter list (the text from `;` onward, or
+/// empty) allows it: false only for a `q` parameter whose value is zero
+/// or unparseable. Other parameters are ignored — this asks the single
+/// question a static answer needs, not a full content-negotiation
+/// engine.
+fn codingQualityPositive(parameters: []const u8) bool {
+    var params = std.mem.splitScalar(u8, parameters, ';');
+    while (params.next()) |raw_param| {
+        const param = std.mem.trim(u8, raw_param, " \t");
+        if (param.len == 0) continue;
+        const equals = std.mem.indexOfScalar(u8, param, '=') orelse continue;
+        const name = std.mem.trim(u8, param[0..equals], " \t");
+        if (!std.ascii.eqlIgnoreCase(name, "q")) continue;
+        const value = std.mem.trim(u8, param[equals + 1 ..], " \t");
+        const quality = std.fmt.parseFloat(f32, value) catch return false;
+        return quality > 0;
+    }
+    return true;
+}
+
 /// The value of the named cookie in the request's Cookie header, or null
 /// when the request carries none (#178). Reads the first Cookie header
 /// only — RFC 6265 has user agents send exactly one — and scans its
@@ -1082,7 +1153,7 @@ fn foldHeader(
         // `maxForwards` below — parsing it for every request would
         // let a garbage value on a POST reject a request the spec
         // says may ignore the field entirely (#240).
-        .other, .keep_alive, .proxy_connection, .te, .upgrade, .x_forwarded_for, .max_forwards => {},
+        .other, .keep_alive, .proxy_connection, .te, .upgrade, .x_forwarded_for, .x_real_ip, .x_forwarded_proto, .max_forwards => {},
     }
 }
 
@@ -1752,6 +1823,16 @@ fn hexDigitValue(byte: u8) u4 {
 
 const testing = std.testing;
 
+/// Zig 0.17 removed array multiplication (`a ** n`). Fixtures that need a
+/// repeated multi-byte sequence spell it out once here.
+fn repeatBytes(comptime bytes: []const u8, comptime times: usize) [bytes.len * times]u8 {
+    var result: [bytes.len * times]u8 = undefined;
+    for (0..times) |i| {
+        @memcpy(result[i * bytes.len ..][0..bytes.len], bytes);
+    }
+    return result;
+}
+
 fn expectRequestError(expected: HeadError, head: []const u8, head_is_full: bool) !void {
     var storage: HeaderStorage = undefined;
     try testing.expectError(expected, parseRequestHead(head, head_is_full, &storage, null));
@@ -2139,7 +2220,7 @@ test "http parser: partial heads are Incomplete until the buffer fills" {
 }
 
 test "http parser: header-array overflow is 431-class, not 400" {
-    const head = "GET / HTTP/1.1\r\nHost: a\r\n" ++ ("X-Filler: 1\r\n" ** constants.headers_max) ++ "\r\n";
+    const head = "GET / HTTP/1.1\r\nHost: a\r\n" ++ repeatBytes("X-Filler: 1\r\n", constants.headers_max) ++ "\r\n";
     try expectRequestError(error.HeadTooLarge, head, false);
 }
 
@@ -2225,6 +2306,42 @@ test "http parser: header helpers are case-insensitive" {
     try testing.expect(tokenListHas("close", "CLOSE"));
     try testing.expect(!tokenListHas("closed", "close"));
     try testing.expect(!tokenListHas("", "close"));
+}
+
+test "http parser: Accept-Encoding selects gzip only when its q allows" {
+    const Case = struct { value: []const u8, accepted: bool };
+    for ([_]Case{
+        .{ .value = "gzip", .accepted = true },
+        .{ .value = "GZip", .accepted = true },
+        .{ .value = "deflate, gzip;q=0.5", .accepted = true },
+        .{ .value = "gzip;q=0", .accepted = false },
+        .{ .value = "*", .accepted = true },
+        .{ .value = "*;q=1", .accepted = true },
+        // The wildcard cannot revive an explicitly refused gzip.
+        .{ .value = "gzip;q=0, *", .accepted = false },
+        // Nor can it add one the client did not name only when refused.
+        .{ .value = "*;q=0", .accepted = false },
+        .{ .value = "identity", .accepted = false },
+        .{ .value = "", .accepted = false },
+        // A malformed quality is treated as declining, never as a yes.
+        .{ .value = "gzip;q=wat", .accepted = false },
+    }) |case| {
+        const headers = [_]Header{
+            Header.init("Host", "example"),
+            Header.init("Accept-Encoding", case.value),
+        };
+        try testing.expectEqual(case.accepted, acceptsGzip(&headers));
+    }
+    // No field at all is the common case and means plain only.
+    const none = [_]Header{Header.init("Host", "example")};
+    try testing.expect(!acceptsGzip(&none));
+    // Multiple field lines are one list (RFC 9110 §5.3): a refusal and
+    // an acceptance split across lines still accepts.
+    const split = [_]Header{
+        Header.init("accept-encoding", "gzip;q=0"),
+        Header.init("Accept-Encoding", "br, gzip;q=1"),
+    };
+    try testing.expect(acceptsGzip(&split));
 }
 
 test "http parser: cookieValue finds its crumb, byte-exactly" {
@@ -2370,7 +2487,7 @@ test "chunked: an ordinary trailer still forwards, however long its name (#244)"
     // past the buffer keeps only a prefix, and the prefix must classify
     // `.other` exactly as the whole name does — a truncation that could
     // collide with a managed spelling would refuse a legal trailer.
-    const long_name = "X-" ++ ("a" ** (trailer_name_bytes_max * 2));
+    const long_name = "X-" ++ @as([trailer_name_bytes_max * 2]u8, @splat('a'));
     const bodies = [_][]const u8{
         "0\r\nX-Checksum: 3f21\r\n\r\n",
         "0\r\nX-Checksum: 3f21\r\nX-Signature: ab\r\n\r\n",
@@ -2418,7 +2535,7 @@ test "chunked: framing violations are malformed" {
 
 test "chunked: size lines and trailers hit their static bounds" {
     // A size line longer than the bound (extensions included).
-    const long_line = "1;" ++ ("e" ** constants.chunked_line_bytes_max) ++ "\r\na\r\n0\r\n\r\n";
+    const long_line = "1;" ++ @as([constants.chunked_line_bytes_max]u8, @splat('e')) ++ "\r\na\r\n0\r\n\r\n";
     try testing.expectEqual(
         @as(?ChunkedScanner.Error, error.Oversize),
         chunkedOutcome(long_line, long_line.len).failure,
@@ -2432,7 +2549,7 @@ test "chunked: size lines and trailers hit their static bounds" {
     // A trailer section past its bound.
     const trailer_line = "X-Filler: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n";
     const repeats = constants.chunked_trailer_bytes_max / trailer_line.len + 1;
-    const long_trailer = "0\r\n" ++ (trailer_line ** repeats) ++ "\r\n";
+    const long_trailer = "0\r\n" ++ repeatBytes(trailer_line, repeats) ++ "\r\n";
     try testing.expectEqual(
         @as(?ChunkedScanner.Error, error.Oversize),
         chunkedOutcome(long_trailer, long_trailer.len).failure,

@@ -24,6 +24,7 @@ const std = @import("std");
 
 const zoxy = @import("zoxy");
 const build_options = @import("build_options");
+const h3_runtime = @import("h3_runtime.zig");
 
 const XevIo = zoxy.Io.XevIo;
 const ServerXev = zoxy.Server(XevIo);
@@ -153,6 +154,39 @@ fn serve(init: std.process.Init, arena: std.mem.Allocator, config_path: []const 
     if (resources.tls_credentials.len > 0) {
         server.setTlsCredentials(resources.tls_credentials);
     }
+    if (resources.upstream_tls.len > 0) {
+        server.setClusterTls(resources.upstream_tls);
+    }
+    // Bind the UDP listeners before TCP `start`, so a bad QUIC identity
+    // stops the process before it accepts a byte of HTTP/1.1. The receive
+    // is armed by `Runtime.start` below, once the loop is ready to drive
+    // it; both protocols then share `global_io.run()`. The runtime borrows
+    // the process counters and the access log, so every h3 witness renders
+    // through the same `/metrics`, exit tally and sink as the HTTP/1.1
+    // traffic — `Server` never learns the h3 path exists.
+    var h3 = try initH3Runtime(
+        arena,
+        &global_io,
+        &config,
+        resources.h3_credentials,
+        resources.upstream_tls,
+        &server,
+    );
+    // The admin scrape carries the h3 listener-status section: the
+    // runtime appends its per-listener rows into the response buffer the
+    // admin already reserved for it. Untyped pointer, like the witness
+    // seam — the admin plane names no h3 type.
+    if (h3) |*runtime| {
+        server.admin.setStatusHook(runtime, h3_runtime.Runtime.statusAppend);
+    }
+    var reload_context: TlsReloadContext = undefined;
+    if (resources.tls_store) |store| {
+        reload_context = .{ .server = &server, .store = store };
+        server.setSighupHook(.{
+            .context = &reload_context,
+            .reload = reloadTls,
+        });
+    }
     // Before `start`, which is a change #311 forced and an improvement on
     // its own terms. The serving watchdog is armed at the end of `start`,
     // and the seam refuses to arm an alarm whose handler is not installed
@@ -163,12 +197,53 @@ fn serve(init: std.process.Init, arena: std.mem.Allocator, config_path: []const 
     // killed a process mid-bind.
     installSignalHandlers();
     try server.start();
+    if (h3) |*runtime| {
+        runtime.start();
+        var index: usize = 0;
+        while (index < runtime.listenerCount()) : (index += 1) {
+            std.debug.print("  h3       udp {f} (QUIC, buffered proxy)\n", .{
+                runtime.boundAddress(index),
+            });
+        }
+    }
 
     try global_io.run();
+    if (h3) |*runtime| runtime.stop();
 
     // The loop only stops after a completed drain (§8).
     assert(server.isIdle());
     server.dumpMetrics();
+}
+
+/// Bind every configured HTTP/3 listener, or null when the config names
+/// none. The log the h3 witness writes through is the TCP path's own:
+/// one sink, one pair of staging buffers, one drain gate — null when the
+/// config names no sink, and the witness hook is counters-only. A bind
+/// failure names itself on stderr and stops the start, like every other
+/// startup refusal.
+fn initH3Runtime(
+    arena: std.mem.Allocator,
+    io: *XevIo,
+    config: *const zoxy.config.Config,
+    credentials: []const h3_runtime.Credential,
+    upstream_tls: []const ?zoxy.tls.ClusterTls.Runtime,
+    server: *ServerXev,
+) !?h3_runtime.Runtime {
+    if (config.h3_listeners.len == 0) return null;
+    var access_log: ?*ServerXev.AccessLogType = null;
+    if (config.access_log_sink != null) access_log = &server.access_log;
+    return h3_runtime.Runtime.init(
+        arena,
+        io,
+        config,
+        credentials,
+        upstream_tls,
+        &server.counters,
+        access_log,
+    ) catch |err| {
+        std.debug.print("zoxy: cannot start HTTP/3 listeners: {t}\n", .{err});
+        return err;
+    };
 }
 
 /// Everything a start takes from the box before the loop exists.
@@ -177,7 +252,17 @@ const StartupResources = struct {
     log_sink_fd: @TypeOf(XevIo.log_sink_stdout),
     /// One slot per listener, null where the listener is plaintext —
     /// empty when nothing terminates TLS.
-    tls_credentials: []const ?zoxy.tls.Credentials,
+    tls_credentials: []const ?zoxy.tls.CredentialSet,
+    /// The bounded rotation store, absent when no listener terminates.
+    /// Kept past startup because SIGHUP reloads into its next generation.
+    tls_store: ?*zoxy.tls.CredentialStore,
+    /// One runtime per cluster, in config order, null where the cluster
+    /// dials plaintext — empty when no cluster carries upstream TLS.
+    /// Owned here for the process's life; the serving path borrows it.
+    upstream_tls: []const ?zoxy.tls.ClusterTls.Runtime,
+    /// PEM bytes for every configured HTTP/3 listener, parallel to
+    /// `config.h3_listeners`. Empty when the QUIC path is off.
+    h3_credentials: []const h3_runtime.Credential,
 };
 
 /// The §5/§8 startup gauntlet: raise `RLIMIT_NOFILE` to the demand, open
@@ -211,9 +296,187 @@ fn openStartupResources(
     // config named a file, so open it while a failure can still name it
     // and stop the process, rather than surfacing as a broken connection
     // under traffic (§4).
-    const tls_credentials = try loadTlsCredentials(io, arena, config);
-    assert(tls_credentials.len == 0 or tls_credentials.len == config.listeners.len);
-    return .{ .log_sink_fd = log_sink_fd, .tls_credentials = tls_credentials };
+    //
+    // One install serves both directions: listener credentials and
+    // upstream client credentials are parsed by the same libcrypto, so
+    // the fixed heap must be in place before either loader runs.
+    if (libcryptoNeeded(config)) try installLibcryptoHeap();
+    const tls = try openTlsCredentials(io, arena, config);
+    assert(tls.credentials.len == 0 or tls.credentials.len == config.listeners.len);
+    const upstream_tls = try openClusterTls(io, arena, config);
+    assert(upstream_tls.len == 0 or upstream_tls.len == config.clusters.len);
+    // HTTP/3 requires QUIC-TLS, so its PEMs are part of the same gauntlet
+    // as a TCP listener's: read here, where a bad file stops the process
+    // and `--check` gives the same verdict.
+    const h3_credentials = try openH3Credentials(io, arena, config);
+    return .{
+        .log_sink_fd = log_sink_fd,
+        .tls_credentials = tls.credentials,
+        .tls_store = tls.store,
+        .upstream_tls = upstream_tls,
+        .h3_credentials = h3_credentials,
+    };
+}
+
+/// Read every HTTP/3 listener's certificate and key. The loader has
+/// already refused an h3 listener without both and two listeners naming
+/// different paths, so this is a bounded read of one identity.
+fn openH3Credentials(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    config: *const zoxy.config.Config,
+) ![]const h3_runtime.Credential {
+    if (config.h3_listeners.len == 0) return &.{};
+    const credentials = try arena.alloc(h3_runtime.Credential, config.h3_listeners.len);
+    for (config.h3_listeners, 0..) |listener, index| {
+        credentials[index] = .{
+            .cert_pem = try readH3Pem(io, arena, index, "certificate", listener.cert_path),
+            .key_pem = try readH3Pem(io, arena, index, "key", listener.key_path),
+        };
+    }
+    return credentials;
+}
+
+fn readH3Pem(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    listener_index: usize,
+    kind: []const u8,
+    path: []const u8,
+) ![]const u8 {
+    return std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        arena,
+        .limited(zoxy.constants.tls_pem_bytes_max),
+    ) catch |err| {
+        std.debug.print(
+            "zoxy: h3 listener {d}: cannot read {s} '{s}': {t}\n",
+            .{ listener_index, kind, path, err },
+        );
+        return err;
+    };
+}
+
+const TlsResources = struct {
+    credentials: []const ?zoxy.tls.CredentialSet,
+    store: ?*zoxy.tls.CredentialStore,
+};
+
+/// Whether this config names libcrypto at all: a listener terminating
+/// TLS or a cluster dialing it. Either direction parses credentials, and
+/// the allocator swap is refused once anything has allocated.
+fn libcryptoNeeded(config: *const zoxy.config.Config) bool {
+    if (config.limits.tls_engines > 0) return true;
+    for (config.clusters) |cluster| {
+        if (cluster.tls != null) return true;
+    }
+    return false;
+}
+
+/// Install the fixed libcrypto heap exactly once, before any credential
+/// is parsed. If it fails the zero-allocation promise (§5) is unbacked,
+/// and a proxy that cannot keep its own invariants should not start.
+fn installLibcryptoHeap() error{LibcryptoHeapUnavailable}!void {
+    if (zoxy.tls.libcrypto_heap.install(&libcrypto_heap_storage)) return;
+    std.debug.print(
+        "zoxy: libcrypto refused the fixed-heap install; " ++
+            "the zero-allocation budget (DESIGN.md §5) cannot be kept\n",
+        .{},
+    );
+    return error.LibcryptoHeapUnavailable;
+}
+
+/// Load the initial certificate generation into the rotation store. No
+/// TLS listener means no store; the heap is the caller's either way,
+/// because upstream TLS may be the only thing that needs it.
+fn openTlsCredentials(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    config: *const zoxy.config.Config,
+) !TlsResources {
+    assert(config.listeners.len >= 1);
+    if (config.limits.tls_engines == 0) return .{ .credentials = &.{}, .store = null };
+
+    const plans = try arena.alloc(zoxy.tls.CredentialStore.ListenerPlan, config.listeners.len);
+    var tls_listeners: usize = 0;
+    for (config.listeners, 0..) |listener, index| {
+        const tls = listener.tls orelse {
+            plans[index] = null;
+            continue;
+        };
+        assert(tls.certificates.len >= 1);
+        assert(tls.certificates.len <= zoxy.constants.tls_certificates_max);
+        const paths = try arena.alloc(
+            zoxy.tls.CredentialStore.CertificatePath,
+            tls.certificates.len,
+        );
+        for (tls.certificates, 0..) |certificate, cert_index| {
+            paths[cert_index] = .{
+                .cert_path = certificate.cert_path,
+                .key_path = certificate.key_path,
+                .names = certificate.names,
+            };
+        }
+        plans[index] = paths;
+        tls_listeners += 1;
+    }
+    // No listener terminates: the heap may still have been installed for
+    // upstream TLS, but there is no rotation store to build.
+    if (tls_listeners == 0) return .{ .credentials = &.{}, .store = null };
+
+    const read_context = try arena.create(ReloadReadContext);
+    read_context.* = .{ .io = io };
+    const reader: zoxy.tls.CredentialStore.Reader = .{
+        .context = read_context,
+        .read = readTlsPem,
+    };
+    const store = try arena.create(zoxy.tls.CredentialStore);
+    store.* = try zoxy.tls.CredentialStore.init(arena, plans, reader, .{});
+    const credentials = store.initial() catch |err| {
+        std.debug.print(
+            "zoxy: listener {d} certificate {d}: {t}\n",
+            .{ store.last_listener, store.last_certificate, err },
+        );
+        return err;
+    };
+    std.debug.print(
+        "  tls reload  {d} KiB reserved for {d} certificate generation(s) across {d} listener(s)\n",
+        .{
+            zoxy.tls.CredentialStore.reservedBytes(tls_listeners) / 1024,
+            zoxy.constants.tls_reload_generations_max,
+            tls_listeners,
+        },
+    );
+    return .{ .credentials = credentials, .store = store };
+}
+
+/// Load one runtime per cluster, in config order, so the server can index
+/// this exactly as it indexes `config.clusters`. Empty when no cluster
+/// carries upstream TLS.
+fn openClusterTls(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    config: *const zoxy.config.Config,
+) ![]const ?zoxy.tls.ClusterTls.Runtime {
+    var tls_clusters: usize = 0;
+    for (config.clusters) |cluster| {
+        if (cluster.tls != null) tls_clusters += 1;
+    }
+    if (tls_clusters == 0) return &.{};
+
+    const runtimes = try arena.alloc(?zoxy.tls.ClusterTls.Runtime, config.clusters.len);
+    @memset(runtimes, null);
+    errdefer {
+        for (runtimes) |*runtime| {
+            if (runtime.*) |*loaded| loaded.deinit();
+        }
+    }
+    for (config.clusters, 0..) |cluster, index| {
+        const tls = cluster.tls orelse continue;
+        runtimes[index] = try zoxy.tls.ClusterTls.load(arena, io, tls);
+    }
+    return runtimes;
 }
 
 /// What `--check` exits with (#301). Three answers rather than two,
@@ -267,7 +530,7 @@ fn checkConfig(init: std.process.Init, arena: std.mem.Allocator, config_path: []
     // The one failure with no budget to report: nothing was loaded, so
     // there is no config to price and this arm answers without a banner.
     const config = readConfig(init.io, arena, config_path) catch |err|
-        return @intFromEnum(checkExitFor(err));
+        return @backingInt(checkExitFor(err));
     const config_arena_bytes = init.arena.queryCapacity() - arena_before;
     const demands = BudgetXev.demandsFor(&config);
     assert(demands.fds > 0);
@@ -285,7 +548,7 @@ fn checkConfig(init: std.process.Init, arena: std.mem.Allocator, config_path: []
         .nofile = nofile,
         .verdict = verdict,
     });
-    return @intFromEnum(verdict);
+    return @backingInt(verdict);
 }
 
 /// Ask the box for exactly what a start asks it for, and give it back.
@@ -478,80 +741,58 @@ const BodyFileContext = struct {
 /// which is when it is actually used.
 var libcrypto_heap_storage: [zoxy.constants.libcrypto_heap_bytes]u8 align(16) = undefined;
 
-/// Turn each listener's configured certificate paths into loaded
-/// credentials (§4), one slot per listener and null where the listener is
-/// plaintext. Startup-only: the arena owns the decoded chains for the
-/// process, and every engine on a listener borrows that listener's entry.
-///
-/// This is where a bad certificate stops the proxy. The alternative —
-/// discovering it on the first handshake — turns a typo into an outage
-/// that only shows up under traffic, and reports it as a failed
-/// connection rather than as the config being wrong.
-fn loadTlsCredentials(
+/// Where a SIGHUP reload reads its PEMs. The Io interface is the one the
+/// process was started with; certificate reload runs in the loop, so it
+/// blocks for the duration of a read — a handful of small files.
+const ReloadReadContext = struct {
     io: std.Io,
-    arena: std.mem.Allocator,
-    config: *const zoxy.config.Config,
-) ![]const ?zoxy.tls.Credentials {
-    assert(config.listeners.len >= 1);
-    if (config.limits.tls_engines == 0) {
-        // No listener terminates TLS: nothing to load, and — the point of
-        // checking here — no libcrypto heap to reserve either.
-        return &.{};
-    }
+};
 
-    // Before any credential, because `Credentials.load` calls libcrypto
-    // and the allocator swap is refused once anything has allocated. If
-    // it fails the zero-allocation promise (§5) is unbacked, and a proxy
-    // that cannot keep its own invariants should not start.
-    if (!zoxy.tls.libcrypto_heap.install(&libcrypto_heap_storage)) {
-        std.debug.print(
-            "zoxy: libcrypto refused the fixed-heap install; " ++
-                "the zero-allocation budget (DESIGN.md §5) cannot be kept\n",
-            .{},
-        );
-        return error.LibcryptoHeapUnavailable;
-    }
-
-    const credentials = try arena.alloc(?zoxy.tls.Credentials, config.listeners.len);
-    for (config.listeners, 0..) |listener, index| {
-        const tls = listener.tls orelse {
-            credentials[index] = null;
-            continue;
-        };
-        const cert_pem = try readPemFile(io, arena, tls.cert_path);
-        const key_pem = try readPemFile(io, arena, tls.key_path);
-        credentials[index] = zoxy.tls.Credentials.load(arena, cert_pem, key_pem, .{}) catch |err| {
-            // Which listener and which verdict: the paths are right here,
-            // and an operator with several listeners needs to know which
-            // one to look at.
-            std.debug.print(
-                "zoxy: listener {d} cannot use '{s}' + '{s}': {t}\n",
-                .{ index, tls.cert_path, tls.key_path, err },
-            );
-            return err;
-        };
-    }
-    // One slot per listener, in listener order: `Server.credentialsFor`
-    // indexes this by listener index, so a table of any other length would
-    // hand some listener another's key or none at all.
-    assert(credentials.len == config.listeners.len);
-    return credentials;
+/// Read one PEM into the store's fixed-buffer allocator, refused past
+/// `tls_pem_bytes_max`. The bound's job is to turn "the operator pointed
+/// at the wrong file" into a named error rather than an arena the size of
+/// whatever was on disk.
+fn readTlsPem(
+    context: *anyopaque,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) zoxy.tls.CredentialStore.ReadError![]const u8 {
+    assert(path.len >= 1);
+    const reload: *const ReloadReadContext = @ptrCast(@alignCast(context));
+    return std.Io.Dir.cwd().readFileAlloc(
+        reload.io,
+        path,
+        allocator,
+        .limited(zoxy.constants.tls_pem_bytes_max),
+    ) catch |err| switch (err) {
+        error.StreamTooLong => error.FileTooLarge,
+        error.OutOfMemory => error.OutOfMemory,
+        else => |remaining| {
+            std.debug.print("zoxy: cannot read TLS file '{s}': {t}\n", .{ path, remaining });
+            return error.FileUnreadable;
+        },
+    };
 }
 
-/// One PEM file into the arena, bounded. The bound's job is to turn "the
-/// operator pointed at the wrong file" into a named error rather than an
-/// arena the size of whatever was on disk.
-fn readPemFile(io: std.Io, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
-    assert(path.len >= 1);
-    return std.Io.Dir.cwd().readFileAlloc(
-        io,
-        path,
-        arena,
-        .limited(zoxy.constants.tls_pem_bytes_max),
-    ) catch |err| {
-        std.debug.print("zoxy: cannot read TLS file '{s}': {t}\n", .{ path, err });
-        return err;
+const TlsReloadContext = struct {
+    server: *ServerXev,
+    store: *zoxy.tls.CredentialStore,
+};
+
+/// SIGHUP's second job: load the next certificate generation and hand it
+/// to the server. A failure is logged and the previous generation stays
+/// active — a bad new certificate must not take the listener down.
+fn reloadTls(context: *anyopaque) void {
+    const reload: *TlsReloadContext = @ptrCast(@alignCast(context));
+    const sets = reload.store.reload() catch |err| {
+        std.debug.print(
+            "zoxy: certificate reload failed at listener {d}, certificate {d}: {t}; keeping the previous set\n",
+            .{ reload.store.last_listener, reload.store.last_certificate, err },
+        );
+        return;
     };
+    reload.server.setTlsCredentials(sets);
+    std.debug.print("zoxy: certificate set reloaded\n", .{});
 }
 
 /// The loader's `FileSource.read` against the real filesystem: whole
@@ -661,8 +902,9 @@ const help_text =
     \\Signals:
     \\  SIGTERM, SIGINT   Drain in-flight connections, then exit 0. The
     \\                    counters are printed once on the way out.
-    \\  SIGHUP            Reopen the access log's file sink (rotation).
-    \\                    No other meaning: config changes are a restart.
+    \\  SIGHUP            Reopen the access log's file sink (rotation),
+    \\                    and reload the TLS certificate set. Config
+    \\                    changes other than certificates are a restart.
     \\  SIGUSR1           Ignored. It printed the counters until they moved
     \\                    to the admin listener's /metrics, which frames each
     \\                    rendering as its own response.
@@ -914,9 +1156,9 @@ test "checkExitFor: the box's refusals are told from the config's" {
     try testing.expectEqual(CheckExit.invalid_config, checkExitFor(error.MissingField));
     // The codes themselves are the CI contract, so they are asserted
     // rather than left to the declaration order.
-    try testing.expectEqual(@as(u8, 0), @intFromEnum(CheckExit.ok));
-    try testing.expectEqual(@as(u8, 1), @intFromEnum(CheckExit.invalid_config));
-    try testing.expectEqual(@as(u8, 2), @intFromEnum(CheckExit.does_not_fit));
+    try testing.expectEqual(@as(u8, 0), @backingInt(CheckExit.ok));
+    try testing.expectEqual(@as(u8, 1), @backingInt(CheckExit.invalid_config));
+    try testing.expectEqual(@as(u8, 2), @backingInt(CheckExit.does_not_fit));
 }
 
 test "rlimitText: an infinite limit reads as one" {

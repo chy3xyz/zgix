@@ -475,7 +475,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         // buffer with no newline in sight: 414, not 431. The §5 head
         // ring gates the read before any byte accumulates, so its 503
         // can precede the verdict.
-        .request = "GET /" ++ ("a" ** 8500) ++ " HTTP/1.1\r\nHost: sim\r\n\r\n",
+        .request = "GET /" ++ @as([8500]u8, @splat('a')) ++ " HTTP/1.1\r\nHost: sim\r\n\r\n",
         .expected_responses = 1,
         .transcript_cap = 1,
         .golden_status = 414,

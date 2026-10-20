@@ -5,6 +5,9 @@
 
 const std = @import("std");
 
+const conn_limit = @import("conn_limit.zig");
+const rate_limit = @import("rate_limit.zig");
+
 const assert = std.debug.assert;
 
 /// The single dedicated admin/metrics listener (DESIGN.md §8): separate
@@ -129,18 +132,12 @@ pub const relay_buffer_bytes_min: u32 = 1024;
 
 /// Ceiling, and it is an IMPLEMENTATION bound rather than a protocol one.
 /// RFC 8446 §5.1 caps a RECORD at 2^14, not a buffer;
-/// `ResponseBodyPolicy.transformOut` hands a whole relay chunk to
-/// `Engine.sendApp` with no loop around it, so on a *terminating* listener
-/// one chunk is one record and a buffer past `tls_app_chunk_bytes` has
-/// nowhere to go. That was once the reason this number was 16 KiB for
-/// everyone; the bound is conditional now, which is the second of the two
-/// exits the previous comment named. A config whose listeners all speak
-/// plaintext may take the full ceiling here; one that terminates TLS is
-/// refused above `tls_app_chunk_bytes` at load
-/// (`LimitRelayBufferOverTlsRecord`) rather than emitting a record no peer
-/// may accept — §5's rule that a shape which cannot serve is a config
-/// error, not a runtime surprise. Chunking inside the transform is the
-/// other exit and stays open; it would retire that refusal.
+/// Every transform that encrypts chunks at `tls_app_chunk_bytes` — the
+/// head channel, both body legs, and the tunnel relay — so a terminating
+/// listener may take the full ceiling here just as a plaintext one does.
+/// The old conditional refusal (`LimitRelayBufferOverTlsRecord`) retired
+/// when the last of those transforms grew its loop: a wide buffer no
+/// longer implies a record no peer may accept.
 ///
 /// 32 KiB because the relay buffer sets how many event-loop round trips a
 /// body costs, and the large-body band is where that is visible: a 100 KiB
@@ -306,6 +303,25 @@ comptime {
 /// tripping a staging assert against the first client to connect.
 pub const tls_cert_chain_bytes_max: u32 = 8 * 1024;
 
+/// The most certificate/key pairs one TLS listener may carry (§4). SNI
+/// selection scans the set per handshake with no allocation; 16 covers a
+/// multi-tenant edge while keeping the config arena and the scan bounded.
+/// A larger set is refused at load rather than silently truncated.
+pub const tls_certificates_max: u32 = 16;
+
+/// How many certificate-set generations a process may hold: the initial
+/// load plus three SIGHUP rotations. A generation is never freed while the
+/// process runs — a handshake already in flight holds its credentials by
+/// pointer — so the bound is what keeps certificate rotation from turning
+/// into an unbounded arena. Past it a reload is refused and the operator
+/// restarts, which is the same answer a config change gets (§1).
+pub const tls_reload_generations_max: u8 = 4;
+
+comptime {
+    assert(tls_certificates_max >= 1);
+    assert(tls_reload_generations_max >= 1);
+}
+
 comptime {
     // A single P-256 leaf is ~450 bytes of DER; below a kilobyte the
     // limit would reject certificates that every other proxy serves.
@@ -322,6 +338,19 @@ comptime {
 /// hand back from a single record, so every buffer the engine decrypts
 /// into is sized from it.
 pub const tls_record_plaintext_bytes_max: u32 = 16 * 1024;
+
+/// The most wire bytes one TLS record can occupy: the 5-byte header, the
+/// plaintext, zssl's 256-byte allowance for TLS 1.3 padding, and the
+/// AEAD tag inside that allowance. Pinned against zssl's own
+/// `wire_record_bytes_max` in `UpstreamTls.zig`, which is the engine that
+/// has to hold a whole record before it can decrypt.
+///
+/// This is also the bound on how much plaintext *one drive step* may
+/// yield on the upstream leg. That engine's record buffer holds at most
+/// this many wire bytes, and every record it hands to a sink strips its
+/// own overhead, so a destination this wide can never be overrun — even
+/// when a full record and a small one complete inside the same read.
+pub const tls_record_wire_bytes_max: u32 = tls_record_plaintext_bytes_max + 256 + 5;
 
 /// The most ciphertext one TLS read takes off the socket. A cap, not a
 /// capability: the engine's record buffer holds more, but what a single
@@ -340,12 +369,10 @@ pub const tls_read_chunk_bytes: u32 = tls_record_plaintext_bytes_max;
 /// cross in one record, which is what `transformOut` emits.
 ///
 /// Pinned here rather than to `relay_buffer_bytes_max` so that raising the
-/// relay ceiling for plaintext deployments costs a terminating one
-/// nothing: `Engine`'s outbox is `2 x (this + 256)` at comptime, so the
-/// two numbers moving together would have grown every engine for a
-/// benefit only the plaintext path collects. The loader keeps the pairing
-/// true where it matters by refusing a relay buffer above this on any
-/// config that terminates TLS (`LimitRelayBufferOverTlsRecord`).
+/// relay ceiling costs the engine nothing: `Engine`'s outbox is a fixed
+/// number of emitted records at comptime, not a function of the relay
+/// knob. Every encrypting transform chunks at this bound, so the relay
+/// ceiling no longer depends on whether a listener terminates TLS.
 pub const tls_app_chunk_bytes: u32 = tls_record_plaintext_bytes_max;
 
 comptime {
@@ -362,16 +389,43 @@ comptime {
 /// The ceiling on one TLS engine's own footprint, asserted against
 /// `@sizeOf(Engine)` in `src/tls/Engine.zig` (§5: a budget is a stated
 /// number a thing must fit, not a number read back off whatever it grew
-/// to). Measured at 92 KiB — the record, out, flight and reassembly
-/// buffers plus the outbox — with the headroom here for a pin that adds
-/// a field. It was 132 KiB under ztls, whose per-handshake buffers were
+/// to). Measured at 111 KiB — the record, out, flight and reassembly
+/// buffers plus a three-record outbox (a tunnel's two-direction burst
+/// and a control reply) — with headroom here for a pin that adds a
+/// field. It was 132 KiB under ztls, whose per-handshake buffers were
 /// wider; the pool costs the same slots for less. A bump past this is a
 /// deliberate re-costing of the engine pool, which is what tripping the
 /// assert makes it.
 pub const tls_engine_bytes_max: u32 = 160 * 1024;
 
+/// The ceiling on one *upstream* TLS engine's own footprint — the
+/// client-side counterpart of `tls_engine_bytes_max` above, used when a
+/// cluster dials its origins over TLS (§4). It is an upper bound, not a
+/// measured size: the pool is reserved before the backend-generic
+/// `Server` is instantiated, so `poolSizesFor` cannot see
+/// `@sizeOf(UpstreamTls)`. `Server` asserts the real type against this
+/// bound at init, which is what makes a bump past it a deliberate
+/// re-costing rather than a silent one.
+///
+/// 128 KiB covers the handshake state, the wire-record out-buffer, the
+/// 16 KiB server-flight reassembly, the mTLS flight and a three-record
+/// outbox (a tunnel's two-direction burst plus a control reply), with
+/// room for a pin that adds a field. The real `@sizeOf(UpstreamTls)` is
+/// asserted in `Server` before the pool is reserved.
+pub const upstream_tls_engine_bytes_max: u32 = 128 * 1024;
+
+comptime {
+    // An engine carries at least the out-buffer and the server-flight
+    // reassembly, each a record's worth — a bound below both could not
+    // hold one handshake.
+    assert(upstream_tls_engine_bytes_max >= 2 * tls_record_plaintext_bytes_max);
+    // A `*_bytes_max` is a byte count, and a power of two keeps the
+    // per-slot figure page-friendly like every other pool unit here.
+    assert(std.math.isPowerOfTwo(upstream_tls_engine_bytes_max));
+}
+
 /// The ceiling on `limits.tls_engines` — how many TLS sessions may be
-/// handshaking or terminated at once (§5). An engine is ~92 KiB plus its
+/// handshaking or terminated at once (§5). An engine is ~111 KiB plus its
 /// plaintext buffer, so this is the one pool whose count an operator
 /// notices in RSS: 1024 is ~170 MiB, and the ceiling exists so a typo in
 /// the config cannot ask for a gigabyte. Unlike the conn-slot ceiling it
@@ -503,6 +557,113 @@ pub const libcrypto_heap_bytes: u32 = libcryptoHeapBytes(tls_engines_max);
 /// on disk. Generous: the DER inside is bounded far tighter by
 /// `tls_cert_chain_bytes_max`.
 pub const tls_pem_bytes_max: u32 = 256 * 1024;
+
+/// Upper bound on configured HTTP/3 listeners. Each one owns a UDP socket
+/// and its own session slots, so this is a policy ceiling rather than a
+/// pool size; the per-listener slot count below is the memory knob.
+pub const h3_listeners_max: u16 = 8;
+
+/// QUIC connections one HTTP/3 listener reserves slots for when the
+/// config does not say. A slot embeds a fixed 256 KiB arena, so 64 slots
+/// is ~16 MiB of BSS-backed state — conservative beside the TCP conn
+/// pool, and raised per listener when the deployment needs it.
+pub const h3_connections_default: u16 = 64;
+
+/// Hard ceiling on one listener's `max_connections`. At the slot's 256 KiB
+/// arena this is 256 MiB, which is the point: the operator names a cost
+/// this proxy is willing to reserve, and the banner cannot hide it.
+pub const h3_connections_max: u16 = 1024;
+
+/// Client-initiated bidirectional streams one HTTP/3 connection admits at
+/// once: the `initial_max_streams_bidi` ceiling the connection advertises in
+/// its transport parameters and later raises with MAX_STREAMS frames, and
+/// (via `session.zig`'s `H3Session.streams_max`, which aliases this) the
+/// size of the per-session request-slot table. One constant so the wire
+/// limit and the slot table cannot drift apart: every request occupies one
+/// slot and one stream, so a finished request frees both together and the
+/// session hands the stream credit back one at a time. The ordinal of the
+/// stream a client may open is `id / 4 + 1` (RFC 9000 §4.5), so this value
+/// is also the count of open streams, and a raise must be monotonic.
+pub const h3_request_streams_max: u16 = 8;
+
+/// The default per-response-body cap an HTTP/3 exchange forwards. The h3
+/// proxy streams the body to the client as it arrives, so this is a
+/// policy bound on one response's decoded size, not a memory bound — a
+/// body past it mid-stream is cut off with a stream reset (the answer
+/// counters read it as a bad gateway). Config may narrow it; the ceiling
+/// a config may set is `h3_response_bytes_limit`.
+pub const h3_response_bytes_max: u32 = 64 * 1024;
+
+/// The largest `max_response_bytes` a config may set for one HTTP/3
+/// listener: 16 MiB. The streaming proxy bounds its staging memory by
+/// the exchange chunk buffer, not by this cap, so the ceiling prices
+/// nothing but the policy bound itself; the default stays
+/// `h3_response_bytes_max`.
+pub const h3_response_bytes_limit: u32 = 16 * 1024 * 1024;
+
+/// Exchange slots one HTTP/3 listener reserves for in-flight upstream
+/// legs. Each exchange embeds the request buffer, a small response-head
+/// buffer and one body chunk buffer (~104 KiB), so this is fixed rather
+/// than per-connection.
+pub const h3_exchanges: u16 = 16;
+
+/// §5 price for one HTTP/3 session slot: `@sizeOf(Listener(IoType).Slot)`,
+/// comptime-asserted in listener.zig the way `h3_exchange_slot_bytes` is in
+/// the proxy. Measured composition (both Io backends): the embedded
+/// 256 KiB fixed arena (262,144 B) plus `CryptoPool` (17,408 B of
+/// fixed-size slots), the three sent rings (3 spaces × 8 slots × 1,520 B),
+/// the per-level CRYPTO reassembly (4 × 8,192 B), the datagram ring
+/// (16 × 1,500 B) and the stream table / ACK tracker / RTT state around
+/// them — `@sizeOf(Connection)` = 381,760 — plus `@sizeOf(H3Session)`
+/// (5,440 B of control-stream and QPACK-instruction reassembly buffers)
+/// and the slot's flags: 387,264 B measured, 397,312 B priced. The old
+/// 264 KiB figure priced only the arena plus a sliver; the streamed
+/// connection's rings and crypto pool outgrew it, and the budget must
+/// name what the slot actually costs.
+pub const h3_session_slot_bytes: u32 = 388 * 1024;
+
+/// Banner estimate for one HTTP/3 exchange slot: an 80 KiB rendered
+/// request, an 8 KiB response-head buffer, a 16 KiB body chunk buffer,
+/// the TLS dial fields when a cluster dials TLS (an engine *pointer*,
+/// the staged-unit counter and the verifier context — the engine itself
+/// is priced by `h3_upstream_tls_engines`, not here), and the
+/// head/state around them. The body streams through the chunk buffer as
+/// it arrives, so the slot no longer scales with the response size the
+/// way the buffered slice's 64 KiB staging buffer did. The proxy asserts
+/// the real `@sizeOf(Exchange)` against this figure, so a slot that
+/// outgrows it fails the build rather than the banner.
+pub const h3_exchange_slot_bytes: u32 = 108 * 1024;
+
+/// Idle window an HTTP/3 listener's pooled upstream keep-alive connection
+/// is kept after its last response: the parked slot holds an fd with no
+/// armed op until the proxy's one coarse timer reaps it with a
+/// synchronous close. Config-free on purpose (the configuration surface
+/// is frozen): thirty seconds, the same order as the TCP path's default
+/// `idle_ms`, and far below any origin's own keep-alive window so the
+/// proxy reaps before the origin would have.
+pub const h3_pool_idle_ns: u64 = 30 * std.time.ns_per_s;
+
+/// Parked keep-alive upstream connections one HTTP/3 listener's pool may
+/// hold at once — at most one per configured endpoint, capped here. The
+/// pool is an accelerator, not a limiter: a checkout miss dials fresh, so
+/// this bounds only the fds parked sockets may hold, which is what the fd
+/// budget (`fdsRequired`'s `h3_sockets` term) prices. In-flight exchanges
+/// hold their own socket each, already priced by `h3_exchanges`.
+pub const h3_parked_per_listener_max: u16 = 32;
+
+/// §5 price of one HTTP/3 parked keep-alive slot — the proxy's `Parked`
+/// record (its socket handle, the optional `*UpstreamTls` parked beside
+/// it, the two index scalars and the idle deadline). The TCP path's
+/// parked connections hold no comparable record: parking there is a
+/// state of an already-priced upstream slot, which is why this term has
+/// no TCP-side twin. Field-by-field the record is ≤ 28 B; 32 B is the
+/// aligned bound. The socket's fd rides `fdsRequired`'s `h3_sockets`
+/// term and the engine itself rides `h3_upstream_tls_engines`, so this
+/// prices bookkeeping only — no double count. `Parked` is private to
+/// `h3/proxy.zig`, so unlike the Exchange and Slot bounds this one
+/// cannot be comptime-asserted from outside; a proxy-side shape change
+/// must re-review it here.
+pub const h3_parked_slot_bytes: u32 = 32;
 
 comptime {
     assert(tls_engines_default >= 1);
@@ -730,6 +891,21 @@ pub const request_body_bytes_default: u64 = 1 << 20;
 /// cap" for anyone who genuinely wants none.
 pub const request_body_bytes_max: u64 = 1 << 40;
 
+/// The largest proxied response body zoxy will compress at all. The
+/// compressor runs only when the whole body arrived with its head, so
+/// this is also the memory the shared gzip state must hold. Above it the
+/// response is forwarded untouched.
+pub const compress_body_bytes_max: u32 = 64 * 1024;
+
+/// Room for a gzip stream plus its header/footer. Incompressible input
+/// grows by a few dozen bytes; the compressor reports failure past this
+/// and the caller sends the plain body.
+pub const compress_out_bytes_max: u32 = compress_body_bytes_max + 1024;
+
+/// Default `compress.min_bytes`: below this a response is not worth the
+/// header and the decoder.
+pub const compress_min_bytes_default: u32 = 1024;
+
 /// Default budget for reading one request head (#235) — from the
 /// client's first byte to a complete head, which is exactly a slowloris's
 /// window (§7: "a slowloris meets the clock or `head_buffer_bytes`,
@@ -746,6 +922,16 @@ pub const request_body_bytes_max: u64 = 1 << 40;
 /// insecure one, which is the signature of a knob that should have been
 /// two.
 pub const head_ms_default: u32 = 10_000;
+
+/// Default `timeouts.h3_exchange_ms`: the cap on one HTTP/3 upstream
+/// exchange — the buffered h3 proxy's connect, send and receive window —
+/// when the config omits it. The ten seconds `http/h3/proxy.zig` shipped
+/// with before the knob existed: long enough for a small origin response
+/// to cross the plaintext leg, short enough that a stalled QUIC exchange
+/// gives its slot back. Unlike the other optional caps, absence does not
+/// turn it off — a config predating the field must behave exactly as it
+/// did, which is a fixed ten-second deadline, not none.
+pub const h3_exchange_ms_default: u32 = 10_000;
 
 /// Interim (`1xx`) responses one exchange may carry before the origin's
 /// final answer (#232). RFC 9110 puts no cap on them, and neither nginx
@@ -920,11 +1106,21 @@ pub const header_edits_max: u16 = 16;
 /// included).
 pub const pick_name_bytes_max: u16 = 64;
 
+/// Upper bound on an `http` listener's `h3_advertise` value — the
+/// `Alt-Svc` field content this socket appends to every proxied response
+/// head so HTTP/1.1 clients can discover an experimental HTTP/3 listener
+/// (RFC 7838). A bound on config text that lands on the wire, like
+/// `cluster_name_bytes_max`; 128 bytes carries a full
+/// `h3=":port"; ma=3600` spelling with room for several protocol ids.
+pub const alt_svc_value_bytes_max: u16 = 128;
+
 /// A response render's edit ceiling (#178): the configured filter edits
-/// plus the one slot the Set-Cookie stamp reserves. The renderer's
-/// asserts and the proxy's edit buffers all speak this name, so the
-/// reserved slot cannot drift out of any of them.
-pub const response_edits_max: u16 = header_edits_max + 1;
+/// plus the two slots the proxy's own injections reserve — the Set-Cookie
+/// stamp and the per-listener `Alt-Svc` advertisement, each an `add` that
+/// rides the same machinery rather than owning a second injection path.
+/// The renderer's asserts and the proxy's edit buffers all speak this
+/// name, so the reserved slots cannot drift out of any of them.
+pub const response_edits_max: u16 = header_edits_max + 2;
 
 /// Upper bound on one configured body's bytes (#159) — file or inline,
 /// rejected at load. The bound is the scope boundary, not a tuning
@@ -945,6 +1141,61 @@ pub const body_name_bytes_max: u16 = 64;
 /// Upper bound on every configured timeout — one hour. A timeout above
 /// this is almost certainly a units mistake in the config.
 pub const timeout_ms_max: u32 = 3_600_000;
+
+/// Upper bound on a listener's `rate_limit.requests` and
+/// `rate_limit.burst`: a million requests per window is already far past
+/// what one client can send through this proxy, and the bound keeps the
+/// milli-token arithmetic inside a `u32`.
+pub const rate_limit_requests_max: u32 = 1 << 20;
+pub const rate_limit_burst_max: u32 = 1 << 20;
+
+/// Upper bound on `limits.rate_limit_entries` — the number of distinct
+/// client identities the listener-level buckets can track at once. One
+/// million entries is ~32 MiB at the entry's current 32-byte width, which
+/// is the most this feature may add to the §5 total without an operator
+/// seeing it in the banner.
+pub const rate_limit_entries_max: u32 = 1 << 20;
+
+/// Ceiling on a listener's `conn_limit.max`: no client can hold more
+/// concurrent connections than this process has slots, so a larger cap
+/// would describe a limit the pool already enforces.
+pub const conn_limit_conns_max: u32 = conn_slots_max;
+
+/// Upper bound on `limits.conn_limit_entries` — the number of distinct
+/// client identities the per-client connection counters can track at
+/// once. One million entries is ~24 MiB at the entry's current width,
+/// which is the most this feature may add to the §5 total.
+pub const conn_limit_entries_max: u32 = 1 << 20;
+
+comptime {
+    // The burst capacity is a milli-token `u32`; the config bound must
+    // leave room for the ×1000 conversion.
+    assert(rate_limit_burst_max <= std.math.maxInt(u32) / 1000);
+    assert(rate_limit_requests_max >= 1);
+    assert(rate_limit_burst_max >= rate_limit_requests_max);
+    assert(rate_limit_entries_max >= 1);
+    assert(conn_limit_conns_max >= 1);
+    assert(conn_limit_entries_max >= 1);
+}
+
+/// What the listener-level rate-limit table reserves: zero when the
+/// feature is off (the count is zero exactly then), otherwise one entry
+/// per tracked client identity. `Server.init` asserts the allocation
+/// matches this number, so the banner's term and the arena slice are the
+/// same fact.
+pub fn rateLimitTableBytes(entries: u32) u64 {
+    assert(entries <= rate_limit_entries_max);
+    if (entries == 0) return 0;
+    return @as(u64, entries) * @sizeOf(rate_limit.Entry);
+}
+
+/// What the per-client connection table reserves, on the rate limiter's
+/// exact terms: zero entries means the feature is off and costs nothing.
+pub fn connLimitTableBytes(entries: u32) u64 {
+    assert(entries <= conn_limit_entries_max);
+    if (entries == 0) return 0;
+    return @as(u64, entries) * @sizeOf(conn_limit.Entry);
+}
 
 /// Floor on `timeouts.loop_watchdog_ms` (#311): the shortest serving-loop
 /// backstop an operator may name.
@@ -1384,9 +1635,13 @@ pub const completion_queue_entries: u32 =
 /// probe, each of which may hold one while dialing (§7) + the access
 /// log's file sink when the
 /// config names one (§8 — the `stdout` sink is one of the three stdio
-/// descriptors already counted). Closed form so `ensureFdBudget` can
-/// check the *effective* size against RLIMIT_NOFILE; the admin
-/// reservation is fixed, and so is the prober's floor of one probe.
+/// descriptors already counted) + per HTTP/3 listener one UDP socket, one
+/// upstream socket per exchange slot and up to `h3_parked_per_listener_max`
+/// parked keep-alive sockets — QUIC sessions live outside the conn-slot
+/// pool, so these fds are priced here or nobody prices them. Closed form
+/// so `ensureFdBudget` can check the *effective* size against
+/// RLIMIT_NOFILE; the admin reservation is fixed, and so is the prober's
+/// floor of one probe.
 ///
 /// No `fds_max` companion, for the reason `in_flight_ops_max` has none:
 /// the listener term makes this a property of a config, not of this file.
@@ -1398,10 +1653,18 @@ pub fn fdsRequired(
     listeners: u32,
     access_log_files: u32,
     health_probes: u32,
+    /// UDP listener sockets plus the one upstream TCP socket each h3
+    /// exchange slot may hold at once plus the parked keep-alive pool's
+    /// sockets (bounded by `h3_parked_per_listener_max` per listener).
+    /// HTTP/3 sessions live outside the conn-slot pool, so their fds are
+    /// a term of their own.
+    h3_sockets: u32,
 ) u32 {
     assert(conn_slots <= conn_slots_max);
     assert(upstream_slots <= upstream_slots_max);
     assert(listeners <= std.math.maxInt(u16));
+    assert(h3_sockets <= @as(u32, h3_listeners_max) *
+        (1 + h3_exchanges + h3_parked_per_listener_max));
     // Zero or one: the config names at most one sink, and only its `file`
     // arm opens anything. Each file sink costs its held fd plus one
     // transient during a SIGHUP reopen — the new fd opens before the old
@@ -1411,7 +1674,7 @@ pub fn fdsRequired(
     assert(health_probes <= health_probe_concurrency_max);
     return 3 + 1 + 1 + (listeners + admin_listeners) +
         2 * conn_slots + 1 + admin_conns + upstream_slots + health_probes +
-        2 * access_log_files;
+        2 * access_log_files + h3_sockets;
 }
 
 /// Default effective pool sizes when the config omits a `limits` block: a
@@ -1518,7 +1781,7 @@ comptime {
     assert(endpoint_inflight_max >= conn_slots_max);
     assert(endpoint_inflight_max >= upstream_slots_max);
     assert(header_edits_max >= 1);
-    assert(response_edits_max == header_edits_max + 1);
+    assert(response_edits_max == header_edits_max + 2);
     assert(body_bytes_max >= 1);
     // A body must fit the u32 lengths the render and the channel carry.
     assert(body_bytes_max <= std.math.maxInt(u32) / 2);
@@ -1822,6 +2085,71 @@ pub const PoolSizes = struct {
     /// `libcryptoHeapBytes` is what *derives* that array's size, at
     /// `tls_engines_max`; it is not a per-config subtotal to print.
     libcrypto_heap_bytes: u64 = 0,
+    /// The listener-level per-client rate-limit table (§7): a
+    /// fixed-size open-addressing table allocated once at startup. Zero
+    /// exactly when no listener configures a `rate_limit` block, which
+    /// is what makes the feature free to every deployment that did not
+    /// ask for it. Its own banner term because it is the one reservation
+    /// whose size is a policy about *clients* rather than connections.
+    rate_limit_entries: u32 = 0,
+    rate_limit_entry_bytes: u64 = 0,
+    /// The per-client concurrent-connection table (§7): same shape and
+    /// same all-or-nothing pricing as the rate-limit table, kept apart
+    /// because the two features are independent — a deployment may cap
+    /// connections without rate-limiting, or the reverse.
+    conn_limit_entries: u32 = 0,
+    conn_limit_entry_bytes: u64 = 0,
+    /// The one shared gzip state (§7), or zero when no listener enables
+    /// `compress`. A single fixed object, not a pool: rendering is
+    /// synchronous on the loop thread, and the compressed bytes are
+    /// copied into the connection's head buffer before anything else runs.
+    compress_bytes: u64 = 0,
+    /// The §4 upstream TLS engine pool: one client engine per shared
+    /// upstream slot, reserved only when at least one cluster carries a
+    /// `tls` block and zero otherwise — a deployment that dials every
+    /// origin in the clear pays nothing for the feature.
+    ///
+    /// The count is the *shared* pool's `upstream_slots`, not a limit of
+    /// its own: any parked upstream may be a TLS one, so a smaller pool
+    /// would be upstream capacity the dial path could not encrypt.
+    upstream_tls_engines: u32 = 0,
+    /// The unit size of one upstream TLS engine: the compiled bound
+    /// `upstream_tls_engine_bytes_max`, never `@sizeOf(UpstreamTls)`.
+    /// The engine type is backend-generic at this layer, and the printed
+    /// total must be derivable before `Server` exists; the reservation
+    /// asserts the real `@sizeOf` fits this bound.
+    upstream_tls_engine_bytes: u64 = 0,
+    /// The h3 listeners' upstream TLS engine pool: one client engine per
+    /// exchange slot plus one per parked slot, per listener that routes
+    /// to a TLS-dialing cluster — the same all-or-nothing terms as the
+    /// shared pool above. The h3 proxy embeds the engine type directly
+    /// (it is not backend-generic there), but the budget stays
+    /// backend-generic, so the unit is the same compiled bound and the
+    /// proxy asserts the real `@sizeOf` against it like `Server` does.
+    h3_upstream_tls_engines: u32 = 0,
+    h3_upstream_tls_engine_bytes: u64 = 0,
+    /// The §5 h3 session pool: QUIC connection slots per listener, summed
+    /// over `h3_listeners` (each listener's `max_connections`). Sessions
+    /// live outside the conn-slot pool, so this term is what prices them;
+    /// the unit is the compiled `h3_session_slot_bytes`, and listener.zig
+    /// comptime-asserts the real `@sizeOf(Slot)` against it. Zero exactly
+    /// when there are no h3 listeners, on the same all-or-nothing terms
+    /// as the TLS pools.
+    h3_sessions: u32 = 0,
+    /// The §5 h3 exchange pool: `constants.h3_exchanges` upstream-leg
+    /// slots per h3 listener, summed. The unit is the compiled
+    /// `h3_exchange_slot_bytes`, comptime-asserted against the real
+    /// `@sizeOf(Exchange)` inside the proxy, so the printed total and
+    /// the reservation cannot drift.
+    h3_exchanges: u32 = 0,
+    /// The §5 h3 keep-alive pool: per h3 listener, the smaller of the
+    /// routed endpoint count and `h3_parked_per_listener_max`, summed
+    /// with a route table's clusters deduplicated — the closed form the
+    /// proxy sizes its `parked` array from at init. The unit is
+    /// `h3_parked_slot_bytes`, the `Parked` bookkeeping record only:
+    /// the sockets' fds ride the fd budget and the parked TLS engines
+    /// ride `h3_upstream_tls_engines` above.
+    h3_parked: u32 = 0,
 };
 
 /// What the access log reserves: nothing when it is off, both staging
@@ -1838,12 +2166,9 @@ pub fn accessLogBytes(buffer_bytes: u32) u64 {
 /// By pointer: `PoolSizes` is past the 16-byte threshold TIGER_STYLE sets
 /// for by-value arguments, and a stack copy of the budget buys nothing.
 pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
-    assert(sizes.conn_slots >= 1);
-    assert(sizes.conn_slots <= conn_slots_max);
-    assert(sizes.relay_buffers >= 1);
-    assert(sizes.relay_buffers <= relay_buffers_max);
-    assert(sizes.upstream_slots >= 1);
-    assert(sizes.upstream_slots <= upstream_slots_max);
+    assert(sizes.conn_slots >= 1 and sizes.conn_slots <= conn_slots_max);
+    assert(sizes.relay_buffers >= 1 and sizes.relay_buffers <= relay_buffers_max);
+    assert(sizes.upstream_slots >= 1 and sizes.upstream_slots <= upstream_slots_max);
     assert(sizes.conn_bytes > 0);
     // Pinned to the conn count while an exchange is a connection (#274);
     // the assert is what will fail loudly the day #173 sizes the pool
@@ -1884,11 +2209,87 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
     } else {
         assert(sizes.tunnel_buffer_pair_bytes >= 2 * @as(u64, relay_buffer_bytes_min));
     }
-    // The TLS terms are all-or-nothing together: a pool with no engines
-    // is a plaintext deployment, which reserves no heap and no plaintext
-    // buffers either. Any mixture is a composition mistake, not a
-    // configuration one — `limits.tls_engines` already refuses the
-    // config-level version of it.
+    // The rate-limit table is all-or-nothing: zero entries means the
+    // feature is off and nothing was reserved; a nonzero count carries
+    // the element width `Server.init` allocates, asserted here so the
+    // banner cannot price a smaller entry than the arena holds.
+    assertRateLimitTable(sizes);
+    assertConnLimitTable(sizes);
+    // The TLS terms, listener and upstream alike: all-or-nothing, so the
+    // banner cannot price a smaller unit than the arena holds.
+    assertTlsPoolTerms(sizes);
+    // The h3 terms: per-listener counts, zero together when no h3
+    // listener exists, and each within its compiled ceiling product.
+    assertH3PoolTerms(sizes);
+    const total = @as(u64, sizes.conn_slots) * sizes.conn_bytes +
+        @as(u64, sizes.stream_slots) * sizes.stream_bytes +
+        @as(u64, sizes.relay_buffers) * sizes.relay_buffer_pair_bytes +
+        @as(u64, sizes.upstream_slots) * sizes.upstream_bytes +
+        sizes.access_log_bytes + sizes.log_header_bytes +
+        sizes.endpoint_table_bytes + sizes.metrics_bytes +
+        @as(u64, sizes.tunnels) * sizes.tunnel_buffer_pair_bytes +
+        rateLimitTableBytes(sizes.rate_limit_entries) +
+        connLimitTableBytes(sizes.conn_limit_entries) +
+        sizes.compress_bytes +
+        @as(u64, sizes.head_buffers) * (sizes.head_buffer_bytes + 1) +
+        bufferGroupDescriptorBytes(sizes.head_buffers) +
+        @as(u64, sizes.upstream_head_buffers) * sizes.upstream_head_buffer_bytes +
+        sizes.head_scratch_bytes +
+        @as(u64, sizes.tls_engines) *
+            (sizes.tls_engine_bytes + sizes.tls_plaintext_bytes) +
+        sizes.libcrypto_heap_bytes +
+        @as(u64, sizes.upstream_tls_engines) * sizes.upstream_tls_engine_bytes +
+        @as(u64, sizes.h3_sessions) * h3_session_slot_bytes +
+        @as(u64, sizes.h3_exchanges) * h3_exchange_slot_bytes +
+        @as(u64, sizes.h3_parked) * h3_parked_slot_bytes +
+        @as(u64, sizes.h3_upstream_tls_engines) * sizes.h3_upstream_tls_engine_bytes;
+    assert(total > 0);
+    return total;
+}
+
+/// The h3 pool terms' shape checks, on `assertTlsPoolTerms`' pattern.
+/// Sessions, exchanges and parked slots all derive from the h3 listener
+/// list, so they are zero together: a deployment without an h3 listener
+/// reserves none of the three. The counts are bounded by the compiled
+/// ceiling products (`h3_listeners_max` × per-listener cap), which is the
+/// strongest shape claim this side can make — the per-listener counts
+/// themselves are the config's. The units are the compiled constants,
+/// asserted against the real structs on the h3 side (listener.zig's Slot,
+/// the proxy's Exchange) rather than here, where the types are not
+/// visible; `h3_parked_slot_bytes` is a reviewed bound instead, for the
+/// reason its declaration names.
+fn assertH3PoolTerms(sizes: *const PoolSizes) void {
+    assert(sizes.h3_sessions <=
+        @as(u32, h3_listeners_max) * h3_connections_max);
+    assert(sizes.h3_exchanges <=
+        @as(u32, h3_listeners_max) * h3_exchanges);
+    assert(sizes.h3_parked <=
+        @as(u32, h3_listeners_max) * h3_parked_per_listener_max);
+    if (sizes.h3_sessions == 0) {
+        assert(sizes.h3_exchanges == 0);
+        assert(sizes.h3_parked == 0);
+    } else {
+        assert(sizes.h3_exchanges >= h3_exchanges);
+    }
+    // The engine pool is sized per listener too: it cannot outnumber the
+    // exchange-plus-parked worst case the proxy reserves.
+    assert(sizes.h3_upstream_tls_engines <=
+        sizes.h3_exchanges + sizes.h3_parked);
+}
+
+/// The TLS pool terms' shape checks, split from `memoryBytesTotal` for
+/// the length limit. The listener pool is all-or-nothing together: a pool
+/// with no engines is a plaintext deployment, which reserves no heap and
+/// no plaintext buffers either. Any mixture is a composition mistake,
+/// not a configuration one — `limits.tls_engines` already refuses the
+/// config-level version of it. The upstream pools are all-or-nothing too,
+/// but their condition is a *cluster* setting rather than a listener one:
+/// any cluster with a `tls` block makes the shared pool the upstream
+/// pool's size (a parked upstream could otherwise have no engine to dial
+/// with), and the h3 pool counts what `h3.proxy` reserves — one engine
+/// per exchange slot plus one per parked slot per TLS-routing listener.
+/// The unit is always the compiled bound, never a measured size.
+fn assertTlsPoolTerms(sizes: *const PoolSizes) void {
     assert(sizes.tls_engines <= tls_engines_max);
     if (sizes.tls_engines == 0) {
         assert(sizes.tls_engine_bytes == 0);
@@ -1900,22 +2301,42 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
         assert(sizes.tls_plaintext_bytes >= tls_record_plaintext_bytes_max);
         assert(sizes.libcrypto_heap_bytes == libcrypto_heap_bytes);
     }
-    const total = @as(u64, sizes.conn_slots) * sizes.conn_bytes +
-        @as(u64, sizes.stream_slots) * sizes.stream_bytes +
-        @as(u64, sizes.relay_buffers) * sizes.relay_buffer_pair_bytes +
-        @as(u64, sizes.upstream_slots) * sizes.upstream_bytes +
-        sizes.access_log_bytes + sizes.log_header_bytes +
-        sizes.endpoint_table_bytes + sizes.metrics_bytes +
-        @as(u64, sizes.tunnels) * sizes.tunnel_buffer_pair_bytes +
-        @as(u64, sizes.head_buffers) * (sizes.head_buffer_bytes + 1) +
-        bufferGroupDescriptorBytes(sizes.head_buffers) +
-        @as(u64, sizes.upstream_head_buffers) * sizes.upstream_head_buffer_bytes +
-        sizes.head_scratch_bytes +
-        @as(u64, sizes.tls_engines) *
-            (sizes.tls_engine_bytes + sizes.tls_plaintext_bytes) +
-        sizes.libcrypto_heap_bytes;
-    assert(total > 0);
-    return total;
+    assert(sizes.upstream_tls_engines <= upstream_slots_max);
+    if (sizes.upstream_tls_engines == 0) {
+        assert(sizes.upstream_tls_engine_bytes == 0);
+    } else {
+        assert(sizes.upstream_tls_engines == sizes.upstream_slots);
+        assert(sizes.upstream_tls_engine_bytes == upstream_tls_engine_bytes_max);
+    }
+    if (sizes.h3_upstream_tls_engines == 0) {
+        assert(sizes.h3_upstream_tls_engine_bytes == 0);
+    } else {
+        assert(sizes.h3_upstream_tls_engine_bytes == upstream_tls_engine_bytes_max);
+    }
+}
+
+/// The rate-limit table's own shape checks, split from
+/// `memoryBytesTotal` for the length limit. Zero entries and a zero unit
+/// are the feature being off; a nonzero count must carry the real
+/// element width, which is the number `Server.init` allocates.
+fn assertRateLimitTable(sizes: *const PoolSizes) void {
+    assert(sizes.rate_limit_entries <= rate_limit_entries_max);
+    if (sizes.rate_limit_entries == 0) {
+        assert(sizes.rate_limit_entry_bytes == 0);
+    } else {
+        assert(sizes.rate_limit_entry_bytes == @sizeOf(rate_limit.Entry));
+    }
+}
+
+/// The connection-limit table's shape checks, on `assertRateLimitTable`'s
+/// terms: zero entries and a zero unit are the feature being off.
+fn assertConnLimitTable(sizes: *const PoolSizes) void {
+    assert(sizes.conn_limit_entries <= conn_limit_entries_max);
+    if (sizes.conn_limit_entries == 0) {
+        assert(sizes.conn_limit_entry_bytes == 0);
+    } else {
+        assert(sizes.conn_limit_entry_bytes == @sizeOf(conn_limit.Entry));
+    }
 }
 
 test "budgets: in-flight ops fit the completion queue with headroom" {
@@ -2093,6 +2514,37 @@ test "budgets: memory total matches the closed form" {
         .tls_plaintext_bytes = plaintext_bytes,
         .libcrypto_heap_bytes = libcrypto_heap_bytes,
     }));
+    // The upstream TLS engine pool is priced only when some cluster dials
+    // TLS, and then one engine per shared upstream slot. Same separability
+    // as the terms above: the difference between the two totals is the
+    // pool and nothing else, because every other field is held fixed.
+    const upstream_tls_engines: u32 = 8;
+    const expected_upstream_tls = expected_small +
+        @as(u64, upstream_tls_engines) * upstream_tls_engine_bytes_max;
+    try std.testing.expectEqual(expected_upstream_tls, memoryBytesTotal(&.{
+        .conn_slots = 64,
+        .conn_bytes = conn_bytes,
+        .stream_slots = streamSlotsFor(64),
+        .stream_bytes = stream_bytes,
+        .relay_buffers = 8,
+        .relay_buffer_pair_bytes = pair_bytes,
+        .upstream_slots = 8,
+        .upstream_bytes = upstream_bytes,
+        .access_log_bytes = accessLogBytes(0),
+        .endpoint_table_bytes = 0,
+        .metrics_bytes = metrics,
+        .head_buffers = 0,
+        .head_buffer_bytes = head_buffer_bytes_default,
+        .upstream_head_buffers = 0,
+        .upstream_head_buffer_bytes = head_buffer_bytes_default,
+        .head_scratch_bytes = head_buffer_bytes_default,
+        .upstream_tls_engines = upstream_tls_engines,
+        .upstream_tls_engine_bytes = upstream_tls_engine_bytes_max,
+    }));
+    try std.testing.expectEqual(
+        @as(u64, upstream_tls_engines) * upstream_tls_engine_bytes_max,
+        expected_upstream_tls - expected_small,
+    );
     // An unconfigured access log reserves nothing (§5), and a configured
     // one reserves both buffers at whatever size it was given — the term
     // tracks `limits`, not the compiled default.
@@ -2115,15 +2567,15 @@ test "budgets: c10k ceiling fd count needs a raised NOFILE" {
     // at startup (§8); this pins the ceiling closed form.
     try std.testing.expectEqual(
         @as(u32, 34395),
-        fdsRequired(conn_slots_max, upstream_slots_max, 0, 0, health_probe_concurrency_max),
+        fdsRequired(conn_slots_max, upstream_slots_max, 0, 0, health_probe_concurrency_max, 0),
     );
     // A file sink is two fds — held plus the SIGHUP-reopen transient —
     // at the ceiling as everywhere.
     try std.testing.expectEqual(
         @as(u32, 34397),
-        fdsRequired(conn_slots_max, upstream_slots_max, 0, 1, health_probe_concurrency_max),
+        fdsRequired(conn_slots_max, upstream_slots_max, 0, 1, health_probe_concurrency_max, 0),
     );
-    try std.testing.expect(fdsRequired(conn_slots_max, upstream_slots_max, 0, 1, health_probe_concurrency_max) <= 65536);
+    try std.testing.expect(fdsRequired(conn_slots_max, upstream_slots_max, 0, 1, health_probe_concurrency_max, 0) <= 65536);
     // The out-of-box side of this is pinned by "the default deployment is
     // lean" below, not restated here.
 }
@@ -2134,7 +2586,7 @@ test "budgets: the default deployment is lean" {
     // ceiling — operators opt up through `limits` (§5). One listener.
     // With the one file sink a config can name included: the lean line
     // holds whether or not the access log writes to a file.
-    try std.testing.expect(fdsRequired(conn_slots_default, upstream_slots_default, 1, 1, 1) < 4096);
+    try std.testing.expect(fdsRequired(conn_slots_default, upstream_slots_default, 1, 1, 1, 0) < 4096);
     try std.testing.expect(
         completionQueueDepthFor(conn_slots_default, upstream_slots_default, 1, 1, cq_fill_eighths_default) <
             completion_queue_entries,

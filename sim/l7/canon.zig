@@ -8,6 +8,16 @@ const std = @import("std");
 
 const assert = std.debug.assert;
 
+/// Zig 0.17 removed array multiplication (`a ** n`). Fixtures that need a
+/// repeated multi-byte sequence spell it out once here.
+pub fn repeatBytes(comptime bytes: []const u8, comptime times: usize) [bytes.len * times]u8 {
+    var result: [bytes.len * times]u8 = undefined;
+    for (0..times) |i| {
+        @memcpy(result[i * bytes.len ..][0..bytes.len], bytes);
+    }
+    return result;
+}
+
 /// The #140 logged headers: a request header two scripts send and a
 /// response header the sized origin answers with, plus the one value
 /// each may ever carry. The access-log verifier demands that any value
@@ -122,7 +132,7 @@ pub const page_content_type = "text/plain";
 /// 8192. Sent at accept time, it races the request legs into the
 /// deferred-render path (§7 buffer rotation) and must die as a clean
 /// 502 or teardown, never a crash.
-pub const oversize_head = "HTTP/1.1 200 OK\r\nx-pad: " ++ ("p" ** 8162) ++ "\r\n\r\n";
+pub const oversize_head = "HTTP/1.1 200 OK\r\nx-pad: " ++ @as([8162]u8, @splat('p')) ++ "\r\n\r\n";
 
 /// The `101` a WebSocket origin answers an upgrade request with (#180).
 /// Carries the participating pair the proxy must let travel: strip

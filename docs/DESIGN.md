@@ -1,6 +1,6 @@
 # zoxy — bullet-proof L4/L7 proxy
 
-An L4/L7 proxy in Zig 0.16 in the spirit of Cloudflare's Pingora, with two
+An L4/L7 proxy in Zig 0.17 in the spirit of Cloudflare's Pingora, with two
 hard constraints: **nothing allocates on the hot path** and **exhaustion
 sheds load — it never crashes, never queues unboundedly, never allocates.**
 Steady-state operation issues zero heap allocations and zero allocating
@@ -40,7 +40,10 @@ Goals, in priority order:
    every pool — no worker threads, no cross-thread queues (§3). Fewer
    moving parts than the previous iteration, not more.
 5. **L4 (TCP relay) and L7 (HTTP/1.1 reverse proxy)** serving, with
-   keep-alive and shared upstream connection reuse.
+   keep-alive and shared upstream connection reuse. The L7 proxy also
+   originates TLS 1.3 to a cluster that configures it; that Stage 1
+   client is deliberately narrow (the rest is a non-goal below) and
+   shares §4's trust store and credential loader.
 
 Non-goals (deliberate, recorded so they are decisions rather than drift):
 
@@ -49,10 +52,176 @@ Non-goals (deliberate, recorded so they are decisions rather than drift):
   condition was met, and carrying it needs no new I/O machinery — a
   tunnel is the L4 relay this proxy already runs, entered from an L7
   exchange. What it does need is its own resource model, which is why it
-  is a §5 pool rather than a §7 detail.
+  is a §5 pool rather than a §7 detail. HTTP/2 has taken its first step on
+  the same reasoning: `http/h2_client.zig` is a sans-I/O client driver
+  over the vendored codec, one stream per connection and no HPACK dynamic
+  table, so the upstream leg can reuse a parked connection without
+  carrying encoder state. **No config opts into it yet** — wiring it means
+  translating the exchange's byte stream into frames in both directions,
+  and that slice is not claimed until it can be tested end to end.
+  HTTP/3 now has a config surface and a serving path, not merely a
+  compiled dependency: `h3_listeners` binds a UDP socket, terminates
+  QUIC-TLS with one certificate, and proxies each request over
+  HTTP/1.1 — plaintext, or TLS when the selected cluster's `tls` block
+  is set, the same sans-I/O client engine and loaded cluster state the
+  TCP path dials with — to the cluster its route table selects — the §7
+  host+path-prefix table the HTTP/1.1 listener resolves, through the
+  same pipeline, minus the dimensions this slice refuses at load (header
+  predicates, per-route `access_log` suppression). A request nothing
+  matches is answered 404, the TCP path's `l7_no_route` verdict, and the
+  access-log line a matched request earns names the cluster its route
+  selected. Replies stream: the head goes out the moment it parses,
+  then body chunks relay per read — Content-Length, chunked (decoded
+  incrementally) and close-delimited alike — each response body still
+  capped at `max_response_bytes` (64 KiB by default, configurable up to
+  16 MiB), a cap enforced as the body crosses it rather than by staging
+  the whole reply. The exchange deadline — the connect, send and
+  receive window the streaming proxy bounds, absolute across a streamed
+  read so large bodies want it raised — is
+  operator-settable via `timeouts.h3_exchange_ms`, absent keeping the
+  shipped 10 s default and `0` disabling it. An `http` listener
+  advertises the UDP port on its own proxied response heads with
+  `h3_advertise` — an `Alt-Svc` field (RFC 7838) whose value the operator
+  writes verbatim, per listener, so an edge socket can announce the h3
+  endpoint while a listener behind a UDP-terminating load balancer names
+  a different value or none. The path is
+  explicitly experimental: zquic's own README calls the stack
+  experimental, QUIC sessions sit outside the §5 conn/upstream pools
+  (each listener reserves a fixed 256 KiB slot per session, one socket
+  per exchange, and a small keep-alive pool of one parked upstream
+  connection per endpoint — idle-reaped, accelerator-not-limiter — all
+  priced in the fd demand), a listener whose clusters all dial
+  plaintext reserves no upstream engines and one routing at a TLS
+  cluster reserves one engine per exchange slot plus one per parked
+  slot, and `unix:` endpoints stay refused by the loader.
+  `vendor/zquic` (zhttp's hardened zquic 0.9.18),
+  `deps/zcrypto`, and the `qtls`/`qpack` bridges compile under
+  `zig build h3-check`; the main binary links libssl because `main` now
+  wires the listener.
+  `http/h3/session.zig` is the first piece of that design: a `Slot`
+  backs zquic's allocator with a `FixedBufferAllocator`, caps one
+  connection at 64 streams, and refuses cleanly when either the byte
+  budget or the stream cap is reached. Measured at zquic 0.9.18: the
+  empty connection is 2,984 B and allocates nothing; one bidirectional
+  stream costs 328 B. The 256 KiB slot is headroom for the handshake's
+  crypto reassembly and packet queues, which the serving design must
+  still price rather than assume. The QUIC-TLS side is proven on the same
+  footing: zhttp's bridge over OpenSSL 3.5's `SSL_set_quic_tls_cbs` is
+  compiled by `h3-check`, completes a client/server handshake, and
+  asserts that both sides derive matching application traffic secrets.
+  libssl is linked by that check alone — the proxy still links libcrypto
+  only. Above that, `h3-check` now drives the packet layer end to end:
+  a ClientHello in a protected Initial packet, the server flight in
+  Handshake packets, client Finished, and a 1-RTT PING decrypted with the
+  application keys both sides installed from the TLS secrets. The HTTP/3
+  application layer is proven on the same bench: QPACK-encoded HEADERS
+  and a DATA frame cross a QUIC bidirectional stream as a request, and
+  the response returns the same way. The listener's own building blocks
+  are now unit-tested beside the seam: a CID/peer demux with bounded
+  probing, a generation-checked connection-slot pool with idle
+  deadlines, RFC 9002 ACK-range and PTO bookkeeping, and an HTTP/3
+  request-stream parser/serializer with an injectable header codec. The
+  per-connection state machine is now assembled too: `connection.zig`
+  owns a 256 KiB fixed arena, runs the QUIC-TLS handshake over CRYPTO
+  frames, installs RFC 9001 keys at each level, reassembles CRYPTO in
+  order, and moves application bytes over STREAM frames in both
+  directions. A full handshake plus a request/response consumes 11,712
+  bytes of that arena in the test. It acknowledges received packet
+  numbers and resends the oldest unacknowledged packet on a PTO: ACK
+  frames come from `recovery.zig`, and retained frame payloads are
+  re-sealed under a fresh packet number. Both directions of flow control
+  are enforced: the client's allowances gate `sendStream`, and this
+  side's advertised windows gate incoming STREAM frames and are topped up
+  with MAX_DATA/MAX_STREAM_DATA once half a window is consumed. It does
+  not yet parse HTTP/3 itself; the listener feeds it datagrams and the
+  session hands its STREAM bytes to `request_stream.zig`.
+  That listener exists: `listener.zig` binds the UDP socket through the
+  seam, demuxes by CID/peer, allocates connection slots from a fixed
+  pool, forwards datagrams, drains replies into listener-owned send
+  buffers, drives PTO from a 100 ms timer, and reaps idle connections on
+  the next inbound datagram (there is no per-connection timer yet). Its
+  SimIo tests send a real qtls ClientHello through a socket pair and run a
+  full HTTP/3 GET/response end to end. Two lifecycle gaps are explicit:
+  idle reaping has no timer yet, and the seam has no UDP receive cancel,
+  so `stop` leaves the armed receive for `deinit`/the loop to finish.
+  The HTTP/3 layer above the stream is now present too: `session.zig`
+  owns zhttp's RFC 9204 QPACK decoder/encoder (the session advertises a
+  zero-capacity dynamic table, so peers use static and literal field
+  sections), up to eight concurrent
+  request parsers, the server control/QPACK streams (ids 3, 7, 11, sent
+  when the handshake completes), and single-send response encoding.
+  `listener.zig` initializes one session per connection when a request
+  handler is installed and routes STREAM bytes into it. Deferred:
+  dynamic QPACK tables (capacity is advertised as zero), response
+  trailers, MAX_STREAMS accounting, and threshold loss detection (PTO
+  resends the oldest packet per space). An end-to-end SimIo
+  test now drives the whole stack through real UDP sockets: client
+  Initial, server flight, Finished, an HTTP/3 GET, the request handler,
+  and a QPACK-decoded 200 response. It pinned two ordering facts: SimIo
+  may deliver the Handshake flight before the Initial, so the client
+  stashes one; and submitting Finished and the 1-RTT request in one
+  batch lets the request overtake Finished at the server, so the client
+  defers the request by a millisecond. A live aioquic 1.7 client against
+  `zoxy` with an `h3_listeners` entry — and against the standalone
+  `zig build h3-serve` binary — completes the handshake and receives a
+  200 with the expected body, including a chunked origin response. That
+  is the first interop evidence outside the in-process client. The path
+  is observed like any other, counters first: every h3 request, relayed
+  response, `502`/`504` verdict, `503` shed and opened or closed session
+  is witnessed into the shared process counter set (`zoxy_h3_*` in the
+  `/metrics` exposition and the exit tally — the h3 runtime borrows
+  `Server.counters`; `Server` and the admin plane hold no h3 knowledge).
+  The same runtime borrows `Server.access_log`: every h3 request earns
+  one `kind:"http"` line in the configured sink — payload-byte
+  accounting where the TCP line counts wire bytes, and no named-header
+  capture yet, both documented choices of this slice — so h3 traffic
+  reads in the log exactly where the HTTP/1.1 traffic does, and with no
+  `access_log` block the path emits nothing at all.
+  Observability closed a gap and widened a surface: a no-route request
+  now witnesses its own verdict — `h3_no_route`, the `l7_no_route`
+  sibling, the fifth bucket in the every-request-lands-in-exactly-one
+  sum, logged with `.rejected` for the same reason the TCP path's
+  unroutable 404 is — and the admin scrape carries per-listener h3 rows
+  (live sessions, cumulative requests/responses, the parked pool) behind
+  an untyped appender the runtime installs, keeping the admin plane free
+  of h3 types.
+  The route table now carries the L7 dimensions as well — a #302 header
+  predicate and per-route `access_log: false` ride the same
+  `resolveRoutes` pipeline (conjunction, most-specific-first), the log
+  suppression reaching only the access-log line while the counters the
+  same witness hook fires stay. The listener's own answers can wear
+  configured pages — `error_pages: {no_route, bad_gateway,
+  gateway_timeout}` naming bodies the same load-time render cache the
+  TCP path uses — and an idle exchange deadline
+  (`timeouts.h3_exchange_idle_ms`, off by default) resets on any
+  application progress in either direction, so SSE and deliberate drips
+  outlive the absolute budget.
+  Request bodies stream now too: the session delivers DATA-frame chunks
+  to the handler (`Request.body` stays empty; a handler that defers but
+  never subscribes cannot consume the upload and the stream drops as
+  malformed), stamping whether the transport FIN rode the HEADERS frame
+  so the proxy can commit at dial time — `Content-Length` verbatim, no
+  `Content-Length` generated chunked, and a fin-on-HEADERS request
+  head-only, no generated framing at all. The exchange is full duplex:
+  the response read arms the moment the request head credits, the two
+  directions hold their own staging buffers and completions on the one
+  upstream socket, and the connection parks or closes only when both are
+  done — a response that completes early (an origin's 4xx-and-close, a
+  100 under an upload) leaves the upload consumed-and-dropped, never
+  reset, and never parks a connection whose body the origin did not
+  read. 1xx heads are skipped per RFC 9110 §15.2. SimIo covers a 100 KiB
+  upload in both framings byte-for-byte through the scripted origin, a
+  200 relayed before the upload's fin, the early-rejection verdict, a
+  skipped 100, and teardown settling both armed directions; a live
+  aioquic POST of 1 MiB echoes back through the proxy. The earlier live
+  gap below this slice — no ACK-only packet, a stalled large upload —
+  closed with the transport's ACK clocking; the duplex pump no longer
+  serializes on it either way.
 - Feature parity with Envoy/NGINX. Pingora's lesson is that a small, sharp
   proxy core beats a configurable monolith.
-- Caching, compression, request transformation.
+- Caching, request transformation. Response compression is bounded rather
+  than absent: static answers at load and small coalesced proxied bodies
+  (§7), never a streaming compressor.
 - Windows/macOS *production* support. Production is Linux + `io_uring`;
   libxev's kqueue backend keeps macOS usable as a dev box only.
 - Multi-process orchestration, xDS, hot restart — until operability demands
@@ -67,11 +236,27 @@ Non-goals (deliberate, recorded so they are decisions rather than drift):
 - Config reload. Config is parse-once immutable (§5); a change is a
   process restart — consistent with process-per-port scale-out (§3). Hot
   restart / drain-to-successor is out of scope for the same reason.
-  SIGHUP is therefore free for the conventional log-rotation meaning and
-  carries only that (§8): reopen the access log's file sink.
+  SIGHUP is therefore free for two narrow meanings (§8): reopen the
+  access log's file sink, and ask the application to load the next
+  *listener* TLS certificate generation. A cluster's upstream CA and
+  client files are startup-only and are not re-read. The config file,
+  pools and tables are still not re-read.
 - Dynamic DNS for upstreams. Cluster endpoints are static socket
   addresses resolved once at config load (§7); re-resolution waits for a
   demonstrated need.
+- The rest of upstream TLS. Stage 1 originates TLS 1.3 from the L7 proxy,
+  forwards requests with bodies (streamed through the ordinary §7 framing
+  and relay rules), parks and reuses upstream sessions (a reuse skips the
+  handshake), probes TLS endpoints (an `http` check handshakes and speaks
+  encrypted; a `tcp` check stays a plain connect), and carries an
+  `Upgrade` tunnel through the same relay: either end may speak TLS, and
+  a half-close is announced with `close_notify`. An early failure takes
+  the same one free replay as a plaintext try (a fresh dial re-encrypts
+  the still-intact request head), and a cluster that dials TLS is still
+  refused at load when an
+  `l4` listener routes to it, because that relay never originates TLS.
+  What remains is resumption on the originating side; the handshake, the
+  exchange path and the tunnel exist.
 
 ## 3. Topology — one thread, one loop, one ring, shared pools
 
@@ -211,7 +396,7 @@ iteration's hand-rolled TigerBeetle pattern, and the same shape as
 
 **Dependency policy: Zig-first, with a scoped C exception for proven
 crypto primitives.** The TIGER_STYLE zero-dependency rule takes its
-recorded exceptions here, all vendored by content hash in `build.zig.zon`
+recorded exceptions here, all vendored under `deps/` with their upstream
 as zoxy-io forks: **libxev** (this section), **hparse** (the HTTP/1.1 head
 parser — as a hardened fork, §7), and **zssl** (the TLS 1.3 engine, below).
 libxev and hparse are pure Zig. zssl carries the codebase's one C surface,
@@ -238,7 +423,7 @@ without it too, which is the point of trusting these primitives
 institutionally rather than instrumenting them; the safety this surface
 does get is the audited Zig above it, the fixed heap beside it, and §9's
 `smoke-release` running the mode that ships.
-And the pinned hash is an *audited commit*, never a branch tip — libxev's
+And the vendored copy is an *audited commit*, never a branch tip — libxev's
 Zig 0.16 support is a self-described compatibility shim (PR #220) with
 real fixes still unmerged behind it — so a pin moves only after re-audit;
 for zssl that audit means the Zig protocol layer read line by line, the C
@@ -281,7 +466,7 @@ primitives trusted institutionally.
   `xev` directly; it calls `src/io/io.zig`, a comptime-selected facade with
   two backends: `XevIo` (production) and `SimIo` (deterministic
   simulation — virtual sockets, virtual clock, seeded adversarial
-  scheduler, §9). The Zig 0.16 std landscape still rules out building this
+  scheduler, §9). The pinned std landscape still rules out building this
   on `std.Io` directly — `std.Io.Threaded` allocates per task, the
   evented executor has stubbed networking and offers only work-stealing
   scheduling, and `std.crypto.tls` is client-only — each re-verified
@@ -294,12 +479,22 @@ primitives trusted institutionally.
   never `loop.stop()`, which does not wake a blocked loop from another
   thread (libxev #173). `SimIo` delivers drain as just another scheduled
   event.
+  The **UDP arm** is the seam's first optional surface: `udpBind`,
+  `udpAddress`, `udpRecv` (whose completion carries the per-datagram
+  source address), `udpSend` and `udpCloseNow`. Both backends implement
+  it. `XevIo` rides libxev's UDP watcher; `SimIo` routes a datagram
+  through a bounded pool (64 slots, 2 KiB each) with linked per-socket
+  queues, so a seeded run replays one delivery schedule and a full pool
+  drops like a real UDP sender. It stays outside `assertIoInterface` and
+  `assertUdpInterface` records it separately because no serving path
+  calls it yet — the arm exists so the HTTP/3 groundwork starts from a
+  tested transport instead of a type seam.
 - **The data path never sees a `sockaddr` either.** `connect` takes an
   `Io.Address` — an IP address or a Unix socket path (#303, §7) — and
   each backend turns it into whatever the syscall wants. A union rather
   than a `connectUnix` beside `connect`: every dial site stays one call,
   and the family branch lives in the only file allowed to know what a
-  `sockaddr_un` is. The pinned libxev could not express the family at
+  `sockaddr_un` is. The vendored libxev could not express the family at
   all — its `connect` op carries an address union whose members top out
   at 28 bytes against a `sockaddr_un`'s 110 — so this is where the fork
   gained its sixth commit, priced in `build.zig.zon`'s audit note and in
@@ -532,7 +727,7 @@ a raised `RLIMIT_NOFILE`:
 | upstream slots | 1311 | 11457 | ~48 B state |
 | head buffers (ring) | = conn slots | 11457 | `head_buffer_bytes` + 1 B |
 | upstream head buffers | = upstream slots | 11457 | `head_buffer_bytes` + 24 B |
-| tls engines | 0, or min(conn slots, 1024) | 1024 | ~92 KiB + plaintext |
+| tls engines | 0, or min(conn slots, 1024) | 1024 | ~111 KiB + plaintext |
 | tunnels | 0 (off) | 11457 | 2 × `relay_buffer_bytes` |
 | **pool memory** | **~66 MiB** | **~653 MiB** | |
 
@@ -545,6 +740,43 @@ that knob: measured at the ceiling with tunnels and TLS off, the banner
 prints 290 MiB at 4 KiB against 559 MiB at the 16 KiB default, the
 268.5 MiB difference being the relay pool alone.
 
+The HTTP/3 listeners price in the same closed form, as their own terms
+rather than inside the conn-slot pools QUIC sessions never draw from:
+**h3 sessions** = Σ listeners × `max_connections` × `h3_session_slot_bytes`
+(a slot is the 256 KiB connection arena plus the crypto scratch pool, the
+sent rings, the stream/ACK/PTO state and the HTTP/3 session's control and
+QPACK reassembly buffers — `listener.zig` comptime-asserts the real
+`@sizeOf(Slot)` against the price, the way the proxy asserts `Exchange`);
+**h3 exchanges** = Σ listeners × `h3_exchanges` × `h3_exchange_slot_bytes`;
+**h3 parked** = Σ listeners × min(routed endpoints,
+`h3_parked_per_listener_max`) × `h3_parked_slot_bytes`, the keep-alive
+pool's `Parked` bookkeeping record only — the sockets' fds ride the fd
+budget and a parked TLS connection's engine rides the fourth term,
+**h3 upstream tls engines** = Σ TLS-routing listeners × (`h3_exchanges` +
+that same parked bound) × `upstream_tls_engine_bytes_max`. All four read
+zero on a deployment with no `h3_listeners` entry: a feature nobody
+configured costs nothing, on the same terms as tunnels.
+
+`rate_limit_entries` adds one process-wide table when any listener carries
+a `rate_limit` block: 32 bytes per entry, 1 to 1,048,576, printed on its
+own banner line. It is not a pool of per-connection state — one table
+serves every listener, keyed by the client's `/32` or `/64` — so its cost
+is the same whether one listener or all of them rate-limit. The table is
+priced in `PoolSizes` and reserved at `Server.init`, like every other
+term in this section.
+
+`conn_limit_entries` adds a second client-keyed table on the same terms
+when any listener carries a `conn_limit` block: 24 bytes per entry, 1 to
+1,048,576, one table serving every listener. A connection is counted at
+its first admitted request — after a PROXY header has revealed the real
+client — and its count is returned at teardown, after every resource that
+could have kept the slot alive is gone. A released identity leaves a
+**tombstone** rather than clearing its slot: linear probing cannot simply
+empty a slot that a later key may sit past, and the tombstone is both the
+end-of-chain marker a lookup understands and the reusable slot the next
+insertion takes. A table that cannot place an identity within the same
+eight-probe bound as the rate limiter fails open and is counted.
+
 `relay_buffer_bytes` defaults to 16 KiB and is the operator's to size, as
 `head_buffer_bytes` below is. It sets how many round trips a body costs —
 §6's strict recv→send→recv relay is correct at any size, so a 256 KiB
@@ -556,21 +788,29 @@ at 4 KiB, the two together measured ~40% of bulk latency
 multiplies hardest: 11457 pairs is ~358 MiB of relay pool at the default
 against ~90 MiB at 4 KiB, which is why a deployment moving small bodies
 at high concurrency is exactly who should turn it down. The ceiling is
-32 KiB, and the bound that matters is conditional rather than global:
-RFC 8446 caps a record, not a buffer, but `transformOut` hands a whole
-chunk to `sendApp` as a single record with no loop around it (§4), so a
-listener that *terminates* still cannot carry a chunk past one record.
-That is now a refusal at load (`LimitRelayBufferOverTlsRecord`) rather
-than a ceiling everyone pays: a config whose listeners all speak
-plaintext may take the full 32 KiB, and one that terminates TLS is told
-to stay at or under `tls_app_chunk_bytes` instead of silently emitting a
-record no conforming peer may accept. `tls_app_chunk_bytes` and
+32 KiB, and the bound that matters is per record rather than per buffer:
+RFC 8446 caps a record, not a buffer. Every transform that encrypts —
+the head channel, both body legs, and the tunnel relay (§6, §7's
+upgraded connections) — chunks a framed window at `tls_app_chunk_bytes`,
+so a terminating listener may use the full ceiling just as a plaintext
+one does. The old conditional refusal (`LimitRelayBufferOverTlsRecord`)
+retired when the last transform grew its loop; the load-time rule that
+remains is the SNI peek's floor. `tls_app_chunk_bytes` and
 `client_hello_bytes_max` are pinned to the record ceiling itself, not to
-this one, so widening the relay ceiling leaves the TLS engine's outbox
-(`2 × (tls_app_chunk_bytes + 256)`, comptime) and the SNI peek's staging
-bound exactly where they were. Chunking inside the transform is the
-other exit and stays open; it would retire the refusal and let a
-terminating listener take the wider buffer too.
+this one, so widening the relay ceiling leaves the TLS engines' outboxes
+(a fixed number of records at comptime) and the SNI peek's staging bound
+exactly where they were.
+
+A cluster that dials TLS widens two destinations the operator's knobs
+do not name. One drive step on the upstream leg can complete a full wire
+record and a small one, and every record strips its own overhead — so
+the relay halves and the upstream head buffers are each sized at least
+one wire record (16,645 B) whenever any cluster has a `tls` block. The
+default banner shows both terms moving together; a deployment with no
+TLS upstream pays neither. The width is a decryption destination, not a
+new operator knob: `relay_buffer_bytes` and `head_buffer_bytes` still
+govern their plaintext paths, and the effective width is the larger of
+the knob and one wire record.
 
 `head_buffer_bytes` defaults to 8 KiB and is the largest head accepted
 (oversize → 414/431, §7), with a 1 KiB floor and a 1 MiB ceiling: a size
@@ -638,11 +878,16 @@ while `tunnels ≤ conn_slots` holds, which is why that is a rejection at
 load rather than advice.
 
 The **TLS engine pool** (§4) is the one whose default is not "one per
-connection", and the row above says so: an engine is ~92 KiB of zssl
+connection", and the row above says so: an engine is ~111 KiB of zssl
 record and reassembly buffers plus *two* plaintext destinations —
-`max(head_buffer_bytes, 32 KiB)` for the head, which the response head
-then renders back over, and a further 32 KiB for the request body, which
-§7 lets run concurrently with that render and so cannot share it. Two
+`max(head_buffer_bytes + one wire record, 32 KiB)` for the head, which
+the response head then renders back over, and a further 32 KiB for the
+request body, which §7 lets run concurrently with that render and so
+cannot share it. The head destination is wider than the configured head
+on purpose: a decrypt step can carry a complete head and a record's
+worth of body together, and the destination has to hold that step or a
+legal body would be refused as an overflow. What the operator bounded is
+the *head*, and the parser applies that number. Two
 orders of magnitude past a head buffer. One-per-slot at the c10k ceiling would be gigabytes, so the
 default is conn slots *capped* at 1024 and a deployment past that sheds
 rather than reserves. It is zero — the whole feature free — unless some
@@ -811,14 +1056,18 @@ Rules:
   identity. Decided here, implemented with the features that need it: a
   key with no feature behind it is not a freeze, it is a promise.
 
-  All three of those features ship *after* 1.0.0, which turns this record
-  from a convenience into the contract they are held to. Two of them add
-  keys and are additive by nature. The certificate set is not: today's
-  `tls` is one `{cert, key}` pair, and a freeze means a config that was
-  valid at 1.0.0 stays valid. So `cert`/`key` survive as the one-pair
-  spelling of `certificates`, the way `endpoints` already accepts a bare
-  literal beside its object form and `pick` accepts a bare policy beside
-  its object — sugar for the common case, one general form underneath.
+  All three of those features were deferred past 1.0.0; the certificate
+  set ships now (#297), and upstream TLS's client seam and trust store
+  exist, with the L7 exchange path in Stage 1: request bodies forwarded,
+  upstream sessions parked and reused, health checks over TLS, upgrade
+  tunnels carried through either end's TLS, and the same one free replay
+  a plaintext try gets. Client CA
+  (#304) remains deferred. The
+  set is additive: `cert`/`key` survive as
+  the one-pair spelling of `certificates`, the way `endpoints` already
+  accepts a bare literal beside its object form and `pick` accepts a bare
+  policy beside its object — sugar for the common case, one general form
+  underneath.
   Breaking it instead would be the freeze meaning nothing the first time
   it was tested.
 - **An address is a string, and `unix:` extends its grammar** (#303,
@@ -1474,13 +1723,21 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   write a *constant*, so an edit here would encode one fixed address for
   every client — forwarding's exact opposite — and barring the name means
   one mechanism owns the header rather than two that can disagree.
+  The same block optionally writes **`X-Real-IP`** (the observed peer,
+  nginx's spelling) and **`X-Forwarded-Proto`** (`http`/`https` from the
+  receiving listener). Both are opt-in bools beside `mode`, tagged and
+  suppressed on the same rule, and barred from filter edits for the same
+  constant-value reason: one fixed address or one fixed scheme is a lie
+  on every listener but the one it describes.
 - **Configurable filters/rules: filters are data, not code.**
   Zero-alloc extensibility means no plugins,
   no closures, no dynamic dispatch chains — instead, a rule is *compiled
   at config time* into bounded, immutable tables in the config arena
-  (match programs over method/host/path/header slices; action lists drawn
-  from a closed enum: reject-with-status, add/remove/set header, rewrite
-  path prefix). The rule table, a rule's action list and a rule's header
+  (match programs over method/host/path/header slices, plus
+  ASCII-case-insensitive `path_contains`/`query_contains`/`query_prefix`
+  over the canonical path and raw query; action lists drawn from a closed
+  enum: reject-with-status, add/remove/set header, rewrite path prefix).
+  The rule table, a rule's action list and a rule's header
   matches carry no static limit: each is an arena slice at exactly the
   length the config asked for, and evaluation is a bounded loop over
   that length. `header_edits_max` is the one static limit here, and the
@@ -1510,6 +1767,21 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   with unbounded fuel or an embedded allocator cannot satisfy the gate);
   anything beyond the closed action enum is a Zig function added to the
   owning phase module at compile time.
+  Two precedence facts sit beside the walk. A listener-level **WAF-lite
+  denylist** runs before it: literal, ASCII-case-insensitive patterns over
+  canonical path, raw query and header values, bounded by the head buffer
+  and answered with a configured reject status — no body inspection, no
+  decoding, and no filter `allow` can exempt it. And a listener-level
+  **token bucket** runs before both, keyed by the client's `/32` or `/64`;
+  it is a fixed table (`limits.rate_limit_entries`, 32 B/entry) with a
+  bounded probe, answering `429` and failing open when the table is full.
+  Beside it, a listener-level **connection cap** (`conn_limit`,
+  `limits.conn_limit_entries`, 24 B/entry) counts a client's concurrent
+  connections, answering `503` at the cap; it is counted once per
+  connection at its first admitted request and returned at teardown, so
+  keep-alive does not consume it repeatedly.
+  All three are opt-in per listener, so a deployment that does not ask
+  pays nothing.
 - **A filter can match on who is connecting** (#177, settled
   2026-08-03). `match.client` is a CIDR list, any-of across the list
   and conjoined with the rest. It refuses a range — the list on a
@@ -2197,8 +2469,9 @@ origin, not one this proxy can pick for them.
   serve it, while a dangling name is a load error rather than a
   silently empty page — the `clusters` idiom, applied to the same kind
   of thing.
-  Each configured page is rendered **at load** into two complete
-  responses — both persistence variants, status line through body, one
+  Each configured page is rendered **at load** into up to four complete
+  responses — both persistence variants, each with a plain and a gzip
+  body when the client accepts gzip — status line through body, one
   contiguous arena buffer each — with the head length recorded so a
   `HEAD` request sends that same buffer's prefix. Serving one is
   therefore the comptime path unchanged: one send from immutable
@@ -2232,6 +2505,18 @@ origin, not one this proxy can pick for them.
   one status no rung raises. Response filters (#175) cannot carry the
   action at all — those rules run when an origin response already
   exists, and replacing it is not an edit.
+- **Proxied compression is a bounded transform, not a pump feature**
+  (settled 2026-10-18). Zig's `std.compress.flate` exposes no flush, so a
+  stream that interleaves one recv with one send cannot emit a valid gzip
+  member incrementally. Rather than buffer an unbounded body or re-frame
+  it into chunks, the proxy compresses only what is provable in one step:
+  the origin's entire body arrived coalesced with its head, framing is
+  `Content-Length`, the status is `200`, the type is compressible, and
+  the body is at most 64 KiB. The result is copied into the client head
+  buffer and committed with the head, so the body pump stays byte-identical
+  and the compressor is one process-wide buffer counted in §5. Everything
+  else — SSE, large bodies, chunked — passes through untouched; front a
+  CDN or compress at the origin for those.
 - **A shed keeps the connection when it can.** Closing is not free: it
   costs the client a handshake and this proxy an accept, a conn slot and
   an admission — so an always-closing shed is *more* expensive per
@@ -2376,7 +2661,10 @@ origin, not one this proxy can pick for them.
   carrying the
   client, method, canonical host and path (§7), status, outcome,
   duration, byte counts each way, and the cluster and endpoint that
-  served. `outcome` is not derivable from `status` and that is the point:
+  served. A route may opt its requests out with `access_log: false`; the
+  check happens at the top of `logExchange`, so the line is skipped while
+  counters, metrics and admission are untouched — suppressing a line is
+  not suppressing an observation. `outcome` is not derivable from `status` and that is the point:
   an origin's own `503` and this proxy's shed `503` are the same three
   digits and opposite events. The two answer different questions — what
   the origin said, and whether the client got it — so `status` is
@@ -2470,7 +2758,11 @@ origin, not one this proxy can pick for them.
   async and signal fds — evaluated on the *effective* config
   (`fdsRequired`, so a lean deployment demands only what it uses) and
   asserted against `RLIMIT_NOFILE` at startup, next to the memory
-  printout, so `EMFILE` is unreachable rather than a ladder rung.
+  printout, so `EMFILE` is unreachable rather than a ladder rung The h3 listeners'
+  UDP sockets, exchange sockets and parked keep-alive sockets are terms
+  of the same count, and their memory — session, exchange and parked
+  pools plus the h3 engine pool — is part of the §5 memory total, priced
+  on the same per-listener formulas as that section names.
 - **The ring is pre-budgeted, not shed.** The in-flight op count is
   closed-form — per-connection ops (bounded by the strict relay
   discipline) × conn slots + parked upstreams + timers — evaluated on the
@@ -2892,6 +3184,11 @@ src/
   tls/
     Engine.zig        // zssl wrapper: sans-I/O TLS 1.3 seam, pooled (§4, §5)
     Credentials.zig   // per-listener PEM chain + signing key, parsed once (§4)
+    CredentialSet.zig // per-listener SNI set: names, selection, default (§4)
+    CredentialStore.zig // bounded rotation generations + SIGHUP reload (§4)
+    TrustStore.zig    // upstream trust anchors + RFC 9525 chain/name check (§4)
+    ClusterTls.zig    // per-cluster upstream trust + mTLS, loaded at startup (§4)
+    UpstreamTls.zig   // sans-I/O TLS 1.3 client seam for upstream legs (§4)
     libcrypto_heap.zig // libcrypto's mallocs into one fixed startup buffer (§4, §5)
   balancer.zig        // upstream endpoint pick: rr | p2c | hash (§7)
   shed.zig            // exhaustion ladder: decisions + static responses (incl. configured pages, #159)
@@ -2956,15 +3253,16 @@ RFC 9111 (caching) binds only an implementation that caches, which §1
 rules out — a non-caching gateway inherits nothing from it. RFC 9113,
 9114 and 9204 arrive with #173 and #197 and not before.
 
-**TLS, because this proxy terminates it** (§4). RFC 8446 is the protocol
-and §4.6.1 its resumption tickets; **6066** §3 is SNI, which is what a
-terminating proxy selects credentials on; **7301** is ALPN, which is how
-`http/1.1` is advertised and the gate #173 opens behind. Two BCPs are
+**TLS, because this proxy terminates it and, in Stage 1, originates it**
+(§4). RFC 8446 is the protocol and §4.6.1 its resumption tickets; **6066**
+§3 is SNI, which selects a listener's credentials and names the origin on
+the upstream leg; **7301** is ALPN, which is how `http/1.1` is advertised
+and the gate #173 opens behind. Two BCPs are
 prescriptive rather than definitional and are treated as binding anyway:
 **9325** (secure use) and **8996** (TLS 1.0/1.1 deprecated). **9525** —
-service identity in certificates, which obsoleted 6125 in 2023 — binds
-only an implementation that *originates* TLS to its upstreams, which
-this one does not; it becomes load-bearing the day it does.
+service identity in certificates, which obsoleted 6125 in 2023 — binds the
+upstream TLS client, the one path here that *originates* TLS: it matches
+the origin's leaf against the cluster's `server_name`.
 
 **Per feature.** RFC **6455** §4 is the opening handshake #180
 recognises — tunnelling means never implementing the protocol, but

@@ -92,7 +92,7 @@ is the exception: it never serves, so its report can use stdout.
 | signal | effect |
 |---|---|
 | `SIGTERM`, `SIGINT` | drain in-flight connections, then exit 0 |
-| `SIGHUP` | reopen the access log's `file` sink — rotation, and nothing else |
+| `SIGHUP` | reopen the access log's `file` sink and load the next TLS certificate generation |
 | `SIGUSR1` | ignored |
 
 A completed drain prints the counters once on its way out. A drain that
@@ -125,9 +125,10 @@ is the same listener with health checks and the access log turned on.
 
 ### Replacing a running instance
 
-There is no reload. The pools, the ring and every table are sized from the
-config at startup and never grow, so nothing re-reads the file. `SIGHUP`
-means log rotation and nothing else, and hot restart is a non-goal
+There is no config reload. The pools, the ring and every table are sized
+from the config at startup and never grow, so nothing re-reads the file.
+`SIGHUP` reopens the access log and reloads the TLS certificate set, but
+it never re-reads `config.json`; hot restart is a non-goal
 ([DESIGN.md](DESIGN.md) §1).
 
 Instead, every listener is bound with `SO_REUSEPORT`, so a second process
@@ -286,6 +287,46 @@ Both files are read once at startup, so a missing or unusable file stops
 the proxy with an error naming the file, never mid-handshake. `cert` is a
 PEM chain, leaf first; `key` is the leaf's PEM private key.
 
+#### More than one name on one listener
+
+`certificates` is the SNI form: one or more `cert`/`key` pairs, selected by
+the name the client asked for. The first entry is the default — what a
+client with no SNI, or a name no entry claims, receives.
+
+```json
+"tls": {
+    "certificates": [
+        { "cert": "/etc/zoxy/api.crt", "key": "/etc/zoxy/api.key",
+          "names": ["api.example.com"] },
+        { "cert": "/etc/zoxy/www.crt", "key": "/etc/zoxy/www.key" }
+    ]
+}
+```
+
+`names` is optional. Absent or empty, the names come from the leaf's
+`subjectAltName` DNS entries, falling back to its common name. Matching is
+ASCII case-insensitive and follows RFC 6125: an exact name, or a leftmost
+`*.` wildcard matching exactly one label (`*.example.com` matches
+`a.example.com`, not `example.com` or `a.b.example.com`). A trailing dot is
+ignored. One listener carries at most 16 pairs.
+
+Every certificate follows the same rules as the one-pair form: ECDSA
+P-256/P-384, read once at startup, and a bad file is refused with the
+listener and certificate number named.
+
+`SIGHUP` reloads the set from the configured paths. The new generation
+serves new handshakes while the old one finishes the handshakes already in
+flight; a reload that fails names the listener and certificate and keeps
+the old generation, so a bad certificate cannot take the listener down.
+Four generations are reserved at startup (the initial load plus three
+rotations), and the banner prints that reservation as `tls reload`. After
+the fourth, a reload is refused and the process restarts to pick up the
+new files.
+
+That reload is inbound only. A cluster's upstream `ca_file`, `client_cert`
+and `client_key` are read once at startup and are not re-read on `SIGHUP`;
+changing them needs a restart.
+
 Either protocol may terminate. The handshake runs as a phase ahead of the
 protocol, so routing, filters, redirects and access logs work exactly as
 they do in the clear.
@@ -300,8 +341,11 @@ listener. That header is staged in the relay buffer, which a terminated
 connection's wire bytes do not pass through, so the combination is
 rejected at load rather than sent to the origin as garbage.
 
-Termination is inbound only. The connection zoxy opens to the backend stays
-plaintext.
+Termination is inbound only. An `http` listener's connection to its
+backend is plaintext unless that cluster sets its own `tls` block (see
+[TLS to the origin](#tls-to-the-origin)); an `l4` listener does not
+originate TLS, whether or not it terminates it. Terminating on one side
+never implies TLS on the other.
 
 `limits.tls_engines` bounds how many TLS sessions may be in flight at once.
 It is the largest single line in the startup banner's memory budget; see
@@ -367,8 +411,9 @@ refused at startup. It may not exceed `conn_slots`.
 The pool is separate from the buffers ordinary traffic uses. Every other
 pool is sized for concurrent activity, and an idle keep-alive connection
 holds no head buffer, but a tunnel pins its relay buffer for its whole
-life. A separate pool means tunnels cannot starve HTTP. Each costs 8200
-bytes, printed in the startup banner.
+life. A separate pool means tunnels cannot starve HTTP. Each costs one
+relay pair — 32,808 bytes at the 16 KiB default, 33,330 when a `tls`
+cluster widens both halves — printed in the startup banner.
 
 When the pool is full the upgrade is refused with `503` before the
 handshake reaches the origin, so a refusal costs no backend connection.
@@ -384,6 +429,10 @@ ones that became sessions.
 - The upgraded upstream connection leaves the keep-alive pool and is never
   reused for another client. It still counts against the cluster's
   `max_inflight` for as long as the tunnel lives.
+- Through a `tls` cluster the tunnel also holds that connection's TLS
+  engine for its whole life. `upstream_slots` is therefore the ceiling on
+  concurrent TLS tunnels; exhausting it sheds fresh TLS dials, never an
+  established tunnel.
 
 The access log writes one line when the tunnel closes: `kind` `http`,
 `status` `101`, the request facts that opened it, and `bytes_in` and
@@ -421,6 +470,197 @@ connection.
 > Releases up to 0.3.0 bounded nothing. A deployment proxying uploads
 > larger than 1 MiB needs `max_body_bytes` raised, or set to `0`, before
 > upgrading.
+
+### HTTP/3 listeners (experimental)
+
+An `h3_listeners` entry binds a UDP socket, terminates QUIC-TLS, and
+proxies each request over plaintext HTTP/1.1 to the cluster its route
+table selects:
+
+```json
+"h3_listeners": [
+    {
+        "bind": "0.0.0.0:443",
+        "routes": [
+            { "host": "api.example", "prefix": "/api", "cluster": "api" },
+            { "prefix": "/", "cluster": "origin" }
+        ],
+        "tls": {
+            "cert": "/etc/zoxy/fullchain.pem",
+            "key": "/etc/zoxy/key.pem"
+        },
+        "max_connections": 64,
+        "max_response_bytes": 65536
+    }
+]
+```
+
+`"cluster": "name"` remains sugar for a single catch-all route. The
+table is the HTTP/1.1 listener's §7 routing, every dimension included:
+a host scope, an optional `header` predicate (`equals` or `present`,
+#302), and the longest path prefix that respects segment boundaries —
+a conjunction, matched most-specific-first (host, then header, then
+prefix), the same table the TCP listener builds. A route may also set
+`access_log: false`: its requests drop out of the access log only — the
+counters and admission stay, nginx's `access_log off` at a location. A
+request nothing matches is answered `404`, the `l7_no_route` verdict of
+the TCP path. Every cluster a route can select must dial over IP: a
+`unix:` endpoint is refused, exactly as the old single-cluster form
+refused it.
+
+The answers the listener writes itself can wear configured pages:
+
+```json
+"h3_listeners": [
+    {
+        "bind": "0.0.0.0:443",
+        "routes": [ { "prefix": "/", "cluster": "origin" } ],
+        "tls": { "cert": "/etc/zoxy/fullchain.pem", "key": "/etc/zoxy/key.pem" },
+        "error_pages": {
+            "no_route": "friendly-404",
+            "bad_gateway": "origin-down",
+            "gateway_timeout": "origin-slow"
+        }
+    }
+]
+```
+
+Each value names a body from the global `bodies` table, rendered through
+the same pipeline the HTTP/1.1 listener's `error_pages` use — one
+rendering per (body, status) pair, shared across both protocols. Absent
+keys keep the built-in text. The h3 answer writes its own HEADERS, so
+only the page's body crosses the seam; the status the family wears
+(404/502/504) is unchanged.
+
+QUIC has no plaintext mode, so `tls` is required. There is no SNI set: the
+process presents one identity, and two HTTP/3 listeners naming different
+certificate paths are refused at load. `--check` reads the same files, so
+a missing certificate is a startup error that names it rather than a
+failed first handshake.
+
+The upstream leg is HTTP/1.1 — plaintext, or TLS when the selected
+cluster carries a `tls` block — keep-alive pooled: a fully framed
+response that does not announce `Connection: close` parks its
+connection for the endpoint's next request (one parked connection per
+endpoint, idle-reaped after 30 s), and a checkout miss simply dials
+fresh. A connection whose origin silently closed fails its next
+exchange with a 502 — never retried, because the request may not be
+idempotent. A TLS dial runs the same sans-I/O client engine the TCP
+path dials with (`src/tls/UpstreamTls.zig`) against the same loaded
+`cluster.tls` state — `verify`, the CA bundle, `server_name` (SNI and
+the RFC 9525 name check) and an optional client certificate mean one
+thing on both protocols. The handshake runs before the request leg and
+inside the same `h3_exchange_ms` deadline; a handshake failure — refused
+verification, malformed flight, origin alert — is the dial's 502, and a
+parked TLS connection checks out with its session and never pays a
+second handshake.
+
+Responses stream: the head relays the moment it parses, then body
+chunks relay as they arrive — `Content-Length`, `Transfer-Encoding:
+chunked` (decoded incrementally, split size lines and all) and
+close-delimited bodies all ride the one streaming path, so replies
+are not bounded by a staging buffer. Each response body is still
+capped at `max_response_bytes` (64 KiB default, configurable up to
+16 MiB): a `Content-Length` past the cap is refused before the head
+goes out (the 502), a chunked or close-delimited body that crosses it
+mid-stream is cut off with a stream reset (counted as a `bad_gateway`),
+and a truncated or malformed chunked body — or a `Content-Length` the
+origin's EOF arrives before — ends the same way once the head is on
+the wire. A short client window pauses the relay (the origin's TCP
+backs up naturally) and the listener's window notify resumes it.
+
+Requests stream the same way. The session hands body bytes to the
+handler as DATA-frame chunks — `Request.body` is always empty, and a
+handler that neither answers nor subscribes to the chunks cannot
+consume the upload, which the session drops as malformed — and the
+proxy stages them into the exchange's upload queue, re-framing per the
+head it rendered at dial time: a client `Content-Length` passes through
+verbatim, a piece that under- or over-runs the declared count answered
+`400` before the origin can receive framing that lies, and a request
+without one commits to generated `Transfer-Encoding: chunked`, each
+piece riding its own size line with the client's fin staging the
+`0\r\n\r\n` terminator. A request whose QUIC stream ended on its
+HEADERS frame — the plain GET — renders head-only instead: no generated
+framing header and no terminator, an empty upload read as "the upload
+already complete" rather than a zero-length chunked body the origin
+must still decode. The exchange is full duplex: the response read arms
+the moment the request head is credited, so an origin that answers
+early — a 4xx refusal, a 100, an echo that beats the upload's fin —
+starts relaying while the upload is still streaming. The two directions
+own separate staging (`upload_buf`/`upload_spill` against the
+response's `chunk`/`head_buf`) and separate completions on the one
+upstream socket, so send backpressure and recv backpressure park
+independently. An early answer that closes the connection orphans the
+upload: the proxy keeps consuming the client's stream and drops the
+bytes (never a reset — the client is not accused of a request the
+origin chose not to read), and the connection never parks, since bytes
+the origin never read would desync the next request. A 1xx from the
+origin is skipped per RFC 9110 §15.2 and never relayed. The connection
+settles — parks for reuse, or closes — only when both directions are
+done: the response fully relayed, the upload's fin (and terminator, for
+chunked) reached the origin.
+
+One exchange carries two deadlines, and expires on whichever comes
+first. `timeouts.h3_exchange_ms` (default 10 s, `0` disables) is the
+absolute budget from the exchange's begin — the dial, the send and the
+receive window across the streamed response — and a leg that outlives it
+is answered `504`, or, after the head went out, its stream is reset and
+the witness records a `bad_gateway`. `timeouts.h3_exchange_idle_ms`
+(default `0`, off) is the idle variant: any application progress in
+either direction — an uploaded body piece, a parsed response head, a
+relayed body chunk — resets it, so a stream that keeps moving (SSE, a
+deliberate drip) is never killed by the absolute budget its longevity
+would outrun. Set it to 15000-30000 for SSE endpoints; leave it off
+where the absolute budget is the policy.
+
+`max_connections` is the listener's memory knob: each session slot embeds
+a fixed 256 KiB arena. The default is 64 (about 16 MiB per listener), and
+the loader caps the value at 1024.
+
+This path is deliberately narrower than the HTTP/1.1 listener: no
+filters, rate limits or connection limits. It is observed like the
+HTTP/1.1 traffic, though.
+An h3 request earns one access-log line in the configured sink — the
+same `kind:"http"` record the TCP listener writes, naming the cluster
+the matched route selected, counting payload
+bytes where the TCP line counts wire bytes, and naming no configured
+headers yet — and its requests, responses, `502`/`504` verdicts, `503`
+sheds and opened/closed sessions land in the same process counters as
+the HTTP/1.1 traffic, rendering through `/metrics` and the exit tally
+as the `zoxy_h3_*` family: every h3 request lands in exactly one verdict
+bucket — `h3_responses`, `h3_bad_gateway`, `h3_gateway_timeout`,
+`h3_shed_busy`, or `h3_no_route` — the sum a deployment's h3 traffic
+answers to, with `h3_no_route` the operational signal a mistyped-host
+probe files under. With no `access_log` block the path stays
+silent: no line, no reservation, counters only.
+
+An `http` listener points HTTP/1.1 clients at the UDP port with an
+`Alt-Svc` advertisement (RFC 7838): name the value and every proxied
+final response head carries it, so a client that trusts the hint can
+open the next connection over QUIC. The value is sent **verbatim** — the
+operator writes the full field content, `ma=` included — and the choice
+is per listener, since what sits in front of the socket decides whether
+the announcement is true:
+
+```json
+{ "bind": "0.0.0.0:443", "http": { "cluster": "origin",
+  "h3_advertise": "h3=\":4443\"; ma=3600" } }
+```
+
+The value must be 1–128 bytes; an empty or over-long one is refused at
+load. Until a client trusts the hint, point it at the UDP port directly
+(for example, `curl --http3-only https://host:443/` with a client built
+for HTTP/3). For a scripted interop check, `scripts/h3-interop-client.py`
+is a minimal aioquic client pinned to an IPv4 socket — aioquic's default
+path opens a dual-stack IPv6 socket whose IPv4-mapped sends some hosts
+(mostly observed on macOS) drop intermittently, which reads exactly like
+a server-side hang; the script removes that variable:
+
+```sh
+pip install aioquic            # any venv
+python3 scripts/h3-interop-client.py 4443
+# -> STATUS 200 / BODY ...
+```
 
 ### Routing
 
@@ -491,6 +731,11 @@ Config order decides one case. Two routes sharing a host and a prefix but
 naming **different** headers are equally specific, and a request carrying
 both headers matches both. The one written first wins.
 
+A route may also carry `"access_log": false`, which suppresses the
+access-log line for requests it answers — nginx's `access_log off` at a
+location. Counters, metrics, admission and the traffic itself are
+unchanged; the line is the only thing omitted.
+
 Two things to know before relying on this. A request that gains or loses
 the header **moves to a different cluster**, so a `hash` pick holds within
 each cluster but not across the change. And the header is a routing key
@@ -545,6 +790,89 @@ its settings. `hash` takes only the object form, naming its key
 (`source_ip`, `header` or `cookie`).
 
 Upstream connections are pooled process-wide and reusable by any request.
+A cluster with a `tls` block parks and reuses its TLS connections the same
+way: a checked-out session that is still healthy skips the handshake. A
+parked session the origin closed while idle is discovered on first use,
+and — as on the plaintext path — that early failure takes the one free
+replay on a fresh dial, which re-encrypts the still-intact request head
+under the new session's keys.
+
+#### TLS to the origin
+
+A cluster with a `tls` block dials its endpoints over TLS 1.3 instead of
+plaintext. It is the same key as a listener's, read from position: here it
+originates, there it terminates.
+
+```json
+"clusters": {
+    "api": {
+        "endpoints": ["10.0.0.1:8443"],
+        "tls": {
+            "server_name": "api.internal.example",
+            "ca_file": "/etc/zoxy/origin-ca.pem",
+            "client_cert": "/etc/zoxy/zoxy.pem",
+            "client_key": "/etc/zoxy/zoxy.key"
+        }
+    }
+}
+```
+
+| field | required | meaning |
+|---|---|---|
+| `server_name` | yes | The SNI name sent to the origin and the name its certificate must match. It is never inferred from an endpoint: `10.0.0.1:8443` is an address, not an identity. |
+| `ca_file` | when `verify` is true | PEM bundle of trust anchors. |
+| `client_cert` | with `client_key` | PEM client chain, leaf first, presented when the origin asks for a client certificate (mTLS). |
+| `client_key` | with `client_cert` | The client chain's PEM private key. |
+| `verify` | no; default `true` | Verify the origin's chain to `ca_file` and its leaf against `server_name` (RFC 9525). |
+
+The trust anchors are exactly this file; there is no system CA store. A
+deployment that wants the host's bundle names it in `ca_file`.
+
+`client_cert` and `client_key` are both or neither; naming one alone is
+refused at load. The key follows the listener's rule — ECDSA P-256 or
+P-384 — because both directions go through one credential loader and the
+handshake runs on the event loop. A key the listener would refuse is
+refused here too, at startup.
+
+The files this block names are read once at startup. A missing or unusable
+file stops the process with an error naming the path, before a port is
+taken, rather than failing under traffic. `SIGHUP` does not re-read them:
+it rotates listener certificates only, so changing a cluster's CA or
+client pair needs a restart.
+
+`verify` is on by default. Setting it to `false` still encrypts the
+connection but authenticates nothing: any peer able to intercept the TCP
+stream is accepted, and `ca_file` is ignored even when present. Use it only
+on a controlled network where another layer authenticates the origin — it
+never means "verify nothing" on a public link. `server_name` is still
+required and still sent as SNI.
+
+The remaining limits are deliberate, not gaps discovered in use:
+
+- Request bodies are forwarded, chunked ones included, under the ordinary
+  §7 cap and framing rules: a declared over-cap body is still `413`, and
+  the body streams through the same relay discipline a plaintext origin
+  uses.
+- TLS upstream connections park and reuse like plaintext ones; a reuse
+  skips the handshake. An `http` health check on a TLS cluster performs
+  its own handshake and probes over it; a `tcp` check stays a plain
+  connect, since it only wants the SYN/ACK and never speaks HTTP.
+- An `Upgrade` may cross this hop. The tunnel relay encrypts and decrypts
+  both ends independently, so a client side and an origin side can each
+  speak TLS, and a half-close is announced with `close_notify` before the
+  write half shuts down.
+- A failed TLS exchange takes the same one free replay as a plaintext
+  one: a stale parked session (or an early failure before any response
+  byte) is retried on a fresh dial, re-encrypting the request head under
+  the new session's keys. Once any request-body chunk has been pumped,
+  the try is no longer reconstructible and the failure reaches the
+  client.
+- An `l4` listener routing to this cluster is refused at load: the relay
+  is transparent and never originates TLS, so the origin would receive
+  the client's bytes without a handshake in front of them.
+
+That refusal is load-time rather than best-effort: a config that cannot
+mean what it says stops with an error naming the rule.
 
 #### Weights
 
@@ -776,6 +1104,14 @@ status). Defaults: `fall` 3, `rise` 2, `expect_status` 200, and a probe
 budget of `timeouts.connect_ms` unless `timeout_ms` overrides it.
 `timeouts.health_interval_ms` (default 2000) paces the gap between sweeps.
 
+On a cluster with a `tls` block, an `http` check completes the handshake
+and sends the probe encrypted, judging the status exactly as it does in
+the clear. A `tcp` check stays a plain connect: it only wants the SYN/ACK
+and never speaks HTTP. Probes draw their TLS engine from the same pool as
+data traffic; if every engine is serving a request, that probe is skipped
+rather than recorded as a failure, so saturation cannot eject a healthy
+endpoint.
+
 If *every* endpoint in a cluster is ejected, zoxy fails open and uses them
 all. Routing nowhere would turn a probe verdict into an outage.
 
@@ -853,6 +1189,75 @@ count refusals, kept apart from `zoxy_l7_shed_upstream_slots`, which means
 zoxy ran out of its own slots and wants a wider pool rather than a busier
 backend.
 
+### Rate limiting
+
+Per listener and opt-in: a token bucket keyed by the client's IPv4 `/32`
+or IPv6 `/64` (the same identity `client` filters and `source_ip` hashing
+use). Above the rate, HTTP requests are answered `429`; the connection
+closes because the body may still be unread.
+
+```json
+"listeners": [
+    { "bind": "0.0.0.0:443", "http": {
+        "cluster": "api",
+        "rate_limit": { "requests": 100, "window_ms": 1000, "burst": 200 } } }
+],
+"limits": { "rate_limit_entries": 4096 }
+```
+
+| field | meaning |
+|---|---|
+| `requests` | tokens refilled per `window_ms` (1..1,048,576) |
+| `window_ms` | refill window (1..`timeout_ms_max`) |
+| `burst` | bucket capacity; optional, defaults to `requests`, must be at least `requests` |
+| `limits.rate_limit_entries` | table slots (32 B each), **required** when any listener has a limit, refused without one |
+
+The table is fixed at load and probed at most eight slots deep: no
+allocation per request and no unbounded scan. Keying is per address, not
+per listener, so one client hitting two listeners shares a bucket. A
+table with no free slot within the probe **fails open** and increments
+`zoxy_l7_rate_limit_full` — a rising count is the signal to widen
+`rate_limit_entries`, not an outage. `zoxy_l7_rate_limited` counts the
+`429`s. A `unix:`-bound listener has no client address and is inert.
+
+Limit the head only: malformed or oversized requests are answered before
+this check, and the bucket is consumed by any admitted request, including
+one a [WAF](#waf-lite-denylist) then refuses.
+
+### Connection limits
+
+A listener may also cap how many connections one client holds at once.
+The token bucket above answers "too many requests"; this answers "too
+many sockets", and the two are independent:
+
+```json
+"listeners": [
+    { "bind": "0.0.0.0:443", "http": {
+        "cluster": "api",
+        "conn_limit": { "max": 256 } } }
+],
+"limits": { "conn_limit_entries": 4096 }
+```
+
+| field | meaning |
+|---|---|
+| `max` | concurrent connections one client identity may hold (1..11457) |
+| `limits.conn_limit_entries` | table slots (24 B each), **required** when any listener has a cap, refused without one |
+
+A connection is counted at its **first admitted request**, not at
+accept: after a PROXY protocol header is parsed is the first point a
+listener knows the real client. Every request on a keep-alive connection
+shares that one count. A request that would take the client past `max`
+is answered `503` and the connection closes, because the request body may
+still be unread.
+
+One request that fits but whose identity the table cannot place (no free
+slot within eight probes) **fails open** and increments
+`zoxy_l7_conn_limit_full`; `zoxy_l7_conn_limited` counts the `503`s. As
+with rate limiting, a rising `conn_limit_full` is the signal to widen
+`limits.conn_limit_entries`, not an outage. Connections that never send a
+request are bounded by the global `conn_slots` pool instead.
+
 ### Client address
 
 One address is used everywhere it matters: the `source_ip` hash pick, a
@@ -926,14 +1331,31 @@ position, and zoxy cannot tell from the inside which position it is in.
 
 Omit the block and the header is passed through untouched.
 
+The same block can also write the two companion headers nginx deployments
+expect. Both are off by default, because a deployment that does not read
+them should not be handed a second spelling of the same fact:
+
+```json
+"forwarded": { "mode": "replace", "real_ip": true, "proto": true }
+```
+
+- `real_ip` writes `X-Real-IP` with the same observed peer as
+  `X-Forwarded-For` — the PROXY-announced address on a listener that
+  accepts one, never an inbound header.
+- `proto` writes `X-Forwarded-Proto` as `http` or `https` from whether
+  this listener terminates TLS.
+
+When either is written, inbound copies of that header are suppressed for
+the same reason as `X-Forwarded-For`: two spellings that disagree is the
+disagreement the header exists to prevent. Filters may not set
+`X-Forwarded-For`, `X-Real-IP` or `X-Forwarded-Proto`; the loader rejects
+them.
+
 The carried chain is bounded. A chain grows by an address per hop and
 nothing in HTTP caps it, so past `forwarded_chain_bytes_max` (512) it is
 dropped *whole*, leaving the line stating only the observed peer. A
 truncated chain would read as complete. `zoxy_forwarded_chain_dropped`
 counts that.
-
-Filters may not set `X-Forwarded-For`; the loader rejects it. A filter can
-only write a constant, which would pin one fixed address to every client.
 
 #### Sending PROXY protocol
 
@@ -1003,12 +1425,15 @@ of [routes](#routing), which are sorted by specificity at load.
 ]
 ```
 
-Match on `method`, `host`, `path_prefix`, header predicates (`present`,
-`equals`, `contains`), and `client`, a list of CIDR ranges the
-connection's address must fall inside. Actions are `reject` with a
-status, `redirect`, `respond` (answer from a configured body), `allow`
-(forward and stop reading rules), `header_set`, `header_add`,
-`header_remove`, and `rewrite_prefix`.
+Match on `method`, `host`, `path_prefix`, `path_contains`, `query_contains`,
+`query_prefix`, header predicates (`present`, `equals`, `contains`), and
+`client`, a list of CIDR ranges the connection's address must fall inside.
+Actions are `reject` with a status, `redirect`, `respond` (answer from a
+configured body), `allow` (forward and stop reading rules), `header_set`,
+`header_add`, `header_remove`, and `rewrite_prefix`. The three new
+predicates are ASCII case-insensitive; `query_contains`/`query_prefix` see
+the raw query with no percent-decoding, and `path_contains` sees the same
+canonical path routing uses.
 
 Only `reject`, `redirect`, `respond` and `allow` end the walk. A rule
 whose actions are all edits, such as the `header_set` above or a
@@ -1021,6 +1446,33 @@ Rules compile into immutable tables at load and are interpreted with
 bounded loops: no plugins, no scripting, nothing that can allocate or run
 unbounded. A rewrite changes only what is *forwarded*. Routing already
 chose the cluster from the original path, so a rewrite never re-routes.
+
+#### WAF-lite denylist
+
+A listener-level literal denylist, evaluated once per request before the
+filter walk. A hit is answered with the configured status and never
+routed or dialed; a filter `allow` cannot exempt it.
+
+```json
+"http": {
+    "cluster": "api",
+    "waf": { "deny": ["union select", "<script", "../"], "status": 403 }
+}
+```
+
+- `deny` is 1..64 literals, each 1..256 bytes, matched ASCII
+  case-insensitively against the canonical path, the raw query, and every
+  header **value**.
+- `status` is `403` by default and may be `400`, `403`, `404` or `429`
+  (the static reject set).
+- `zoxy_l7_waf_blocked` counts hits.
+
+It is deliberately head-only: no body inspection, no percent-decoding, no
+regex, no Unicode folding, and no provenance for a substring. Those are
+bypass surfaces and false-positive surfaces at once — a benign `select`
+in a query parameter is refused like an injection. Use it as one layer
+beside strict request parsing, CIDR rules and [rate limiting](#rate-limiting),
+not as a replacement for a full WAF. Body scanning is not implemented.
 
 #### Matching the client address
 
@@ -1191,6 +1643,52 @@ the request like `reject` and `redirect` do, but counts as
 `zoxy_l7_responded` and logs as `responded`, since refusing traffic and
 serving it are different facts. Statuses are `200` plus the error set.
 
+#### Precompressed static answers
+
+Every configured body — `respond` and `error_pages` alike — is gzipped
+once at load. When the request's `Accept-Encoding` accepts gzip (an
+explicit `gzip` or `*`; `q=0` declines; q-values are parsed), the answer
+is sent with `Content-Encoding: gzip`, `Vary: Accept-Encoding` and the
+compressed length; otherwise the plain body is sent unchanged. `HEAD`
+gets the selected variant's headers without a body.
+
+This is static-answer compression only; see the next section for the one
+case where a proxied response is compressed.
+
+#### Compressing proxied responses
+
+A listener may opt in to gzip for proxied answers as well:
+
+```json
+"http": {
+    "cluster": "api",
+    "compress": { "min_bytes": 1024 }
+}
+```
+
+- `min_bytes` (default 1024) is the floor; smaller bodies are sent
+  unchanged, since the gzip framing alone would cost more than it saves.
+- Compression applies only when the whole body arrived in the same read
+  as the response head (a small response from a fast origin), status is
+  `200`, `Content-Length` is known, `Content-Type` is text-like
+  (`text/*`, JSON, JavaScript, XML, SVG, NDJSON), no `Content-Encoding`
+  is already set, and `Cache-Control` does not say `no-transform`.
+- The ceiling is 64 KiB. Anything larger, chunked, `until_close`, an
+  interim response, a `HEAD`, or a body that took more than one read is
+  streamed through untouched.
+- A compressed answer carries a recomputed `Content-Length`,
+  `Content-Encoding: gzip` and `Vary: Accept-Encoding`; a client that did
+  not offer gzip gets the original bytes.
+
+The compressor is one buffer allocated at startup and counted in the
+banner, so there is no per-request allocation.
+
+This is not full streaming compression: Zig's `std.compress.flate`
+exposes no flush, so a pump that reads and writes one chunk at a time
+cannot emit a valid gzip stream incrementally. Streaming responses (SSE,
+large bodies, chunked) therefore pass through uncompressed — front zoxy
+with a CDN, or compress at the origin, when those need it.
+
 ### Timeouts
 
 ```json
@@ -1201,13 +1699,14 @@ serving it are different facts. Statuses are `200` plus the error set.
     "drain_deadline_ms": 10000,
     "max_lifetime_ms": 0,
     "request_ms": 0,
+    "h3_exchange_ms": 10000,
     "tunnel_ms": 3600000,
     "health_interval_ms": 2000
 }
 ```
 
 The whole block is optional, and so is every field in it; the values
-above are the defaults. An explicit `0` disables the three caps. For
+above are the defaults. An explicit `0` disables the four caps. For
 `connect_ms` and `idle_ms` it is rejected, since a zero-length dial or
 idle budget is a mistake rather than a policy.
 
@@ -1231,7 +1730,9 @@ idle budget is a mistake rather than a policy.
 | `drain_deadline_ms` | `0` | how long a `SIGTERM` drain waits before reaping stragglers; `0` waits for the last connection |
 | `max_lifetime_ms` | `0` | absolute connection-age cap regardless of activity; `0` disables |
 | `request_ms` | `0` | cap on one L7 exchange, **not** refreshed by activity — bounds a request that is merely slow, where `idle_ms` only bounds one that has stalled; `0` disables |
-| `tunnel_ms` | `3600000` | whole life of a [tunnelled upgrade](#tunnelled-upgrades-websocket), replacing the three above once one is established; 1 s to 1 day, and `0` is **not** legal |
+| `h3_exchange_ms` | `10000` | cap on one HTTP/3 upstream exchange — the h3 listener's connect, send and receive window across the streamed response, which the TCP-side `request_ms` never reaches; absolute, not refreshed by progress, so streaming large bodies wants it raised; absent keeps the built-in 10 s, `0` disables |
+| `h3_exchange_idle_ms` | `0` | idle cap on one HTTP/3 exchange: any progress in either direction (upload piece, response head, relayed chunk) resets it, so long-lived streams (SSE) survive the absolute cap; `0` disables. SSE wants 15000-30000 |
+| `tunnel_ms` | `3600000` | whole life of a [tunnelled upgrade](#tunnelled-upgrades-websocket), replacing the idle, request and lifetime deadlines once one is established; 1 s to 1 day, and `0` is **not** legal |
 | `health_interval_ms` | `2000` | pause between health-probe sweeps |
 | `loop_watchdog_ms` | absent | kill this process if its event loop completes nothing for this long. Absent is off; 2 s minimum |
 
@@ -1274,7 +1775,9 @@ feature it sizes is configured. Both are described further down.
     "upstream_slots": 4096,
     "head_buffers": 1024,
     "upstream_head_buffers": 512,
-    "head_buffer_bytes": 16384
+    "head_buffer_bytes": 16384,
+    "rate_limit_entries": 4096,
+    "conn_limit_entries": 4096
 }
 ```
 
@@ -1296,7 +1799,7 @@ it for big-cookie or JWT traffic. 1 KiB to 1 MiB, default 8 KiB.
 `tls_engines` bounds *TLS sessions in flight*, handshaking or terminated,
 and is zero unless some listener has a `tls` block. It decides what a TLS
 deployment costs: an engine is by far the largest per-connection object
-zoxy holds, about 92 KiB plus a 32 KiB plaintext buffer, so 1024 of them
+zoxy holds, about 111 KiB plus a 32 KiB plaintext buffer, so 1024 of them
 is roughly 170 MiB. It defaults to your connection slots capped at 1024,
 and the startup banner prints the total. Lower it if that is more
 concurrent TLS than you serve.
@@ -1305,8 +1808,24 @@ concurrent TLS than you serve.
 [tunnelled upgrades](#tunnelled-upgrades-websocket) and is zero unless
 some listener names an `upgrades` allowlist, in which case it is
 **required**, since no default can be derived for it. Each costs one
-relay-buffer pair (8200 bytes), held for the tunnel's whole life, which
-is why they are reserved apart from `relay_buffers`.
+relay-buffer pair — 32,808 bytes at the 16 KiB default, 33,330 when a
+`tls` cluster widens both halves — held for the tunnel's whole life,
+which is why they are reserved apart from `relay_buffers`.
+
+`rate_limit_entries` sizes the process-wide client-identity table used by
+[rate limiting](#rate-limiting). It is **required** when any `http`
+listener carries a `rate_limit` block and refused without one; 1 to
+1,048,576 entries at 32 bytes each (32 KiB per thousand). One table
+serves every listener, so two limits with different rates share a bucket
+for the same client.
+
+`conn_limit_entries` sizes the process-wide table used by
+[connection limits](#connection-limits). It is **required** when any
+`http` listener carries a `conn_limit` block and refused without one; 1
+to 1,048,576 entries at 24 bytes each. The same table serves every
+listener, so a client's count is shared: a connection accepted by one
+listener consumes capacity against its cap on all of them, like the
+rate limiter's bucket.
 
 `keepalive_requests` lives on an `http` listener beside `max_body_bytes`,
 not in `limits`, because it reserves nothing and states policy. It bounds
@@ -1337,7 +1856,14 @@ out is [Under load](#under-load).
 ### Metrics
 
 An optional listener serves Prometheus exposition text: every shed rung,
-every lifecycle counter, and live pool-occupancy gauges.
+every lifecycle counter, and live pool-occupancy gauges. The experimental
+HTTP/3 path renders there too: the global `zoxy_h3_*` counter family
+(requests, responses, the `bad_gateway`/`gateway_timeout`/`shed_busy`/
+`no_route` verdicts, session opens and closes) plus, after the labeled
+breakdown, one row per configured h3 listener — live sessions, cumulative
+requests and relayed responses, and the parked keep-alive pool, each
+labeled by the listener's bind. The exit tally carries the global family;
+the per-listener rows are the scrape's alone.
 
 ```json
 "admin": { "bind": "127.0.0.1:9100" }

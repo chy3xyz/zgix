@@ -28,6 +28,11 @@
 //!   bufferGroupBytes(io) u32                           (sync; one buffer's
 //!       size — what the caller's own limits must agree with)
 //!   send(io, socket, bytes, c, U, u, cb(u, SendError!u32))
+//!   UdpSocket, UdpCompletion, udpBind, udpAddress, udpRecv, udpSend,
+//!   udpCloseNow                                          (optional arm;
+//!       no serving path uses it yet. Both backends implement it; the
+//!       simulator routes datagrams through a bounded pool so a seeded
+//!       scenario replays the same delivery)
 //!   close(io, socket, c, U, u, cb(u))
 //!   logWrite(io, bytes, c, U, u, cb(u, LogWriteError!u32))   (§8 access log)
 //!   logReopen(io) LogReopenError!void                   (sync; §8 rotation,
@@ -77,10 +82,10 @@ pub const XevIo = @import("XevIo.zig");
 /// simulator can inject drain as just another scheduled event (§4).
 pub const Signal = enum(u8) {
     terminate,
-    /// SIGHUP: reopen the access log's file sink (§8 rotation). This is
-    /// the *only* meaning SIGHUP carries — zoxy does not reload config
-    /// (§1 non-goal: the §5 pools are startup-fixed, so a config change
-    /// is a restart), and claiming the signal for the log says so.
+    /// SIGHUP: reopen the access log's file sink (§8 rotation), then ask
+    /// the application to reload the TLS certificate set. The config
+    /// itself is not reloaded (§1 non-goal: the §5 pools are
+    /// startup-fixed, so a config change is a restart).
     reopen_log,
 };
 
@@ -226,6 +231,15 @@ pub const ConnectError = error{
     Unreachable,
     Canceled,
     Unexpected,
+};
+
+/// What a successful UDP receive delivered: the datagram's source and how
+/// many bytes of the caller's buffer it filled. The source is per
+/// datagram, unlike a TCP connection's fixed peer, which is why it rides
+/// the completion rather than a socket accessor.
+pub const UdpDatagram = struct {
+    source: std.Io.net.IpAddress,
+    len: u32,
 };
 
 pub const RecvError = error{
@@ -401,7 +415,39 @@ pub fn assertIoInterface(comptime IoType: type) void {
     }
 }
 
+/// The optional UDP arm (§4, HTTP/3 groundwork). It is separate from
+/// `assertIoInterface` because no serving path uses UDP yet; both
+/// backends implement it, and the simulator keeps a bounded datagram
+/// pool so a seeded scenario replays one delivery schedule.
+///
+/// The completion is its own type because libxev's UDP watcher carries a
+/// per-op state beside the completion. Callers own both inline.
+pub fn assertUdpInterface(comptime IoType: type) void {
+    comptime {
+        const required_decls = [_][]const u8{
+            "UdpSocket",
+            "UdpCompletion",
+            "udpBind",
+            "udpAddress",
+            "udpRecv",
+            "udpSend",
+            "udpCloseNow",
+        };
+        for (required_decls) |decl_name| {
+            if (!@hasDecl(IoType, decl_name)) {
+                @compileError("Io backend " ++ @typeName(IoType) ++
+                    " is missing required UDP decl: " ++ decl_name);
+            }
+        }
+    }
+}
+
 test "assertIoInterface: both backends satisfy the contract" {
     comptime assertIoInterface(SimIo);
     comptime assertIoInterface(XevIo);
+}
+
+test "assertUdpInterface: both backends satisfy the UDP arm" {
+    comptime assertUdpInterface(SimIo);
+    comptime assertUdpInterface(XevIo);
 }

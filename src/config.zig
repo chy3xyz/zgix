@@ -16,6 +16,7 @@ const sni_router = @import("net/sni_router.zig");
 const filter = @import("http/filter.zig");
 const parser = @import("http/parser.zig");
 const render = @import("http/render.zig");
+const rate_limit = @import("rate_limit.zig");
 const shed = @import("shed.zig");
 const io_module = @import("io/io.zig");
 const json_schema = @import("json_schema.zig");
@@ -24,6 +25,10 @@ const assert = std.debug.assert;
 
 pub const Config = struct {
     listeners: []const Listener,
+    /// Experimental HTTP/3 listeners. Each one owns a UDP socket and maps
+    /// every request to one plaintext HTTP/1.1 cluster; absent leaves the
+    /// QUIC path off and reserves nothing.
+    h3_listeners: []const H3Listener = &.{},
     clusters: []const Cluster,
     connect_timeout_ms: u32,
     idle_timeout_ms: u32,
@@ -70,6 +75,24 @@ pub const Config = struct {
     /// otherwise. `0` disables it, so it is optional in the JSON and
     /// defaults off. L4 connections never set it.
     request_timeout_ms: u32,
+    /// Cap on one HTTP/3 upstream exchange: the buffered h3 proxy's
+    /// connect, send and receive window, from the request render to the
+    /// last response byte. Distinct from `request_timeout_ms`, which
+    /// bounds the L7 exchange on TCP listeners — an h3 exchange runs on
+    /// its own slots outside the conn-slot pools, no TCP-side deadline
+    /// ever reaches it, and this is the only clock it has. `0` disables
+    /// the deadline.
+    ///
+    /// Struct default, on `health_interval_ms`'s terms: the test beds
+    /// hand-build `Config` literals and must keep compiling, and the
+    /// default is the same value the loader resolves absence to, so a
+    /// literal config inherits the deadline the h3 proxy shipped with
+    /// rather than a silently-disabled clock.
+    h3_exchange_ms: u32 = constants.h3_exchange_ms_default,
+    /// The h3 exchange's idle variant (#-): any progress in either
+    /// direction resets it; 0 (the default) leaves the absolute budget
+    /// the only clock. Resolved alongside `h3_exchange_ms` above.
+    h3_exchange_idle_ms: u32 = 0,
     /// Bound on one tunnel's whole life (§8, #180), replacing `idle_ms`,
     /// `request_ms` and `max_lifetime_ms` from the moment a connection
     /// becomes one. Not a fourth clock running beside them: each of those
@@ -153,6 +176,60 @@ pub const Config = struct {
     /// `health.Checker` allocates.
     pub fn healthProbes(config: *const Config) u32 {
         return constants.healthProbeConcurrency(config.checkedEndpoints());
+    }
+
+    /// The relay half width this deployment actually needs (§4/§5).
+    ///
+    /// A TLS origin can hand several records to one drive step: the
+    /// record buffer holds a whole wire record, and a small one can
+    /// complete beside it before the step returns. That step's plaintext
+    /// lands in the upstream→client relay half, so a half sized only for
+    /// one *plaintext* record can be overrun by a legal origin. A wire
+    /// record is the safe bound — every record strips its own overhead,
+    /// so its plaintext is always narrower.
+    ///
+    /// The plaintext path needs no such floor: one socket read cannot
+    /// deliver more bytes than the buffer it read into. Zero cost when no
+    /// cluster dials TLS, which is what keeps the feature opt-in.
+    pub fn effectiveRelayBufferBytes(config: *const Config) u32 {
+        if (!config.hasUpstreamTls()) return config.limits.relay_buffer_bytes;
+        return @max(config.limits.relay_buffer_bytes, constants.tls_record_wire_bytes_max);
+    }
+
+    /// The upstream head buffer's width. A TLS origin's response head and
+    /// the body bytes sharing its first record arrive in one plaintext,
+    /// and both land in this buffer before the head is parsed. Sized for
+    /// one wire record so that step can always be staged; the plaintext
+    /// path keeps the operator's configured width.
+    pub fn effectiveUpstreamHeadBufferBytes(config: *const Config) u32 {
+        if (!config.hasUpstreamTls()) return config.limits.head_buffer_bytes;
+        return @max(config.limits.head_buffer_bytes, constants.tls_record_wire_bytes_max);
+    }
+
+    fn hasUpstreamTls(config: *const Config) bool {
+        for (config.clusters) |cluster| {
+            if (cluster.tls != null) return true;
+        }
+        return false;
+    }
+
+    /// Whether any http listener opted into response compression. The
+    /// shared 64 KiB-ceiling compressor is reserved only then; a
+    /// deployment that does not ask pays nothing.
+    pub fn hasCompression(config: *const Config) bool {
+        for (config.listeners) |listener| {
+            if (listener.compress_min_bytes != null) return true;
+        }
+        return false;
+    }
+
+    /// Whether any listener caps concurrent connections per client, which
+    /// is exactly when the connection table is reserved.
+    pub fn hasConnLimit(config: *const Config) bool {
+        for (config.listeners) |listener| {
+            if (listener.conn_limit_max != null) return true;
+        }
+        return false;
     }
 
     /// Clusters that could lose an endpoint and would never notice: more
@@ -268,6 +345,9 @@ pub const Config = struct {
         /// requests start dying) as well as a ceiling. May be raised as
         /// well as lowered — the big-cookie/JWT case is the reason it
         /// exists. Inert when both pools are zero (an L4-only config).
+        /// When any cluster dials TLS the *upstream* pool's effective
+        /// width is at least one wire record, because a decrypt step can
+        /// land a whole record there; see `effectiveUpstreamHeadBufferBytes`.
         head_buffer_bytes: u32 = constants.head_buffer_bytes_default,
         /// Bytes per relay direction (§6); a pair costs twice this, and
         /// `relay_buffers` + `tunnels` pairs are reserved. Sets how many
@@ -275,6 +355,13 @@ pub const Config = struct {
         /// 16 KiB default and 64 at 4 KiB — and, because
         /// `tls_app_chunk_bytes` rides the same number, the size of the
         /// TLS records a terminating listener emits.
+        ///
+        /// A floor rather than the whole width once a cluster dials TLS:
+        /// that leg's decrypt destination is this half, and one drive
+        /// step can yield a whole wire record plus a small one. The
+        /// effective width is then `max(this, tls_record_wire_bytes_max)`
+        /// — see `effectiveRelayBufferBytes`. The knob still governs the
+        /// plaintext path, where one read cannot outgrow its buffer.
         ///
         /// Lower it when concurrency matters more than bulk: the c10k
         /// ceiling multiplies this by 11457 pairs, so 4 KiB is ~90 MiB of
@@ -335,6 +422,18 @@ pub const Config = struct {
         /// sink beside it. Unlike the pool sizes it may be raised as well
         /// as lowered: it is plain memory, not a share of a budgeted ring.
         access_log_buffer_bytes: u32 = 0,
+        /// Distinct client identities the listener-level rate limiter
+        /// may track at once. Required — and nonzero — when any listener
+        /// configures a `rate_limit` block; zero exactly when none does,
+        /// so one number says both how many buckets exist and whether the
+        /// feature is on. Unlike the pools this is not a share of a
+        /// connection count: the right width is how many clients arrive
+        /// inside one window, which only the operator knows.
+        rate_limit_entries: u32 = 0,
+        /// Distinct client identities the per-client connection cap may
+        /// track at once. Required — and nonzero — when any listener
+        /// configures a `conn_limit` block; zero exactly when none does.
+        conn_limit_entries: u32 = 0,
     };
 
     pub const Listener = struct {
@@ -373,6 +472,15 @@ pub const Config = struct {
         /// #175's next slice — until it lands, a compiled table is
         /// carried but consulted by nothing.
         response_filters: []const filter.ResponseRule = &.{},
+        /// The listener-level WAF-lite denylist, or null when no `waf`
+        /// block was given. Head-only, literal, ASCII case-insensitive;
+        /// evaluated before the filter walk and never routed on a hit.
+        /// Compiled by this loader, interpreted by `http/filter.zig`.
+        waf: ?filter.Waf = null,
+        /// `compress.min_bytes` when this listener opted into response
+        /// compression, or null. The 64 KiB ceiling and the response
+        /// shape are constants in `http/compress.zig`.
+        compress_min_bytes: ?u32 = null,
         protocol: Protocol,
         /// How this listener tells the origin who the client is (§7), or
         /// null to leave `X-Forwarded-For` exactly as it arrived — the
@@ -383,6 +491,13 @@ pub const Config = struct {
         /// the same cluster may be reachable from an edge listener that
         /// must not trust an inbound chain and an internal one that must.
         forwarded: ?Forwarded = null,
+        /// Companion headers the same `forwarded` block may write. Kept
+        /// as separate booleans rather than folded into the enum:
+        /// `Forwarded` answers *which chain rule*, and these answer
+        /// *which extra spellings*, and a listener can ask for either
+        /// independently of the other.
+        forwarded_real_ip: bool = false,
+        forwarded_proto: bool = false,
         /// Whether every connection on this listener must open with a
         /// PROXY protocol header announcing the real client (§6, #142),
         /// or null to treat first bytes as payload — the behavior of
@@ -396,9 +511,9 @@ pub const Config = struct {
         /// what this socket is, and the same cluster is commonly reachable
         /// from a TLS edge listener and a plaintext internal one.
         ///
-        /// Inbound only. The upstream leg stays plaintext whatever this
-        /// says; originating TLS to a backend is a separate decision with
-        /// its own trust store, and #125 is termination.
+        /// Inbound only. This block never makes the upstream leg speak
+        /// TLS: a cluster's own `tls` block is that separate decision,
+        /// with its own trust store, and #125 is termination.
         tls: ?Tls = null,
         /// Which protocol upgrades this listener will carry as tunnels
         /// (§7, #180). Empty by default — an `Upgrade` naming nothing
@@ -416,6 +531,16 @@ pub const Config = struct {
         /// disclosure at an edge — and a proxy cannot tell from the
         /// inside which side of that line it is on.
         proxy_status: bool = false,
+        /// The `Alt-Svc` value every proxied final response head on this
+        /// listener carries (RFC 7838), or null to advertise nothing.
+        /// Per listener because the answer states what sits in front of
+        /// this socket: an edge listener terminating HTTP/1.1 may want to
+        /// point clients at an experimental HTTP/3 UDP listener, while a
+        /// listener behind a load balancer that terminates UDP elsewhere
+        /// wants a different value — or none. The bytes are config
+        /// lifetime and ride the wire verbatim; the operator writes the
+        /// full value, `ma=` included.
+        h3_advertise: ?[]const u8 = null,
         /// Cap on one request's body (#236), or `0` to accept any size.
         ///
         /// Per listener rather than in `limits`, and the distinction is
@@ -439,6 +564,20 @@ pub const Config = struct {
         /// a service mesh want different numbers, which is the same
         /// shape of answer as the cap above.
         keepalive_requests: u32 = constants.keepalive_requests_default,
+        /// Per-client token bucket for this listener (§7), or null for
+        /// no limit — every config predating the block. Per listener on
+        /// `max_body_bytes`'s reasoning: a limit states policy, reserves
+        /// nothing, and one socket fronting an API wants a different
+        /// answer than one fronting a static site. An `l4` listener
+        /// cannot carry one, because a byte relay has no request to
+        /// count.
+        rate_limit: ?rate_limit.Policy = null,
+        /// Cap on concurrent connections from one client identity (§7),
+        /// or null for no cap. Counted once per connection at its first
+        /// admitted request — not at accept — because the client address
+        /// a PROXY-protocol listener reports is only known after the
+        /// header is parsed. Per listener on `rate_limit`'s reasoning.
+        conn_limit_max: ?u32 = null,
 
         /// The upgrade tokens a listener may allow, as a set rather than
         /// a list: the vocabulary is closed, so membership is a field
@@ -514,12 +653,73 @@ pub const Config = struct {
         /// missing or malformed certificate in the startup error that
         /// names the file, rather than in the first client's handshake.
         pub const Tls = struct {
-            /// PEM certificate chain, leaf first.
-            cert_path: []const u8,
-            /// PEM private key for the leaf. ECDSA P-256 or P-384; any
-            /// other key type is refused at load (`tls/Credentials.zig`).
-            key_path: []const u8,
+            /// One or more certificate/key pairs. The first is the
+            /// default for a client that sends no SNI or names nothing
+            /// in the set; the rest are selected by SNI
+            /// (`tls/CredentialSet.zig`). At least one, at most
+            /// `constants.tls_certificates_max`.
+            certificates: []const Certificate,
+
+            pub const Certificate = struct {
+                /// PEM certificate chain, leaf first.
+                cert_path: []const u8,
+                /// PEM private key for the leaf. ECDSA P-256 or P-384;
+                /// any other key type is refused at load
+                /// (`tls/Credentials.zig`).
+                key_path: []const u8,
+                /// DNS names this certificate serves. Empty means
+                /// "derive from the leaf's SAN, then its common name".
+                names: []const []const u8,
+            };
         };
+    };
+
+    /// One HTTP/3 listener: the UDP bind, the certificate the QUIC-TLS
+    /// handshake presents, and the route table that maps host and path
+    /// prefix to one of the plaintext clusters.
+    ///
+    /// Deliberately not a `Listener` arm. A QUIC listener has no SNI table,
+    /// no filters, no upgrades and no keep-alive policy; folding it into
+    /// `Listener` would give every field above a meaning it does not have
+    /// on this path. The two share the config file, not the state machine.
+    pub const H3Listener = struct {
+        /// The UDP bind. IP literals only: `unix:` has no QUIC meaning and
+        /// the loader rejects it.
+        bind_address: std.Io.net.IpAddress,
+        /// The route table every request on this listener is matched
+        /// against: the same §7 `router.Route` the HTTP/1.1 listener
+        /// builds, through the same `resolveRoutes` pipeline, sorted
+        /// host-first, header-aware, longest-prefix-first — every L7
+        /// routing dimension, including a route's `access_log` flag.
+        routes: []const router.Route,
+        /// PEM certificate chain and key. QUIC requires TLS 1.3, so this
+        /// is not optional; the same pair is handed to every session.
+        cert_path: []const u8,
+        key_path: []const u8,
+        /// Session slots this listener reserves. Each slot embeds a fixed
+        /// 256 KiB arena, so this is the listener's memory knob.
+        max_connections: u16 = constants.h3_connections_default,
+        /// Largest origin response body forwarded through this listener,
+        /// decoded bytes for chunked bodies. Bounded by
+        /// `constants.h3_response_bytes_limit`.
+        max_response_bytes: u32 = constants.h3_response_bytes_max,
+        /// The listener's own error pages, one body slice per verdict
+        /// family, null where the config names none and the built-in
+        /// text answers. Each slice is the body of the page the L7
+        /// pipeline rendered for the family's status — arena memory
+        /// that outlives every session, the same lifetime the L7
+        /// static-response table enjoys, so the serving path sends one
+        /// immutable slice and nothing is copied at serve time.
+        error_pages: H3ErrorPages = .{},
+    };
+
+    /// One optional page body per verdict family the h3 proxy answers
+    /// itself; the seam renders the status line itself, so only the
+    /// body crosses (see `H3Listener.error_pages`).
+    pub const H3ErrorPages = struct {
+        no_route: ?[]const u8 = null,
+        bad_gateway: ?[]const u8 = null,
+        gateway_timeout: ?[]const u8 = null,
     };
 
     pub const Cluster = struct {
@@ -585,6 +785,33 @@ pub const Config = struct {
         /// across clients (§3), and a per-connection header cannot name
         /// one client — rejected at load, not silently ignored.
         proxy_protocol_send: ?ProxyProtocolSend = null,
+
+        /// Upstream TLS for every connection this cluster dials, or null
+        /// for plaintext. A terminating TLS listener still dials its
+        /// origin in the clear unless this is set: client-side and
+        /// upstream TLS are independent hops.
+        tls: ?Tls = null,
+
+        /// One cluster's resolved upstream TLS settings. Paths stay
+        /// unresolved here — the loader does no IO — so startup reads
+        /// them once, while an error can still name the file, and builds
+        /// the trust store and client credentials from them.
+        pub const Tls = struct {
+            /// Server name sent as SNI and matched against the origin's
+            /// certificate: the name that makes verification meaningful.
+            server_name: []const u8,
+            /// PEM root bundle, non-null whenever `verify` is true.
+            ca_file: ?[]const u8 = null,
+            /// PEM client certificate chain, leaf first. Present exactly
+            /// when `client_key_path` is.
+            client_cert_path: ?[]const u8 = null,
+            /// PEM private key for `client_cert_path`. Present exactly
+            /// when `client_cert_path` is.
+            client_key_path: ?[]const u8 = null,
+            /// Whether the origin's chain and `server_name` are verified.
+            /// False skips both — see `ClusterTlsJson.verify`.
+            verify: bool = true,
+        };
 
         pub const Pick = enum(u2) {
             rr,
@@ -738,6 +965,34 @@ pub const ValidationError = error{
     ListenerUnixBindClusterSend,
     ListenerBindDuplicate,
     ListenerHttpOrL4,
+    /// An `http` listener's `h3_advertise` that is empty or past
+    /// `constants.alt_svc_value_bytes_max`: the value rides response heads
+    /// verbatim, so it is bounded like every other config string that
+    /// lands on the wire.
+    ListenerH3AdvertiseInvalid,
+    /// An `h3_listeners[].bind` that is not an `IP:port` literal or whose
+    /// port is zero.
+    H3ListenerBindInvalid,
+    /// Two HTTP/3 listeners on the same UDP bind.
+    H3ListenerBindDuplicate,
+    /// A `unix:` bind on an HTTP/3 listener: QUIC addresses have no
+    /// socket path.
+    H3ListenerBindUnix,
+    /// More HTTP/3 listeners than `constants.h3_listeners_max`.
+    H3ListenersOverLimit,
+    /// An HTTP/3 `tls.cert` that is empty.
+    H3ListenerTlsCertPathEmpty,
+    /// An HTTP/3 `tls.key` that is empty.
+    H3ListenerTlsKeyPathEmpty,
+    /// Two HTTP/3 listeners naming different certificate paths. The
+    /// QUIC-TLS binding installs one server identity for the process.
+    H3ListenerTlsConflict,
+    /// An HTTP/3 listener pointed at a cluster with a `unix:` endpoint.
+    H3ListenerClusterUnixEndpoint,
+    /// `max_connections` outside `1..h3_connections_max`.
+    H3ListenerConnectionsOutOfRange,
+    /// `max_response_bytes` outside `1..h3_response_bytes_limit`.
+    H3ListenerResponseBytesOutOfRange,
     ClusterUnknown,
     ClustersEmpty,
     ClustersOverLimit,
@@ -765,6 +1020,24 @@ pub const ValidationError = error{
     ClusterPickNameUnexpected,
     ClusterPickNameInvalid,
     ClusterPickNameTooLong,
+    /// An upstream `tls` block whose `server_name` is empty: SNI and
+    /// hostname verification both need a name to state.
+    ClusterTlsServerNameEmpty,
+    /// `verify` left on (the default) with no `ca_file` to verify
+    /// against.
+    ClusterTlsCaRequired,
+    /// A `client_cert` with no `client_key`: half a client identity.
+    ClusterTlsClientCertWithoutKey,
+    /// A `client_key` with no `client_cert`: half a client identity.
+    ClusterTlsClientKeyWithoutCert,
+    /// An upstream TLS path (`ca_file`, `client_cert`, `client_key`) that
+    /// is empty — which would reach `openat` as the working directory.
+    ClusterTlsPathEmpty,
+    /// An `l4` listener routing to a cluster that dials TLS. The L4 relay
+    /// forwards ciphertext untouched and never originates TLS, so the
+    /// origin would receive whatever bytes the client sent — an encrypted
+    /// session addressed to the wrong endpoint.
+    ClusterTlsOnL4Listener,
     ListenerL4RequestKeyedHash,
     BodiesOverLimit,
     BodyNameEmpty,
@@ -798,9 +1071,17 @@ pub const ValidationError = error{
     RouteSniIsAddress,
     RouteHeaderMatchKind,
     LimitRelayBufferUnderSniRouting,
-    LimitRelayBufferOverTlsRecord,
     ListenerTlsCertPathEmpty,
     ListenerTlsKeyPathEmpty,
+    /// A `tls` block with neither the legacy `cert`+`key` pair nor a
+    /// non-empty `certificates` list.
+    ListenerTlsNoCertificates,
+    /// A `tls` block that carries both forms at once.
+    ListenerTlsFormMixed,
+    /// A `certificates` list past `constants.tls_certificates_max`.
+    ListenerTlsCertificatesOutOfRange,
+    /// An explicit entry in a certificate's `names` is empty.
+    ListenerTlsNameEmpty,
     ClusterProxyProtocolSendUnknown,
     ClusterProxyProtocolOnHttpListener,
     ClusterProxyProtocolOnTlsListener,
@@ -808,6 +1089,11 @@ pub const ValidationError = error{
     FilterMethodUnknown,
     FilterHeaderMatchKind,
     FilterHeaderContainsEmpty,
+    /// A request predicate whose value is empty: absence already means
+    /// "any", so an empty needle has no meaning to give it.
+    FilterQueryContainsEmpty,
+    FilterQueryPrefixEmpty,
+    FilterPathContainsEmpty,
     FilterHeaderNameInvalid,
     FilterHeaderNameReserved,
     FilterHeaderValueInvalid,
@@ -827,6 +1113,17 @@ pub const ValidationError = error{
     ResponseFilterStatusClassUnknown,
     ResponseFilterStatusEmpty,
     ResponseFilterHeaderEditsOverLimit,
+    /// A `waf` block with no `deny` patterns: an empty denylist is a
+    /// mistake, not "allow everything" — omitting the block says that.
+    WafDenyEmpty,
+    /// More than `filter.waf_patterns_max` literal patterns.
+    WafDenyOverLimit,
+    /// A `deny` pattern of zero bytes, which can never fail to match.
+    WafPatternEmpty,
+    /// A `deny` pattern past `filter.waf_pattern_bytes_max`.
+    WafPatternTooLong,
+    /// A `waf.status` outside the reject set the responder can render.
+    WafStatusInvalid,
     EndpointsEmpty,
     EndpointsOverLimit,
     EndpointInvalid,
@@ -869,6 +1166,17 @@ pub const ValidationError = error{
     LimitTunnelsOutOfRange,
     LimitTunnelsOverConnSlots,
     LimitTunnelsWithoutUpgrades,
+    LimitRateLimitEntriesRequired,
+    LimitRateLimitEntriesOutOfRange,
+    LimitRateLimitEntriesWithoutRateLimit,
+    LimitConnLimitEntriesRequired,
+    LimitConnLimitEntriesOutOfRange,
+    LimitConnLimitEntriesWithoutConnLimit,
+    ListenerRateLimitRequestsOutOfRange,
+    ListenerRateLimitWindowOutOfRange,
+    ListenerRateLimitBurstOutOfRange,
+    ListenerRateLimitBurstBelowRequests,
+    ListenerConnLimitOutOfRange,
     LimitCqFillOutOfRange,
     LimitConnSlotsOverCqFill,
     LimitAccessLogBufferOutOfRange,
@@ -972,6 +1280,18 @@ pub fn parseWithFiles(
     // an unreadable file is a fact about the deployment, where a bad
     // filter is a fact about a rule that may never have loaded.
     const bodies = try resolveBodies(arena, parsed.bodies, files);
+    // HTTP/3 listeners carry the same route table the TCP listener
+    // resolves, and its prefix validation gates against the resolved
+    // `head_buffer_bytes` — so this pass needs `limits`. It also names
+    // error-page bodies, which puts it after `bodies` like every other
+    // consumer of the render cache.
+    const h3_listeners = try resolveH3Listeners(
+        arena,
+        parsed.h3_listeners,
+        clusters,
+        limits.head_buffer_bytes,
+        bodies,
+    );
     const listeners = try resolveListeners(
         arena,
         parsed.listeners,
@@ -986,6 +1306,7 @@ pub fn parseWithFiles(
     assert(clusters.len >= 1);
     return .{
         .listeners = listeners,
+        .h3_listeners = h3_listeners,
         .clusters = clusters,
         .connect_timeout_ms = parsed.timeouts.connect_ms,
         .idle_timeout_ms = parsed.timeouts.idle_ms,
@@ -998,6 +1319,11 @@ pub fn parseWithFiles(
         .max_lifetime_ms = parsed.timeouts.max_lifetime_ms,
         .head_timeout_ms = resolveHeadTimeout(&parsed.timeouts),
         .request_timeout_ms = parsed.timeouts.request_ms,
+        // Absence is the built-in default, not "off": the cap shipped
+        // fixed at ten seconds and predating configs keep it. See
+        // `TimeoutsJson.h3_exchange_ms`.
+        .h3_exchange_ms = parsed.timeouts.h3_exchange_ms orelse constants.h3_exchange_ms_default,
+        .h3_exchange_idle_ms = parsed.timeouts.h3_exchange_idle_ms,
         .tunnel_timeout_ms = parsed.timeouts.tunnel_ms,
         .health_interval_ms = parsed.timeouts.health_interval_ms,
         .limits = limits,
@@ -1093,6 +1419,11 @@ fn resolveLogHeaderNames(
 const ResolvedBody = struct {
     name: []const u8,
     bytes: []const u8,
+    /// The body's gzip encoding, built once here so every page that
+    /// carries this body can embed it — compression never runs on the
+    /// serving path, and a body named by several statuses is compressed
+    /// once rather than once per page.
+    gzip: []const u8,
     content_type: []const u8,
     rendered: [shed.page_statuses.len]?*const Config.StaticPage = @splat(null),
 };
@@ -1126,13 +1457,18 @@ fn resolveBodies(
                 return error.BodyNameDuplicate;
             }
         }
+        const bytes = try resolveBodyBytes(arena, &entry.body, files);
         bodies[index] = .{
             .name = entry.name,
-            .bytes = try resolveBodyBytes(arena, &entry.body, files),
+            .bytes = bytes,
+            .gzip = try gzipBytes(arena, bytes),
             .content_type = try resolveContentType(entry.body.content_type),
         };
         assert(bodies[index].name.len >= 1);
         assert(bodies[index].bytes.len <= constants.body_bytes_max);
+        assert(bodies[index].gzip.len >= 2);
+        assert(bodies[index].gzip[0] == 0x1f);
+        assert(bodies[index].gzip[1] == 0x8b);
     }
     assert(bodies.len == parsed.entries.len);
     return bodies;
@@ -1259,8 +1595,10 @@ fn pageFor(
         assert(cached.status == status);
         return cached;
     }
-    const keep = try renderStaticPage(arena, status, body, .keep);
-    const close = try renderStaticPage(arena, status, body, .close);
+    const keep = try renderStaticPage(arena, status, body, .keep, false);
+    const close = try renderStaticPage(arena, status, body, .close, false);
+    const gzip_keep = try renderStaticPage(arena, status, body, .keep, true);
+    const gzip_close = try renderStaticPage(arena, status, body, .close, true);
     const page = try arena.create(Config.StaticPage);
     page.* = .{
         .status = status,
@@ -1270,12 +1608,24 @@ fn pageFor(
         .close_head_len = close.head_len,
         .keep_date = keep.date,
         .close_date = close.date,
+        .gzip_keep = .{
+            .bytes = gzip_keep.bytes,
+            .head_len = gzip_keep.head_len,
+            .date = gzip_keep.date,
+        },
+        .gzip_close = .{
+            .bytes = gzip_close.bytes,
+            .head_len = gzip_close.head_len,
+            .date = gzip_close.date,
+        },
     };
     // What every consumer of a page relies on, stated where every page
     // is made rather than at one call site: the head is a prefix of its
     // own response, on both variants (the serve path's HEAD slice).
     assert(page.keep_head_len <= page.keep.len);
     assert(page.close_head_len <= page.close.len);
+    assert(page.gzip_keep.?.head_len <= page.gzip_keep.?.bytes.len);
+    assert(page.gzip_close.?.head_len <= page.gzip_close.?.bytes.len);
     body.rendered[slot] = page;
     return page;
 }
@@ -1296,14 +1646,22 @@ fn bodyNamed(bodies: []ResolvedBody, name: []const u8) ?*ResolvedBody {
 /// arena buffer — status line, framing, content type, the persistence
 /// announcement, then the body — with the head's length recorded so a
 /// HEAD request is a prefix slice of the same buffer.
+///
+/// `gzip` selects the body's pre-compressed encoding and adds the two
+/// fields that describe it. `Vary` is on the gzip variant only: the
+/// plain response is byte-for-byte what it was before this feature, and
+/// a cache that stored a plain answer still serves it correctly to any
+/// request — it merely forgoes compression.
 fn renderStaticPage(
     arena: std.mem.Allocator,
     status: u16,
     body: *const ResolvedBody,
     persistence: shed.Persistence,
+    gzip: bool,
 ) ParseError!struct { bytes: []const u8, head_len: u32, date: *[shed.date_bytes]u8 } {
     assert(shed.isPageStatus(status));
     assert(body.content_type.len >= 1);
+    const body_bytes = if (gzip) body.gzip else body.bytes;
     // The `Date` value is a placeholder here and a slot from here on
     // (#234): fixed-width, so the serving path patches it in place and a
     // page stays one contiguous send. Its offset is recorded rather than
@@ -1311,8 +1669,14 @@ fn renderStaticPage(
     // string.
     const prefix = try std.fmt.allocPrint(
         arena,
-        "HTTP/1.1 {d} {s}\r\nContent-Length: {d}\r\nContent-Type: {s}\r\nDate: ",
-        .{ status, shed.reasonPhrase(status), body.bytes.len, body.content_type },
+        "HTTP/1.1 {d} {s}\r\nContent-Length: {d}\r\nContent-Type: {s}\r\n{s}Date: ",
+        .{
+            status,
+            shed.reasonPhrase(status),
+            body_bytes.len,
+            body.content_type,
+            if (gzip) "Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n" else "",
+        },
     );
     const rendered = try std.fmt.allocPrint(
         arena,
@@ -1325,11 +1689,11 @@ fn renderStaticPage(
                 .keep => "",
                 .close => "Connection: close\r\n",
             },
-            body.bytes,
+            body_bytes,
         },
     );
-    assert(rendered.len > body.bytes.len);
-    const head_len: u32 = @intCast(rendered.len - body.bytes.len);
+    assert(rendered.len > body_bytes.len);
+    const head_len: u32 = @intCast(rendered.len - body_bytes.len);
     // The slot must sit inside the *head*, or a HEAD request would be
     // sent the prefix without it.
     assert(prefix.len + shed.date_bytes <= head_len);
@@ -1338,6 +1702,30 @@ fn renderStaticPage(
         .head_len = head_len,
         .date = rendered[prefix.len..][0..shed.date_bytes],
     };
+}
+
+/// The gzip encoding of one configured body, built once at load. The
+/// allocator is fine here — this runs before the loop exists — but the
+/// serving path only ever reads `ResolvedBody.gzip`, never this
+/// function. The window is the format's history buffer, stack-sized
+/// because load runs one body at a time and never re-enters.
+fn gzipBytes(arena: std.mem.Allocator, bytes: []const u8) ParseError![]const u8 {
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var out = std.Io.Writer.Allocating.initCapacity(arena, @max(bytes.len / 2, 64)) catch
+        return error.OutOfMemory;
+    defer out.deinit();
+    var compressor = std.compress.flate.Compress.init(&out.writer, &window, .gzip, .default) catch
+        return error.OutOfMemory;
+    compressor.writer.writeAll(bytes) catch return error.OutOfMemory;
+    compressor.finish() catch return error.OutOfMemory;
+    // The result is an owned copy in the arena, not the writer's
+    // scratch: the writer is deinitialized below and pages outlive it.
+    const compressed = try arena.dupe(u8, out.written());
+    // RFC 1952's fixed identity, held here so a mis-wired container is a
+    // load failure rather than a response a client cannot decode.
+    assert(compressed.len >= 18);
+    assert(compressed[0] == 0x1f and compressed[1] == 0x8b);
+    return compressed;
 }
 
 /// Resolve the optional access log (§8): absent means off — no staging
@@ -1390,17 +1778,25 @@ fn resolveAdminBind(admin_json: ?AdminJson) ValidationError!?std.Io.net.IpAddres
 /// resolvers have each enforced their own half, because a pool past this
 /// is not merely wasteful — the fd and ring budgets are derived from
 /// `conn_slots` on the strength of it (`fdsRequired`, `inFlightOps`), so
-/// The two pools a *feature* switches on: TLS engines, reserved exactly
-/// when some listener terminates, and #180's tunnels, reserved exactly
-/// when some listener allows an upgrade. Their own group because both are
-/// zero for a deployment that asked for neither — which is what makes
-/// each feature free — and both are bounded by the conn slots above.
+/// The feature-switched reservations (§5): TLS engines exactly when some
+/// listener terminates, #180's tunnels exactly when some listener allows
+/// an upgrade, and the §7 rate-limit table exactly when some listener
+/// carries a bucket. Their own group because all three are zero for a
+/// deployment that asked for none — which is what makes each feature
+/// free — and both pools are bounded by the conn slots above.
 fn resolveFeaturePools(
     limits_json: *const LimitsJson,
     conn_slots: u32,
     tls_listeners_count: u32,
     upgrade_listeners_count: u32,
-) ValidationError!struct { tls_engines: u32, tunnels: u32 } {
+    rate_limit_listeners_count: u32,
+    conn_limit_listeners_count: u32,
+) ValidationError!struct {
+    tls_engines: u32,
+    tunnels: u32,
+    rate_limit_entries: u32,
+    conn_limit_entries: u32,
+} {
     const tls_engines = try resolveTlsEngines(
         limits_json.tls_engines,
         conn_slots,
@@ -1411,7 +1807,20 @@ fn resolveFeaturePools(
         conn_slots,
         upgrade_listeners_count,
     );
-    return .{ .tls_engines = tls_engines, .tunnels = tunnels };
+    const rate_limit_entries = try resolveRateLimitEntries(
+        limits_json.rate_limit_entries,
+        rate_limit_listeners_count,
+    );
+    const conn_limit_entries = try resolveConnLimitEntries(
+        limits_json.conn_limit_entries,
+        conn_limit_listeners_count,
+    );
+    return .{
+        .tls_engines = tls_engines,
+        .tunnels = tunnels,
+        .rate_limit_entries = rate_limit_entries,
+        .conn_limit_entries = conn_limit_entries,
+    };
 }
 
 /// The two head pools (§5), which exist only for an HTTP listener: the
@@ -1469,12 +1878,10 @@ fn resolveLimits(
     // here — restating them would be two places to keep in step.
     const slots = try resolveSlotCounts(limits_json);
     const conn_slots = slots.conn_slots;
-    const relay_buffers = slots.relay_buffers;
-    const upstream_slots = slots.upstream_slots;
     const head_pools = try resolveHeadPools(
         limits_json,
         conn_slots,
-        upstream_slots,
+        slots.upstream_slots,
         features.http,
     );
     const head_buffer_bytes = try resolveHeadBufferBytes(limits_json.head_buffer_bytes);
@@ -1489,28 +1896,23 @@ fn resolveLimits(
     if (features.sni >= 1 and relay_buffer_bytes < constants.client_hello_bytes_max) {
         return error.LimitRelayBufferUnderSniRouting;
     }
-    // §4's `transformOut` encrypts a whole relay chunk into one record,
-    // and RFC 8446 §5.1 caps a record's plaintext at 2^14 — so on a
-    // terminating listener a buffer past `tls_app_chunk_bytes` could only
-    // produce a record no conforming peer may accept. The ceiling is
-    // wider than that for the plaintext deployments that can use it
-    // (`relay_buffer_bytes_max`), which makes this the paired refusal:
-    // the shape is legal, just not with TLS on it. Refused at load for
-    // the reason the SNI check above is — the alternative is a proxy that
-    // serves small bodies and tears down large ones.
-    if (features.tls >= 1 and relay_buffer_bytes > constants.tls_app_chunk_bytes) {
-        return error.LimitRelayBufferOverTlsRecord;
-    }
+    // A relay buffer wider than one TLS record is legal on a terminating
+    // listener too: every transform that encrypts now chunks at
+    // `tls_app_chunk_bytes` (`proxy.zig`'s head/body channels,
+    // `relay.zig`'s tunnel). The ceiling belongs to plaintext and TLS
+    // alike.
     const feature_pools = try resolveFeaturePools(
         limits_json,
         conn_slots,
         features.tls,
         features.upgrades,
+        features.rate_limit,
+        features.conn_limit,
     );
     const cq_fill_eighths = try resolveCqFill(
         limits_json.cq_fill_eighths,
         conn_slots,
-        upstream_slots,
+        slots.upstream_slots,
         listeners_count,
         health_probes,
     );
@@ -1526,15 +1928,15 @@ fn resolveLimits(
     );
     assertPoolsFitConnSlots(
         conn_slots,
-        relay_buffers,
+        slots.relay_buffers,
         head_pools.head_buffers,
         feature_pools.tls_engines,
         feature_pools.tunnels,
     );
     return .{
         .conn_slots = conn_slots,
-        .relay_buffers = relay_buffers,
-        .upstream_slots = upstream_slots,
+        .relay_buffers = slots.relay_buffers,
+        .upstream_slots = slots.upstream_slots,
         .head_buffers = head_pools.head_buffers,
         .upstream_head_buffers = head_pools.upstream_head_buffers,
         .head_buffer_bytes = head_buffer_bytes,
@@ -1545,6 +1947,8 @@ fn resolveLimits(
             constants.keepalive_requests_default,
         .cq_fill_eighths = cq_fill_eighths,
         .access_log_buffer_bytes = access_log_buffer_bytes,
+        .rate_limit_entries = feature_pools.rate_limit_entries,
+        .conn_limit_entries = feature_pools.conn_limit_entries,
     };
 }
 
@@ -1703,6 +2107,56 @@ fn resolveTunnels(
     return tunnels;
 }
 
+/// The listener-level rate-limit table's width (§7): required and
+/// nonzero exactly when some listener configures a limit, zero
+/// otherwise. A deployment that names buckets nothing can draw on is
+/// told so, and one that asks for limits without reserving room for
+/// their keys is refused rather than silently failing open for every
+/// client (which would be a rate limiter that never limits).
+fn resolveRateLimitEntries(
+    requested: ?u32,
+    rate_limit_listeners_count: u32,
+) ValidationError!u32 {
+    const entries = requested orelse {
+        if (rate_limit_listeners_count >= 1) {
+            return error.LimitRateLimitEntriesRequired;
+        }
+        return 0;
+    };
+    if (entries < 1 or entries > constants.rate_limit_entries_max) {
+        return error.LimitRateLimitEntriesOutOfRange;
+    }
+    if (rate_limit_listeners_count == 0) {
+        return error.LimitRateLimitEntriesWithoutRateLimit;
+    }
+    assert(entries >= 1);
+    return entries;
+}
+
+/// The per-client connection table's width (§7), on the rate limiter's
+/// terms: required and nonzero exactly when some listener configures a
+/// cap, zero otherwise. A cap without a table would fail open for every
+/// client, which is a limit that never limits.
+fn resolveConnLimitEntries(
+    requested: ?u32,
+    conn_limit_listeners_count: u32,
+) ValidationError!u32 {
+    const entries = requested orelse {
+        if (conn_limit_listeners_count >= 1) {
+            return error.LimitConnLimitEntriesRequired;
+        }
+        return 0;
+    };
+    if (entries < 1 or entries > constants.conn_limit_entries_max) {
+        return error.LimitConnLimitEntriesOutOfRange;
+    }
+    if (conn_limit_listeners_count == 0) {
+        return error.LimitConnLimitEntriesWithoutConnLimit;
+    }
+    assert(entries >= 1);
+    return entries;
+}
+
 /// The §5 head-buffer ring follows conn slots when omitted (every
 /// connection could be mid-head at once — never sheds), and is zero
 /// exactly when no listener speaks http: an L4-only deployment registers
@@ -1831,6 +2285,10 @@ pub const ConfigJson = struct {
     /// `$schemas` is still an unknown field.
     @"$schema": ?[]const u8 = null,
     listeners: []const ListenerJson,
+    /// Optional HTTP/3 listeners (experimental). Absent leaves the QUIC
+    /// path off; each entry binds UDP and proxies to one plaintext
+    /// cluster.
+    h3_listeners: []const H3ListenerJson = &.{},
     clusters: ClustersJson,
     /// Optional as a whole, like `limits` below and for the same reason
     /// (§5): an omitted block takes the defaults, so a working config is
@@ -1864,6 +2322,13 @@ pub const ConfigJson = struct {
         .listeners = .{
             .desc = "Sockets the proxy accepts connections on.",
             .min_items = 1,
+        },
+        .h3_listeners = .{
+            .desc = "Optional HTTP/3 (QUIC) listeners. Each binds UDP, " ++
+                "terminates QUIC-TLS with its certificate, and proxies every " ++
+                "request to one plaintext cluster. Experimental: buffered " ++
+                "plaintext HTTP/1.1 origins only, 64 KiB response cap.",
+            .max_items = constants.h3_listeners_max,
         },
         .clusters = .{ .desc = "Named upstream clusters, keyed by cluster name." },
         .timeouts = .{ .desc = "Connection lifecycle deadlines (milliseconds)." },
@@ -1972,6 +2437,12 @@ pub const LimitsJson = struct {
     keepalive_requests: ?u32 = null,
     cq_fill_eighths: ?u32 = null,
     access_log_buffer_bytes: ?u32 = null,
+    /// Optional listener-level rate-limit table width; required and
+    /// nonzero exactly when some listener configures a `rate_limit`.
+    rate_limit_entries: ?u32 = null,
+    /// Optional per-client connection-table width; required and nonzero
+    /// exactly when some listener configures a `conn_limit`.
+    conn_limit_entries: ?u32 = null,
 
     pub const schema_doc =
         "Optional pool sizes and the CQ-fill headroom knob; absent fields " ++
@@ -2066,6 +2537,20 @@ pub const LimitsJson = struct {
             .minimum = constants.access_log_buffer_bytes_min,
             .maximum = constants.access_log_buffer_bytes_max,
         },
+        .rate_limit_entries = .{
+            .desc = "Distinct client identities the listener-level rate limiter " ++
+                "may track at once. Required and nonzero when any listener " ++
+                "configures a rate_limit block; zero (absent) otherwise.",
+            .minimum = 1,
+            .maximum = constants.rate_limit_entries_max,
+        },
+        .conn_limit_entries = .{
+            .desc = "Distinct client identities the per-client connection cap " ++
+                "may track at once. Required and nonzero when any listener " ++
+                "configures a conn_limit block; zero (absent) otherwise.",
+            .minimum = 1,
+            .maximum = constants.conn_limit_entries_max,
+        },
     };
 };
 
@@ -2119,8 +2604,9 @@ pub const ListenerJson = struct {
         },
         .tls = .{
             .desc = "Terminate TLS on this listener with the given certificate " ++
-                "and key; absent is a plaintext socket. Inbound only — the " ++
-                "upstream leg stays plaintext.",
+                "and key; absent is a plaintext socket. Inbound only — a " ++
+                "cluster's own tls block decides whether the upstream leg " ++
+                "originates TLS.",
         },
         .http = .{
             .desc = "Speak HTTP/1.1: run the reverse-proxy state machine, with " ++
@@ -2142,6 +2628,12 @@ pub const HttpListenerJson = struct {
     request_filters: ?[]const FilterJson = null,
     /// Optional #175 response filter rules; absent means none.
     response_filters: ?[]const ResponseFilterJson = null,
+    /// Optional listener-level WAF-lite denylist; absent means none.
+    /// Head-only and literal — see `filter.Waf`.
+    waf: ?WafJson = null,
+    /// Optional gzip for small proxied responses whose body arrived with
+    /// their head. Absent means no compression.
+    compress: ?CompressJson = null,
     /// Optional §7 client-address forwarding; absent leaves the header
     /// untouched.
     forwarded: ?ForwardedJson = null,
@@ -2157,6 +2649,16 @@ pub const HttpListenerJson = struct {
     /// Whether this listener names *why* it refused, in an RFC 9209
     /// `Proxy-Status` field (#300). Absent is off.
     proxy_status: bool = false,
+    /// The `Alt-Svc` value proxied final response heads carry, verbatim
+    /// (RFC 7838), so HTTP/1.1 clients can discover an experimental
+    /// HTTP/3 listener; absent advertises nothing. 1..
+    /// `constants.alt_svc_value_bytes_max` bytes.
+    h3_advertise: ?[]const u8 = null,
+    /// Optional per-client token bucket (§7); absent means no limit.
+    rate_limit: ?RateLimitJson = null,
+    /// Optional per-client concurrent-connection cap (§7); absent means
+    /// no cap.
+    conn_limit: ?ConnLimitJson = null,
 
     pub const schema_doc =
         "An HTTP/1.1 listener's settings. Exactly one of `cluster` or " ++
@@ -2174,6 +2676,18 @@ pub const HttpListenerJson = struct {
         .response_filters = .{
             .desc = "Response filter rules — header edits on the origin's response, " ++
                 "evaluated top-down.",
+        },
+        .waf = .{
+            .desc = "Head-only WAF-lite denylist: literal, ASCII case-insensitive " ++
+                "patterns matched against the canonical path, the raw query and " ++
+                "every request header value. No body inspection and no regex. " ++
+                "Evaluated before the filter walk; a hit answers `status`.",
+        },
+        .compress = .{
+            .desc = "Gzip small proxied responses (status 200, known Content-Length, " ++
+                "compressible type, whole body arriving with the head). `min_bytes` " ++
+                "is the smallest body worth compressing; bodies above 64 KiB and " ++
+                "streamed/chunked responses are forwarded untouched.",
         },
         .forwarded = .{
             .desc = "Tell the origin the client's address via X-Forwarded-For; " ++
@@ -2194,15 +2708,150 @@ pub const HttpListenerJson = struct {
                 "the wire, which an internal listener may want and an edge " ++
                 "one may not.",
         },
+        .h3_advertise = .{
+            .desc = "The Alt-Svc value (RFC 7838) every proxied final " ++
+                "response head carries, sent verbatim — the operator " ++
+                "writes the full value including ma=, e.g. " ++
+                "h3=\":4443\"; ma=3600 — so HTTP/1.1 clients can " ++
+                "discover an experimental HTTP/3 listener. Absent " ++
+                "advertises nothing; per listener, since what is in " ++
+                "front of the socket decides whether the announcement " ++
+                "is true.",
+            .min_length = 1,
+            .max_length = constants.alt_svc_value_bytes_max,
+        },
         .upgrades = .{
             .desc = "Protocol upgrades this listener will carry as tunnels; absent " ++
                 "allows none and an Upgrade stays 501. Requires limits.tunnels.",
         },
+        .rate_limit = .{
+            .desc = "Per-client token bucket: requests per window, with an " ++
+                "optional burst capacity. Refused 429 once the bucket is " ++
+                "empty. Requires limits.rate_limit_entries.",
+        },
+        .conn_limit = .{
+            .desc = "Cap on concurrent connections from one client identity. " ++
+                "A connection is counted at its first admitted request and " ++
+                "refused 503 while the cap is reached. Requires " ++
+                "limits.conn_limit_entries.",
+        },
     };
 };
 
-/// The #180 upgrade allowlist, one flag per protocol this proxy can
-/// recognise (#305 Part 2).
+/// The listener-level token bucket (§7): a closed shape with three
+/// numbers, defaults only where the meaning is forced.
+pub const RateLimitJson = struct {
+    /// Tokens added per `window_ms`, and the sustained rate.
+    requests: u32,
+    /// Window over which `requests` tokens accrue.
+    window_ms: u32,
+    /// Bucket capacity; absent means `requests`, and it may be larger so
+    /// an idle client accumulates a burst. It may not be smaller: a
+    /// capacity below the window's allowance smooths a policy the block
+    /// did not state.
+    burst: ?u32 = null,
+
+    pub const schema_doc =
+        "A per-client token bucket. Sustained rate is requests/window_ms; " ++
+        "burst caps how many may be spent at once. A client over the " ++
+        "limit gets 429, and the connection closes.";
+    pub const schema_fields = .{
+        .requests = .{
+            .desc = "Tokens added per window, and the sustained request rate.",
+            .minimum = 1,
+            .maximum = constants.rate_limit_requests_max,
+        },
+        .window_ms = .{
+            .desc = "Window over which requests tokens accrue, in milliseconds.",
+            .minimum = 1,
+            .maximum = constants.timeout_ms_max,
+        },
+        .burst = .{
+            .desc = "Bucket capacity in requests; absent means requests. May " ++
+                "exceed it (idle clients accumulate), never fall below it.",
+            .minimum = 1,
+            .maximum = constants.rate_limit_burst_max,
+        },
+    };
+};
+
+/// The listener-level connection cap (§7). One number, because the
+/// identity and the refusal are not tunable: one client is a /32 or /64,
+/// and a client at the cap gets 503.
+pub const ConnLimitJson = struct {
+    /// Concurrent connections one client identity may hold.
+    max: u32,
+
+    pub const schema_doc =
+        "A cap on concurrent connections per client identity (IPv4 /32, " ++
+        "IPv6 /64). A connection is counted at its first admitted request; " ++
+        "one reaching the cap is refused 503 and closed. Requires " ++
+        "limits.conn_limit_entries.";
+    pub const schema_fields = .{
+        .max = .{
+            .desc = "Concurrent connections one client may hold.",
+            .minimum = 1,
+            .maximum = constants.conn_limit_conns_max,
+        },
+    };
+};
+
+/// The listener-level WAF-lite block. It is a denylist of *literal*
+/// needles, not a rule language: no regex, no scripting, no body bytes,
+/// no decoding. The bounds are stated here so the loader and the emitted
+/// schema carry the same numbers the evaluator asserts.
+pub const WafJson = struct {
+    /// 1..=64 literal patterns, each 1..=256 bytes. Matched ASCII
+    /// case-insensitively against the canonical path, raw query and
+    /// every header value.
+    deny: []const []const u8,
+    /// Reject status on a hit; one of `filter.reject_statuses`.
+    status: u16 = filter.waf_status_default,
+
+    pub const schema_doc =
+        "Head-only WAF-lite denylist. `deny` patterns are literals matched " ++
+        "ASCII case-insensitively against the canonical path, the raw query " ++
+        "and every request header value; a hit answers `status` before " ++
+        "filters or routing run. It does not inspect bodies, decode escapes " ++
+        "or support regexes.";
+    pub const schema_fields = .{
+        .deny = .{
+            .desc = "Literal patterns, matched case-insensitively against the " ++
+                "canonical path, raw query and every header value.",
+            .min_items = 1,
+            .max_items = filter.waf_patterns_max,
+            .item_min_length = 1,
+            .item_max_length = filter.waf_pattern_bytes_max,
+        },
+        .status = .{
+            .desc = "Status answered on a hit; one of the reject statuses " ++
+                "(default 403).",
+            .int_values = &filter.reject_statuses,
+        },
+    };
+};
+
+/// Optional response compression. Only the minimum is configurable: the
+/// shape (status 200, known Content-Length, whole body with the head) and
+/// the 64 KiB ceiling are protocol/architecture decisions, not knobs.
+pub const CompressJson = struct {
+    min_bytes: u32 = constants.compress_min_bytes_default,
+
+    pub const schema_doc =
+        "Gzip small proxied responses. Applies to status 200 with a known " ++
+        "Content-Length, a compressible Content-Type, no existing " ++
+        "Content-Encoding and `Cache-Control: no-transform`, when the client " ++
+        "accepts gzip and the whole body arrived with its head. `min_bytes` " ++
+        "skips tiny bodies; bodies above 64 KiB and chunked/streamed responses " ++
+        "are forwarded untouched.";
+    pub const schema_fields = .{
+        .min_bytes = .{
+            .desc = "Smallest body worth compressing (default 1024).",
+            .minimum = 0,
+            .maximum = constants.compress_body_bytes_max,
+        },
+    };
+};
 ///
 /// An object rather than the list of tokens this replaced, and the
 /// argument is the vocabulary: §7 requires it closed — a token zoxy
@@ -2231,14 +2880,14 @@ pub const UpgradesJson = struct {
         // protocol added to either and forgotten on the other would let
         // the config name an upgrade the serving path cannot gate, or
         // hide one it can.
-        const resolved = @typeInfo(Config.Listener.Upgrades).@"struct".fields;
-        const json = @typeInfo(UpgradesJson).@"struct".fields;
+        const resolved = @typeInfo(Config.Listener.Upgrades).@"struct".field_names;
+        const json = @typeInfo(UpgradesJson).@"struct".field_names;
         if (resolved.len != json.len) {
             @compileError("UpgradesJson and Config.Listener.Upgrades disagree on the set");
         }
-        for (resolved) |field| {
-            if (!@hasField(UpgradesJson, field.name)) {
-                @compileError("UpgradesJson is missing " ++ field.name);
+        for (resolved) |name| {
+            if (!@hasField(UpgradesJson, name)) {
+                @compileError("UpgradesJson is missing " ++ name);
             }
         }
     }
@@ -2306,44 +2955,226 @@ pub const L4RouteJson = struct {
     };
 };
 
-pub const TlsJson = struct {
+pub const H3ListenerJson = struct {
+    bind: []const u8,
+    /// Sugar for a single catch-all route; mutually exclusive with
+    /// `routes`, exactly as on the HTTP/1.1 listener.
+    cluster: ?[]const u8 = null,
+    /// The explicit route table; matched host-first, header-aware,
+    /// longest-prefix-first, exactly like the HTTP/1.1 listener's — the
+    /// h3 slice now carries every L7 routing dimension, and a route may
+    /// suppress its access-log line (counters stay).
+    routes: ?[]const RouteJson = null,
+    /// Optional error pages for the answers the h3 listener itself
+    /// writes, keyed by the verdict family (`no_route`, `bad_gateway`,
+    /// `gateway_timeout`); each value names a body from the global
+    /// `bodies` table, rendered through the same pipeline the HTTP/1.1
+    /// listener's `error_pages` use. Absent keys keep the built-in text.
+    error_pages: ?H3ErrorPagesJson = null,
+    /// QUIC requires TLS, so this block is required. A dedicated shape
+    /// rather than `TlsJson`: this slice presents exactly one identity,
+    /// and the schema can say so here instead of sharing a block that
+    /// allows a sixteen-certificate SNI set.
+    tls: H3TlsJson,
+    max_connections: u16 = constants.h3_connections_default,
+    max_response_bytes: u32 = constants.h3_response_bytes_max,
+
+    pub const schema_doc =
+        "One experimental HTTP/3 (QUIC) listener. It binds a UDP socket, " ++
+        "terminates QUIC-TLS, and proxies each request over plaintext " ++
+        "HTTP/1.1 to the cluster its route table selects. Responses " ++
+        "stream to the client as they arrive, decoded for chunked " ++
+        "bodies, and each response body is capped.";
+    pub const schema_one_of = [_][]const u8{ "cluster", "routes" };
+    pub const schema_fields = .{
+        .bind = .{
+            .desc = "UDP `IP:port` literal to bind. Hostnames and `unix:` " ++
+                "binds are rejected.",
+        },
+        .cluster = .{
+            .desc = "Sugar for a single catch-all route to this cluster; " ++
+                "mutually exclusive with routes. Must name a plaintext " ++
+                "cluster: this slice has no upstream TLS.",
+        },
+        .routes = .{
+            .desc = "Route table selecting the upstream cluster per request: " ++
+                "host scope, header predicate, and path prefix are a " ++
+                "conjunction, matched most-specific-first (host, then " ++
+                "header, then prefix). A route may set access_log: false " ++
+                "to suppress only its log line.",
+            .min_items = 1,
+        },
+        .error_pages = .{
+            .desc = "Optional error pages for the listener's own answers, " ++
+                "keyed by verdict family. Each value names a body from the " ++
+                "global bodies table; absent keys keep the built-in text.",
+        },
+        .tls = .{
+            .desc = "Certificate and key the QUIC handshake presents. One " ++
+                "pair, required — QUIC has no plaintext mode.",
+        },
+        .max_connections = .{
+            .desc = "QUIC session slots this listener reserves. Each slot " ++
+                "embeds a fixed 256 KiB arena.",
+            .minimum = 1,
+            .maximum = constants.h3_connections_max,
+        },
+        .max_response_bytes = .{
+            .desc = "Largest origin response body forwarded, decoded bytes " ++
+                "for chunked bodies; a body past it mid-stream is cut off " ++
+                "with a stream reset (counted as a bad gateway).",
+            .minimum = 1,
+            .maximum = constants.h3_response_bytes_limit,
+        },
+    };
+};
+
+/// The h3 listener's error-page map: one optional body name per verdict
+/// family the h3 proxy itself answers, each resolved against the global
+/// `bodies` table and rendered through the same `pageFor` pipeline the
+/// HTTP/1.1 listener's `error_pages` use — one rendering per (body,
+/// status) pair, arena-resident for the process's life, so the serving
+/// path sends one immutable slice exactly like the L7 static table.
+pub const H3ErrorPagesJson = struct {
+    /// The 404 a request no route matches is answered with.
+    no_route: ?[]const u8 = null,
+    /// The 502 the gateway's own failures are answered with.
+    bad_gateway: ?[]const u8 = null,
+    /// The 504 an exchange the upstream outlived is answered with.
+    gateway_timeout: ?[]const u8 = null,
+
+    pub const schema_doc =
+        "Error pages for the answers this listener writes itself, keyed " ++
+        "by verdict family. Each value names a body from the global " ++
+        "bodies table; an absent key keeps the built-in text.";
+    pub const schema_fields = .{
+        .no_route = .{
+            .desc = "Body name for the no-route 404 page.",
+        },
+        .bad_gateway = .{
+            .desc = "Body name for the bad-gateway 502 page.",
+        },
+        .gateway_timeout = .{
+            .desc = "Body name for the gateway-timeout 504 page.",
+        },
+    };
+};
+
+pub const H3TlsJson = struct {
     cert: []const u8,
     key: []const u8,
 
     pub const schema_doc =
-        "TLS termination for this listener: where its certificate chain and " ++
-        "private key live. Both are read once at startup, so a missing or " ++
-        "unusable file stops the proxy while the error can still name it — " ++
-        "never mid-handshake against a real client. The key must be ECDSA " ++
-        "P-256 or P-384: the handshake runs on the event loop, where an RSA " ++
-        "signature's milliseconds would stall every other connection on it.";
+        "The single QUIC-TLS identity an HTTP/3 listener presents. The " ++
+        "files are read once at startup; a missing or unusable file stops " ++
+        "the proxy rather than failing the first handshake.";
     pub const schema_fields = .{
         .cert = .{
             .desc = "Path to the PEM certificate chain, leaf first.",
             .min_length = 1,
         },
         .key = .{
-            .desc = "Path to the leaf's PEM private key (ECDSA P-256 or P-384).",
+            .desc = "Path to the leaf's PEM private key.",
             .min_length = 1,
+        },
+    };
+};
+
+pub const TlsJson = struct {
+    /// Legacy single-certificate form: `cert` and `key` together. Cannot
+    /// be combined with `certificates`; the loader names the pair.
+    cert: ?[]const u8 = null,
+    key: ?[]const u8 = null,
+    /// Multi-certificate form. The first entry is the default; SNI
+    /// selects the rest by the names each entry serves.
+    certificates: []const CertificateJson = &.{},
+
+    pub const CertificateJson = struct {
+        cert: []const u8,
+        key: []const u8,
+        /// DNS names this certificate serves, matched case-insensitively
+        /// and with a leftmost `*.` wildcard. Empty derives them from the
+        /// leaf's subjectAltName, then its common name.
+        names: []const []const u8 = &.{},
+
+        pub const schema_doc =
+            "One certificate/key pair in a listener's SNI set.";
+        pub const schema_fields = .{
+            .cert = .{
+                .desc = "Path to the PEM certificate chain, leaf first.",
+                .min_length = 1,
+            },
+            .key = .{
+                .desc = "Path to the leaf's PEM private key (ECDSA P-256 or P-384).",
+                .min_length = 1,
+            },
+            .names = .{
+                .desc = "DNS names this certificate serves; empty derives them " ++
+                    "from the leaf's SAN, then its common name.",
+                .min_items = 1,
+            },
+        };
+    };
+
+    pub const schema_doc =
+        "TLS termination for this listener: where its certificate chain and " ++
+        "private key live. Use `cert`+`key` for one certificate, or " ++
+        "`certificates` for an SNI set whose first entry is the default. " ++
+        "Files are read once at startup, so a missing or unusable file stops " ++
+        "the proxy while the error can still name it — never mid-handshake " ++
+        "against a real client. The key must be ECDSA P-256 or P-384: the " ++
+        "handshake runs on the event loop, where an RSA signature's " ++
+        "milliseconds would stall every other connection on it.";
+    pub const schema_fields = .{
+        .cert = .{
+            .desc = "Path to the PEM certificate chain, leaf first (legacy one-certificate form).",
+            .min_length = 1,
+        },
+        .key = .{
+            .desc = "Path to the leaf's PEM private key (legacy one-certificate form).",
+            .min_length = 1,
+        },
+        .certificates = .{
+            .desc = "Certificate set for SNI selection; the first entry is the default.",
+            .min_items = 1,
+            .max_items = constants.tls_certificates_max,
         },
     };
 };
 
 pub const ForwardedJson = struct {
     mode: []const u8,
+    /// Write `X-Real-IP` from the same observed peer. Off by default:
+    /// the header is a second spelling of `X-Forwarded-For`, and a
+    /// deployment that does not read it should not be handed one.
+    real_ip: ?bool = null,
+    /// Write `X-Forwarded-Proto` (`http`/`https`) from the listener that
+    /// received the request. Off by default.
+    proto: ?bool = null,
 
     pub const schema_doc =
-        "How this listener sets `X-Forwarded-For`. There is no default, " ++
-        "because `replace` and `append` are each a security bug in the " ++
-        "other's position: an inbound chain is client-controlled at the " ++
-        "edge and authoritative behind a proxy you own, and zoxy cannot " ++
-        "tell from the inside which side of that line it is on.";
+        "How this listener sets `X-Forwarded-For`, and optionally the " ++
+        "companion `X-Real-IP` and `X-Forwarded-Proto` headers. There is " ++
+        "no default for `mode`, because `replace` and `append` are each a " ++
+        "security bug in the other's position: an inbound chain is " ++
+        "client-controlled at the edge and authoritative behind a proxy " ++
+        "you own, and zoxy cannot tell from the inside which side of that " ++
+        "line it is on.";
     pub const schema_fields = .{
         .mode = .{
             .desc = "replace: state the observed peer, discarding any inbound chain " ++
                 "(use at the edge). append: extend the inbound chain with the observed " ++
                 "peer (use only when every hop in front is trusted).",
             .enum_type = Config.Listener.Forwarded,
+        },
+        .real_ip = .{
+            .desc = "Also write X-Real-IP with the observed peer (the header nginx " ++
+                "sets). Absent or false leaves inbound copies untouched.",
+        },
+        .proto = .{
+            .desc = "Also write X-Forwarded-Proto as http or https, from whether " ++
+                "this listener terminates TLS. Absent or false leaves inbound " ++
+                "copies untouched.",
         },
     };
 };
@@ -2387,6 +3218,12 @@ pub const MatchJson = struct {
     method: ?[]const []const u8 = null,
     host: ?[]const u8 = null,
     path_prefix: ?[]const u8 = null,
+    /// ASCII case-insensitive substrings over the canonical path and the
+    /// raw query (without `?`).
+    path_contains: ?[]const u8 = null,
+    query_contains: ?[]const u8 = null,
+    /// ASCII case-insensitive prefix of the raw query.
+    query_prefix: ?[]const u8 = null,
     headers: ?[]const HeaderMatchJson = null,
     /// Optional #177 client-address predicate: CIDR literals, any-of.
     client: ?[]const []const u8 = null,
@@ -2400,6 +3237,20 @@ pub const MatchJson = struct {
         },
         .host = .{ .desc = "Canonical host to match; absent matches any host." },
         .path_prefix = .{ .desc = "Canonical origin-form path prefix; must start with a slash." },
+        .path_contains = .{
+            .desc = "ASCII case-insensitive substring of the canonical path.",
+            .min_length = 1,
+        },
+        .query_contains = .{
+            .desc = "ASCII case-insensitive substring of the raw query, without " ++
+                "the leading `?`.",
+            .min_length = 1,
+        },
+        .query_prefix = .{
+            .desc = "ASCII case-insensitive prefix of the raw query, without " ++
+                "the leading `?`.",
+            .min_length = 1,
+        },
         .headers = .{
             .desc = "Header predicates; all must match.",
         },
@@ -2482,12 +3333,13 @@ pub const ResponseActionJson = struct {
         // member here the request lacks would be an edit the renderer
         // has never seen, and one whose type diverged would be the same
         // key meaning two things.
-        for (@typeInfo(ResponseActionJson).@"struct".fields) |field| {
-            if (!@hasField(ActionJson, field.name)) {
-                @compileError("ResponseActionJson." ++ field.name ++ " is not an ActionJson field");
+        const info = @typeInfo(ResponseActionJson).@"struct";
+        for (info.field_names, info.field_types) |name, FieldType| {
+            if (!@hasField(ActionJson, name)) {
+                @compileError("ResponseActionJson." ++ name ++ " is not an ActionJson field");
             }
-            if (@FieldType(ActionJson, field.name) != field.type) {
-                @compileError("ResponseActionJson." ++ field.name ++
+            if (@FieldType(ActionJson, name) != FieldType) {
+                @compileError("ResponseActionJson." ++ name ++
                     " has a different type than ActionJson's");
             }
         }
@@ -2686,6 +3538,10 @@ pub const RouteJson = struct {
     /// request. Conjoined with the other two, not ranked against them.
     header: ?RouteHeaderJson = null,
     cluster: []const u8,
+    /// Whether requests this route answers are written to the access log.
+    /// Absent means yes; `false` suppresses only the line, not counters,
+    /// metrics or admission — nginx's `access_log off` at a location.
+    access_log: bool = true,
 
     pub const schema_doc =
         "One route entry. Every key it states must hold — host, header and " ++
@@ -2700,6 +3556,11 @@ pub const RouteJson = struct {
                 "narrower rule and is tried before the same route without.",
         },
         .cluster = .{ .desc = "Name of the cluster matching requests route to." },
+        .access_log = .{
+            .desc = "Whether requests this route answers are logged; absent " ++
+                "means yes. False suppresses only the access-log line — " ++
+                "counters, metrics and admission are unchanged.",
+        },
     };
 };
 
@@ -2757,6 +3618,9 @@ pub const ClusterJson = struct {
     /// (#142); absent sends none. Only valid on clusters no http
     /// listener routes to.
     proxy_protocol: ?ClusterProxyProtocolJson = null,
+    /// Optional upstream TLS (and client certificate); absent dials the
+    /// endpoints in the clear.
+    tls: ?ClusterTlsJson = null,
 
     pub const schema_doc = "One upstream cluster: its endpoints, pick policy and health checks.";
     pub const schema_fields = .{
@@ -2792,6 +3656,72 @@ pub const ClusterJson = struct {
             .desc = "Announce each client to this cluster's origins with a PROXY " ++
                 "protocol header on the upstream connection (l4-reachable " ++
                 "clusters only); absent sends none.",
+        },
+        .tls = .{
+            .desc = "Dial this cluster's endpoints over TLS, optionally with a " ++
+                "client certificate (mTLS); absent dials in the clear.",
+        },
+    };
+};
+
+/// Upstream TLS for one cluster, with optional mutual TLS. The name is
+/// both the SNI value and the identity the origin's certificate must
+/// match, so neither can be silently omitted or defaulted from an
+/// endpoint literal: an IP destination and a service name are different
+/// claims, and only the operator knows which the origin's certificate
+/// carries.
+pub const ClusterTlsJson = struct {
+    /// Server name sent as SNI and matched against the origin's
+    /// certificate.
+    server_name: []const u8,
+    /// PEM root bundle to verify the origin against. Required whenever
+    /// `verify` is true; optional otherwise.
+    ca_file: ?[]const u8 = null,
+    /// PEM client certificate chain, leaf first, for mTLS. Must be
+    /// paired with `client_key`.
+    client_cert: ?[]const u8 = null,
+    /// PEM private key for `client_cert`. Must be paired with
+    /// `client_cert`.
+    client_key: ?[]const u8 = null,
+    /// Verify the origin's certificate chain and `server_name`.
+    ///
+    /// **DANGER**: `false` disables authentication of the origin
+    /// entirely — the connection is still encrypted, but any peer that
+    /// can intercept the TCP stream is accepted, so this is only for a
+    /// controlled network where another layer authenticates the origin.
+    /// It never means "verify nothing" on a public link.
+    verify: bool = true,
+
+    pub const schema_doc =
+        "Upstream TLS for this cluster: the name to verify, the roots to " ++
+        "verify against, and optionally a client certificate for mTLS. " ++
+        "Files are read once at startup, so a missing or unusable file " ++
+        "stops the proxy while the error can still name it.";
+    pub const schema_fields = .{
+        .server_name = .{
+            .desc = "Server name sent as SNI and matched against the origin's " ++
+                "certificate; no default, because an endpoint IP is not a name.",
+            .min_length = 1,
+        },
+        .ca_file = .{
+            .desc = "Path to the PEM root bundle used to verify the origin. " ++
+                "Required when verify is true (the default).",
+            .min_length = 1,
+        },
+        .client_cert = .{
+            .desc = "Path to the PEM client certificate chain, leaf first, for " ++
+                "mTLS; must be paired with client_key.",
+            .min_length = 1,
+        },
+        .client_key = .{
+            .desc = "Path to the client certificate's PEM private key; must be " ++
+                "paired with client_cert.",
+            .min_length = 1,
+        },
+        .verify = .{
+            .desc = "Verify the origin's chain and server name. DANGER: false " ++
+                "disables origin authentication entirely — encryption without " ++
+                "authentication — and belongs only on a controlled network.",
         },
     };
 };
@@ -2836,12 +3766,12 @@ pub const EndpointJson = struct {
         // The two shapes are one contract: a field added to either and
         // forgotten on the other would let the schema advertise a key
         // the parser rejects, or the parser accept one the schema hides.
-        const outer = @typeInfo(EndpointJson).@"struct".fields;
-        const inner = @typeInfo(ObjectForm).@"struct".fields;
-        assert(outer.len == inner.len);
-        for (outer, inner) |a, b| {
-            assert(std.mem.eql(u8, a.name, b.name));
-            assert(a.type == b.type);
+        const outer = @typeInfo(EndpointJson).@"struct";
+        const inner = @typeInfo(ObjectForm).@"struct";
+        assert(outer.field_names.len == inner.field_names.len);
+        for (outer.field_names, outer.field_types, inner.field_names, inner.field_types) |a_name, a_type, b_name, b_type| {
+            assert(std.mem.eql(u8, a_name, b_name));
+            assert(a_type == b_type);
         }
     }
 
@@ -2956,12 +3886,12 @@ pub const PickJson = struct {
         // The two shapes are one contract: a field added to either and
         // forgotten on the other would let the schema advertise a key
         // the parser rejects, or the parser accept one the schema hides.
-        const outer = @typeInfo(PickJson).@"struct".fields;
-        const inner = @typeInfo(ObjectForm).@"struct".fields;
-        assert(outer.len == inner.len);
-        for (outer, inner) |a, b| {
-            assert(std.mem.eql(u8, a.name, b.name));
-            assert(a.type == b.type);
+        const outer = @typeInfo(PickJson).@"struct";
+        const inner = @typeInfo(ObjectForm).@"struct";
+        assert(outer.field_names.len == inner.field_names.len);
+        for (outer.field_names, outer.field_types, inner.field_names, inner.field_types) |a_name, a_type, b_name, b_type| {
+            assert(std.mem.eql(u8, a_name, b_name));
+            assert(a_type == b_type);
         }
     }
 
@@ -3260,6 +4190,24 @@ pub const TimeoutsJson = struct {
     /// because a request deadline is a policy an operator sets against
     /// their own origin's latency, not a value zoxy can pick for them.
     request_ms: u32 = 0,
+    /// Optional, and `0` means "no cap" — but absence resolves to
+    /// `constants.h3_exchange_ms_default`, not to off: the deadline
+    /// shipped as a fixed ten seconds inside the h3 proxy, and a config
+    /// written before this knob existed must keep behaving exactly as it
+    /// did. Distinct from `request_ms` above, which bounds the L7
+    /// exchange on TCP listeners: an h3 exchange runs on its own slots
+    /// outside the conn-slot pools, no TCP-side deadline reaches it, and
+    /// this is the only clock it has.
+    h3_exchange_ms: ?u32 = null,
+    /// Optional, and `0` (the default) means "no idle cap": the absolute
+    /// `h3_exchange_ms` is the only clock. Where set, any application
+    /// byte making progress in either direction — an uploaded body
+    /// piece, a response head parse, a relayed body chunk — resets an
+    /// idle deadline of `now + h3_exchange_idle_ms`, so a stream that
+    /// keeps moving (SSE, a slow drip the origin means to send) is never
+    /// killed by the absolute budget its longevity would outrun. The
+    /// exchange expires on whichever deadline comes first.
+    h3_exchange_idle_ms: u32 = 0,
     /// Optional #311 serving-loop watchdog. **Absent is off**, and that
     /// is why it is optional rather than a `0` like the two caps above:
     /// the mechanism has a floor — `alarm(2)` is whole seconds and the
@@ -3329,6 +4277,20 @@ pub const TimeoutsJson = struct {
         },
         .request_ms = .{
             .desc = "Cap on one L7 exchange, not refreshed by activity; 0 disables it.",
+            .minimum = 0,
+            .maximum = constants.timeout_ms_max,
+        },
+        .h3_exchange_ms = .{
+            .desc = "Cap on one HTTP/3 upstream exchange (connect, send, recv); " ++
+                "0 disables it. Absent keeps the built-in 10 s default.",
+            .minimum = 0,
+            .maximum = constants.timeout_ms_max,
+        },
+        .h3_exchange_idle_ms = .{
+            .desc = "Idle cap on one HTTP/3 exchange: any progress in either " ++
+                "direction (upload piece, response head, relayed chunk) " ++
+                "resets it, so long-lived streams (SSE) survive the " ++
+                "absolute cap. 0 disables it. SSE wants 15000-30000.",
             .minimum = 0,
             .maximum = constants.timeout_ms_max,
         },
@@ -3470,28 +4432,28 @@ pub fn assert_meta_matches(comptime T: type) void {
     }
     const Meta = @TypeOf(T.schema_fields);
     // Every field has a documented, described entry.
-    inline for (@typeInfo(T).@"struct".fields) |field| {
-        if (!@hasField(Meta, field.name)) {
-            @compileError(@typeName(T) ++ "." ++ field.name ++ " has no schema_fields entry");
+    inline for (@typeInfo(T).@"struct".field_names) |field_name| {
+        if (!@hasField(Meta, field_name)) {
+            @compileError(@typeName(T) ++ "." ++ field_name ++ " has no schema_fields entry");
         }
-        const entry = @field(T.schema_fields, field.name);
+        const entry = @field(T.schema_fields, field_name);
         if (!@hasField(@TypeOf(entry), "desc")) {
-            @compileError(@typeName(T) ++ "." ++ field.name ++ " schema entry is missing .desc");
+            @compileError(@typeName(T) ++ "." ++ field_name ++ " schema entry is missing .desc");
         }
     }
     // Every entry maps to a real field and carries only known attributes.
-    inline for (@typeInfo(Meta).@"struct".fields) |entry_field| {
-        if (!@hasField(T, entry_field.name)) {
-            @compileError(@typeName(T) ++ " schema_fields entry '" ++ entry_field.name ++ "' has no matching field");
+    inline for (@typeInfo(Meta).@"struct".field_names) |entry_name| {
+        if (!@hasField(T, entry_name)) {
+            @compileError(@typeName(T) ++ " schema_fields entry '" ++ entry_name ++ "' has no matching field");
         }
-        const entry = @field(T.schema_fields, entry_field.name);
-        inline for (@typeInfo(@TypeOf(entry)).@"struct".fields) |attr| {
+        const entry = @field(T.schema_fields, entry_name);
+        inline for (@typeInfo(@TypeOf(entry)).@"struct".field_names) |attr_name| {
             comptime var known = false;
             inline for (schema_attributes) |name| {
-                if (comptime std.mem.eql(u8, name, attr.name)) known = true;
+                if (comptime std.mem.eql(u8, name, attr_name)) known = true;
             }
             if (!known) {
-                @compileError(@typeName(T) ++ "." ++ entry_field.name ++ " has unknown schema attribute '" ++ attr.name ++ "'");
+                @compileError(@typeName(T) ++ "." ++ entry_name ++ " has unknown schema attribute '" ++ attr_name ++ "'");
             }
         }
     }
@@ -3587,9 +4549,10 @@ fn assertVariantsMatch(comptime T: type) void {
 /// Whether a field carries a Zig default, as an opaque marker — the
 /// value itself is not comparable across the types this walks.
 fn defaultOf(comptime T: type, comptime name: []const u8) ?void {
-    for (@typeInfo(T).@"struct".fields) |field| {
-        if (std.mem.eql(u8, field.name, name)) {
-            return if (field.defaultValue() == null) null else {};
+    const info = @typeInfo(T).@"struct";
+    for (info.field_names, info.field_types, info.field_attrs) |field_name, FieldType, attrs| {
+        if (std.mem.eql(u8, field_name, name)) {
+            return if (attrs.defaultValue(FieldType) == null) null else {};
         }
     }
     return null;
@@ -3617,9 +4580,10 @@ fn assertOneOfMatches(comptime T: type) void {
                 @compileError(@typeName(T) ++ " schema_one_of names '" ++ name ++ "' twice");
             }
         }
-        inline for (@typeInfo(T).@"struct".fields) |field| {
-            if (comptime std.mem.eql(u8, field.name, name)) {
-                if (comptime field.defaultValue() == null) {
+        const info = @typeInfo(T).@"struct";
+        inline for (info.field_names, info.field_types, info.field_attrs) |field_name, FieldType, attrs| {
+            if (comptime std.mem.eql(u8, field_name, name)) {
+                if (comptime attrs.defaultValue(FieldType) == null) {
                     @compileError(@typeName(T) ++ ".schema_one_of names '" ++ name ++
                         "', which is required — every arm would match and the fork would reject everything");
                 }
@@ -3640,7 +4604,8 @@ pub const dto_types = .{
     ForwardedJson,      ProxyProtocolJson,   ClusterProxyProtocolJson, EndpointJson,
     ResponseFilterJson, ResponseMatchJson,   RedirectJson,             BodyJson,
     TlsJson,            PassiveEjectionJson, HttpListenerJson,         L4ListenerJson,
-    L4RouteJson,        RouteHeaderJson,     ResponseActionJson,
+    RateLimitJson,      ConnLimitJson,       WafJson,                  CompressJson,
+    L4RouteJson,        RouteHeaderJson,     ResponseActionJson,       ClusterTlsJson,
 };
 
 comptime {
@@ -3697,17 +4662,20 @@ fn resolveClusters(
         }
         const picked = try resolvePick(&entry.cluster.pick);
         const endpoints = try resolveEndpoints(arena, entry.cluster.endpoints);
+        const check = try resolveCheck(entry.cluster.check, connect_timeout_ms);
+        const tls = try resolveClusterTls(entry.cluster.tls);
         clusters[index] = .{
             .name = entry.name,
             .endpoints = endpoints.addresses,
             .weights = endpoints.weights,
             .pick = picked.pick,
-            .check = try resolveCheck(entry.cluster.check, connect_timeout_ms),
+            .check = check,
             .passive_ejection = try resolvePassiveEjection(entry.cluster.passive_ejection),
             .hash_key = picked.hash_key,
             .max_inflight = try resolveMaxInflight(entry.cluster.max_inflight),
             .retries = try resolveRetries(entry.cluster.retries),
             .proxy_protocol_send = try resolveClusterProxyProtocol(entry.cluster.proxy_protocol),
+            .tls = tls,
         };
     }
     assert(clusters.len == count);
@@ -4036,6 +5004,157 @@ fn resolveListeners(
     return listeners;
 }
 
+/// Resolve the optional HTTP/3 listeners. A listener is a bind, a route
+/// table, one certificate pair and two numbers — the routes ride the same
+/// §7 pipeline the HTTP/1.1 listener resolves, so this pass takes the
+/// resolved `head_buffer_bytes` (prefix validation gates against it) and
+/// runs after `resolveLimits`, beside `resolveListeners`.
+///
+/// The QUIC-TLS binding installs one server identity process-wide. Multiple
+/// h3 listeners are therefore allowed only when they name the same
+/// certificate paths; a config asking for two identities is refused at
+/// load rather than served with whichever listener resolved first.
+fn resolveH3Listeners(
+    arena: std.mem.Allocator,
+    entries: []const H3ListenerJson,
+    clusters: []const Config.Cluster,
+    head_buffer_bytes: u32,
+    bodies: []ResolvedBody,
+) ParseError![]const Config.H3Listener {
+    if (entries.len == 0) return &.{};
+    if (entries.len > constants.h3_listeners_max) return error.H3ListenersOverLimit;
+    assert(clusters.len >= 1);
+    assert(head_buffer_bytes >= 1);
+
+    const listeners = try arena.alloc(Config.H3Listener, entries.len);
+    var first_cert: ?[]const u8 = null;
+    var first_key: ?[]const u8 = null;
+    for (entries, listeners) |entry, *listener| {
+        if (std.mem.startsWith(u8, entry.bind, unix_address_prefix)) {
+            return error.H3ListenerBindUnix;
+        }
+        const bind = std.Io.net.IpAddress.parseLiteral(entry.bind) catch
+            return error.H3ListenerBindInvalid;
+        if (bind.getPort() == 0) return error.H3ListenerBindInvalid;
+
+        const routes = try resolveH3Routes(arena, &entry, clusters, head_buffer_bytes);
+
+        const cert_path = entry.tls.cert;
+        const key_path = entry.tls.key;
+        if (cert_path.len == 0) return error.H3ListenerTlsCertPathEmpty;
+        if (key_path.len == 0) return error.H3ListenerTlsKeyPathEmpty;
+        if (first_cert) |cert| {
+            if (!std.mem.eql(u8, cert, cert_path) or
+                !std.mem.eql(u8, first_key.?, key_path))
+            {
+                return error.H3ListenerTlsConflict;
+            }
+        } else {
+            first_cert = cert_path;
+            first_key = key_path;
+        }
+
+        if (entry.max_connections == 0 or entry.max_connections > constants.h3_connections_max) {
+            return error.H3ListenerConnectionsOutOfRange;
+        }
+        if (entry.max_response_bytes == 0 or
+            entry.max_response_bytes > constants.h3_response_bytes_limit)
+        {
+            return error.H3ListenerResponseBytesOutOfRange;
+        }
+
+        listener.* = .{
+            .bind_address = bind,
+            .routes = routes,
+            .cert_path = cert_path,
+            .key_path = key_path,
+            .max_connections = entry.max_connections,
+            .max_response_bytes = entry.max_response_bytes,
+            .error_pages = try resolveH3ErrorPages(arena, entry.error_pages, bodies),
+        };
+    }
+
+    // Duplicate binds, linear in the (small) listener count. A UDP bind
+    // collision is a config error with the same answer as its TCP twin.
+    for (listeners, 0..) |listener, index| {
+        for (listeners[0..index]) |previous| {
+            if (std.Io.net.IpAddress.eql(&listener.bind_address, &previous.bind_address)) {
+                return error.H3ListenerBindDuplicate;
+            }
+        }
+    }
+    assert(listeners.len == entries.len);
+    return listeners;
+}
+
+/// One h3 listener's route table: the §7 pipeline's answer unmodified —
+/// host, header predicate, prefix, and the per-route `access_log` flag
+/// ride the same `resolveRoutes` the HTTP/1.1 listener builds, so the
+/// h3 table carries every L7 routing dimension — plus the per-route
+/// plaintext-cluster checks replayed per route: no unix endpoints.
+/// TLS-dialing clusters are fine — the h3 exchange runs the same
+/// upstream client engine the TCP path dials with, so a cluster's `tls`
+/// block is honored, not refused. An empty endpoint list is already
+/// refused where clusters resolve.
+/// The h3 listener's error-page map: one body per verdict family that
+/// named one, each rendered by the L7 pipeline for the family's status
+/// through `pageFor` — so validation (name existence, size, content) is
+/// the same function the HTTP/1.1 listener's `error_pages` answer to,
+/// and a body shared between a TCP listener's page and an h3 family's
+/// costs one rendering, not two (#159's one-body-one-buffer contract).
+fn resolveH3ErrorPages(
+    arena: std.mem.Allocator,
+    pages_json: ?H3ErrorPagesJson,
+    bodies: []ResolvedBody,
+) ParseError!Config.H3ErrorPages {
+    const parsed = pages_json orelse return .{};
+    return .{
+        .no_route = try h3ErrorPageBody(arena, bodies, parsed.no_route, 404),
+        .bad_gateway = try h3ErrorPageBody(arena, bodies, parsed.bad_gateway, 502),
+        .gateway_timeout = try h3ErrorPageBody(arena, bodies, parsed.gateway_timeout, 504),
+    };
+}
+
+/// One family's page: the body bytes behind the head the L7 renderer
+/// builds for the status. The h3 answer writes its own HEADERS (QPACK,
+/// not HTTP/1.x), so only the body crosses the seam; the head-length
+/// prefix contract `pageFor` asserts is exactly what makes the slice
+/// honest.
+fn h3ErrorPageBody(
+    arena: std.mem.Allocator,
+    bodies: []ResolvedBody,
+    name: ?[]const u8,
+    status: u16,
+) ParseError!?[]const u8 {
+    const named = name orelse return null;
+    assert(shed.isPageStatus(status));
+    const page = try pageFor(arena, bodies, named, status);
+    assert(page.keep_head_len <= page.keep.len);
+    return page.keep[page.keep_head_len..];
+}
+
+fn resolveH3Routes(
+    arena: std.mem.Allocator,
+    entry: *const H3ListenerJson,
+    clusters: []const Config.Cluster,
+    head_buffer_bytes: u32,
+) ParseError![]const router.Route {
+    const routes = try resolveRoutes(
+        arena,
+        entry.cluster,
+        entry.routes,
+        clusters,
+        head_buffer_bytes,
+    );
+    for (routes) |route| {
+        const cluster = clusters[route.cluster_index];
+        for (cluster.endpoints) |endpoint| {
+            if (endpoint == .unix) return error.H3ListenerClusterUnixEndpoint;
+        }
+    }
+    return routes;
+}
+
 /// One listener's whole resolution — split from `resolveListeners`
 /// when #159 threaded the bodies table through it and the loop body
 /// pushed that function past the length limit. The duplicate-bind pass
@@ -4051,7 +5170,7 @@ fn resolveListener(
     assert(clusters.len >= 1);
     assert(head_buffer_bytes >= 1);
     const bind_address = try resolveBindAddress(arena, listener_json.bind);
-    const tls = try resolveTls(listener_json.tls);
+    const tls = try resolveTls(arena, listener_json.tls);
     // The tag dispatches, and every field it does not carry is one this
     // arm cannot be handed (#305): the seven "this key is meaningless on
     // that protocol" errors this replaced were the loader restating a
@@ -4074,6 +5193,11 @@ fn resolveListener(
     }
     if (listener.protocol == .http) {
         try rejectHttpClusterSend(listener.routes, clusters);
+    }
+    if (listener.protocol == .l4) {
+        // Transparent by definition: the relay never originates TLS, so
+        // a TLS-dialing cluster would be handed the client's bytes as-is.
+        try rejectClusterTlsOnL4(listener.routes, clusters);
     }
     if (listener.tls != null) {
         try rejectTlsClusterSend(listener.routes, clusters);
@@ -4100,17 +5224,87 @@ fn resolveHttpListener(
         // Filled by `resolveListener`, which is where the `mode` field
         // and the bind it describes are both in scope.
         .bind_mode = null,
-        .routes = try resolveRoutes(arena, http_json, clusters, head_buffer_bytes),
+        .routes = try resolveRoutes(
+            arena,
+            http_json.cluster,
+            http_json.routes,
+            clusters,
+            head_buffer_bytes,
+        ),
         .request_filters = try resolveRequestFilters(arena, http_json, head_buffer_bytes, bodies),
         .response_filters = try resolveResponseFilters(arena, http_json),
+        .waf = try resolveWaf(arena, http_json.waf),
+        .compress_min_bytes = if (http_json.compress) |compress|
+            compress.min_bytes
+        else
+            null,
         .protocol = .http,
         .forwarded = try resolveForwarded(http_json.forwarded),
+        .forwarded_real_ip = if (http_json.forwarded) |forwarded|
+            forwarded.real_ip orelse false
+        else
+            false,
+        .forwarded_proto = if (http_json.forwarded) |forwarded|
+            forwarded.proto orelse false
+        else
+            false,
         .proxy_protocol = null,
         .tls = tls,
         .upgrades = try resolveUpgrades(http_json.upgrades),
         .max_body_bytes = try resolveMaxBodyBytes(http_json.max_body_bytes),
         .proxy_status = http_json.proxy_status,
+        .h3_advertise = try resolveH3Advertise(http_json.h3_advertise),
+        .rate_limit = try resolveRateLimit(http_json.rate_limit),
+        .conn_limit_max = try resolveConnLimit(http_json.conn_limit),
     };
+}
+
+/// The listener's `Alt-Svc` advertisement, or null. The value rides
+/// every proxied final response head verbatim, so it is held to the
+/// schema's bound and borrowed from the config's arena — nothing on the
+/// serving path allocates or copies.
+fn resolveH3Advertise(value: ?[]const u8) ValidationError!?[]const u8 {
+    const advertise = value orelse return null;
+    if (advertise.len == 0 or advertise.len > constants.alt_svc_value_bytes_max) {
+        return error.ListenerH3AdvertiseInvalid;
+    }
+    assert(advertise.len >= 1);
+    assert(advertise.len <= constants.alt_svc_value_bytes_max);
+    return advertise;
+}
+
+/// Compile a listener's WAF-lite block: validate every bound at load and
+/// copy the literal patterns into one arena slice, so the request path
+/// only ever iterates immutable data. Absent = no WAF. The `deny` list is
+/// required and non-empty: an empty denylist is a typo, while leaving the
+/// block out is how a listener says it has none.
+fn resolveWaf(arena: std.mem.Allocator, waf_json: ?WafJson) ParseError!?filter.Waf {
+    const json = waf_json orelse return null;
+    if (json.deny.len == 0) {
+        return error.WafDenyEmpty;
+    }
+    if (json.deny.len > filter.waf_patterns_max) {
+        return error.WafDenyOverLimit;
+    }
+    if (!filter.isRejectStatus(json.status)) {
+        return error.WafStatusInvalid;
+    }
+    assert(json.deny.len >= 1); // Past the empty guard.
+    assert(json.deny.len <= filter.waf_patterns_max);
+    assert(filter.isRejectStatus(json.status));
+    const patterns = try arena.alloc([]const u8, json.deny.len);
+    for (json.deny, patterns) |pattern, *slot| {
+        if (pattern.len == 0) {
+            return error.WafPatternEmpty;
+        }
+        if (pattern.len > filter.waf_pattern_bytes_max) {
+            return error.WafPatternTooLong;
+        }
+        assert(pattern.len >= 1);
+        assert(pattern.len <= filter.waf_pattern_bytes_max);
+        slot.* = pattern;
+    }
+    return .{ .patterns = patterns, .status = json.status };
 }
 
 /// An `l4` listener: which cluster (or which table of them) it relays to,
@@ -4170,11 +5364,13 @@ fn resolveL4Listener(
     // be a rejected config and is now an unwritable one. "Happen to be"
     // is the problem: nothing else pins that coincidence, so a default
     // changed with only the http case in mind would move l4's behaviour
-    // silently. These four asserts are where it would stop.
+    // silently. These four asserts are where it would stop. The
+    // rate-limit default is on the same footing and gets the fifth.
     assert(listener.request_filters.len == 0);
     assert(listener.response_filters.len == 0);
     assert(listener.forwarded == null);
     assert(!listener.upgrades.any());
+    assert(listener.rate_limit == null);
     return listener;
 }
 
@@ -4477,7 +5673,7 @@ fn resolveResponseMatch(
     if (match_json.status_class) |literal| {
         const class = std.meta.stringToEnum(filter.StatusClass, literal) orelse
             return error.ResponseFilterStatusClassUnknown;
-        match.status_class = @intFromEnum(class);
+        match.status_class = @backingInt(class);
         // The digit contract `responseMatches` asserts on its side of
         // the seam, proven where it is produced.
         assert(match.status_class.? >= 1);
@@ -4541,6 +5737,24 @@ fn resolveMatch(
     if (match_json.path_prefix) |prefix| {
         try validateRoutePrefix(prefix, head_buffer_bytes);
         match.path_prefix = prefix;
+    }
+    if (match_json.path_contains) |needle| {
+        if (needle.len == 0) {
+            return error.FilterPathContainsEmpty;
+        }
+        match.path_contains = needle;
+    }
+    if (match_json.query_contains) |needle| {
+        if (needle.len == 0) {
+            return error.FilterQueryContainsEmpty;
+        }
+        match.query_contains = needle;
+    }
+    if (match_json.query_prefix) |prefix| {
+        if (prefix.len == 0) {
+            return error.FilterQueryPrefixEmpty;
+        }
+        match.query_prefix = prefix;
     }
     if (match_json.method) |tokens| {
         if (tokens.len == 0) {
@@ -4930,6 +6144,16 @@ fn validateEditableHeaderName(name: []const u8) ParseError!void {
     if (std.ascii.eqlIgnoreCase(name, render.forwarded_for_name)) {
         return error.FilterHeaderNameReserved;
     }
+    // The nginx-compatible companions, barred for the same reason: a
+    // constant `X-Real-IP` is one address for every client, and a
+    // constant `X-Forwarded-Proto` lies on whichever listener is not the
+    // scheme it spells. The `forwarded` block is the one mechanism that
+    // writes them, per listener, from what it actually observed.
+    if (std.ascii.eqlIgnoreCase(name, render.real_ip_name) or
+        std.ascii.eqlIgnoreCase(name, render.forwarded_proto_name))
+    {
+        return error.FilterHeaderNameReserved;
+    }
     // Reserved for the same reason and a stricter one (#240): the value
     // is not merely computed but *required* to be — RFC 9110 §7.6.2 has
     // each hop forward its own decrement, so a rule writing a constant
@@ -4967,14 +6191,18 @@ const isTokenByte = parser.isTokenByte;
 /// they compare directly against the canonical request path) and unique;
 /// the table is sorted longest-prefix-first for the request-time scan.
 /// `l4` listeners have no path, so they take only the `cluster` form.
+/// Both the HTTP/1.1 and the HTTP/3 listener resolve through here — the
+/// two take the sugar/table pair rather than their whole JSON shape so
+/// one pipeline owns §7's rules.
 fn resolveRoutes(
     arena: std.mem.Allocator,
-    http_json: *const HttpListenerJson,
+    cluster: ?[]const u8,
+    routes_json: ?[]const RouteJson,
     clusters: []const Config.Cluster,
     head_buffer_bytes: u32,
 ) ParseError![]const router.Route {
-    const has_cluster = http_json.cluster != null;
-    const has_routes = http_json.routes != null;
+    const has_cluster = cluster != null;
+    const has_routes = routes_json != null;
     if (has_cluster == has_routes) {
         return error.ListenerClusterOrRoutes; // Neither, or both.
     }
@@ -4982,24 +6210,24 @@ fn resolveRoutes(
         const routes = try arena.alloc(router.Route, 1);
         routes[0] = .{
             .prefix = "/",
-            .cluster_index = try clusterIndexOf(clusters, http_json.cluster.?),
+            .cluster_index = try clusterIndexOf(clusters, cluster.?),
         };
         assert(routes.len == 1); // The sugar is always one catch-all route.
         return routes;
     }
-    const routes_json = http_json.routes.?;
-    if (routes_json.len == 0) {
+    const table_json = routes_json.?;
+    if (table_json.len == 0) {
         return error.RoutesEmpty;
     }
-    const routes = try arena.alloc(router.Route, routes_json.len);
-    for (routes_json, 0..) |route_json, index| {
+    const routes = try arena.alloc(router.Route, table_json.len);
+    for (table_json, 0..) |route_json, index| {
         try validateRoutePrefix(route_json.prefix, head_buffer_bytes);
         const host = if (route_json.host) |raw| try validateRouteHost(raw) else null;
         const header = if (route_json.header) |raw|
             try resolveRouteHeader(raw)
         else
             null;
-        for (routes_json[0..index]) |previous| {
+        for (table_json[0..index]) |previous| {
             // Earlier routes already passed validateRouteHost, so their raw
             // host equals its canonical form — a byte compare is sound.
             if (optionalHostEql(previous.host, host) and
@@ -5018,6 +6246,7 @@ fn resolveRoutes(
             .prefix = route_json.prefix,
             .header = header,
             .cluster_index = try clusterIndexOf(clusters, route_json.cluster),
+            .access_log = route_json.access_log,
         };
     }
     // Host, then header, then prefix (§7, #302): the router's linear scan
@@ -5297,6 +6526,49 @@ fn resolveMaxBodyBytes(cap: u64) ValidationError!u64 {
     return cap;
 }
 
+/// Resolve a listener's `rate_limit` block (§7). Absent means no limit.
+///
+/// `burst` defaults to `requests` and may be larger — an idle client
+/// accumulates up to a burst's worth — but not smaller: a capacity below
+/// the refill window would smooth the allowance the operator stated,
+/// which is a different policy than the one the block names.
+fn resolveRateLimit(
+    rate_limit_json: ?RateLimitJson,
+) ValidationError!?rate_limit.Policy {
+    const asked = rate_limit_json orelse return null;
+    if (asked.requests < 1 or asked.requests > constants.rate_limit_requests_max) {
+        return error.ListenerRateLimitRequestsOutOfRange;
+    }
+    if (asked.window_ms < 1 or asked.window_ms > constants.timeout_ms_max) {
+        return error.ListenerRateLimitWindowOutOfRange;
+    }
+    const burst = asked.burst orelse asked.requests;
+    if (burst < 1 or burst > constants.rate_limit_burst_max) {
+        return error.ListenerRateLimitBurstOutOfRange;
+    }
+    if (burst < asked.requests) {
+        return error.ListenerRateLimitBurstBelowRequests;
+    }
+    assert(burst >= asked.requests);
+    assert(asked.window_ms >= 1);
+    return .{
+        .requests = asked.requests,
+        .window_ms = asked.window_ms,
+        .burst = burst,
+    };
+}
+
+/// Resolve a listener's per-client connection cap. One number, checked
+/// against the process's slot ceiling: a cap above it asks for a limit
+/// the pool already enforces.
+fn resolveConnLimit(conn_limit_json: ?ConnLimitJson) ValidationError!?u32 {
+    const asked = conn_limit_json orelse return null;
+    if (asked.max < 1 or asked.max > constants.conn_limit_conns_max) {
+        return error.ListenerConnLimitOutOfRange;
+    }
+    return asked.max;
+}
+
 /// Resolve a listener's #180 upgrade allowlist. Absent allows none, so
 /// an `Upgrade` keeps the `501` it has always got.
 ///
@@ -5312,8 +6584,8 @@ fn resolveUpgrades(
 ) ValidationError!Config.Listener.Upgrades {
     const asked = upgrades_json orelse return .{};
     var upgrades: Config.Listener.Upgrades = .{};
-    inline for (@typeInfo(UpgradesJson).@"struct".fields) |field| {
-        @field(upgrades, field.name) = @field(asked, field.name);
+    inline for (@typeInfo(UpgradesJson).@"struct".field_names) |name| {
+        @field(upgrades, name) = @field(asked, name);
     }
     // No rejection for "every flag false", and the shape is why. An
     // empty *list* was a meaningless spelling of a set, so it was
@@ -5359,11 +6631,39 @@ fn resolveProxyProtocol(
 /// open the current directory, which fails somewhere far less obvious.
 /// Shared by both protocols rather than living in either body: both
 /// speak over a terminated session (§4, §7).
-fn resolveTls(tls_json: ?TlsJson) ValidationError!?Config.Listener.Tls {
+fn resolveTls(arena: std.mem.Allocator, tls_json: ?TlsJson) ParseError!?Config.Listener.Tls {
     const tls = tls_json orelse return null;
-    if (tls.cert.len == 0) return error.ListenerTlsCertPathEmpty;
-    if (tls.key.len == 0) return error.ListenerTlsKeyPathEmpty;
-    return .{ .cert_path = tls.cert, .key_path = tls.key };
+    const has_legacy = tls.cert != null or tls.key != null;
+    if (has_legacy and tls.certificates.len > 0) return error.ListenerTlsFormMixed;
+
+    if (tls.certificates.len > 0) {
+        if (tls.certificates.len > constants.tls_certificates_max) {
+            return error.ListenerTlsCertificatesOutOfRange;
+        }
+        const certificates = try arena.alloc(Config.Listener.Tls.Certificate, tls.certificates.len);
+        for (tls.certificates, 0..) |entry, index| {
+            if (entry.cert.len == 0) return error.ListenerTlsCertPathEmpty;
+            if (entry.key.len == 0) return error.ListenerTlsKeyPathEmpty;
+            for (entry.names) |name| {
+                if (name.len == 0) return error.ListenerTlsNameEmpty;
+            }
+            certificates[index] = .{
+                .cert_path = entry.cert,
+                .key_path = entry.key,
+                .names = entry.names,
+            };
+        }
+        return .{ .certificates = certificates };
+    }
+
+    if (tls.cert == null and tls.key == null) return error.ListenerTlsNoCertificates;
+    const cert = tls.cert orelse return error.ListenerTlsCertPathEmpty;
+    const key = tls.key orelse return error.ListenerTlsKeyPathEmpty;
+    if (cert.len == 0) return error.ListenerTlsCertPathEmpty;
+    if (key.len == 0) return error.ListenerTlsKeyPathEmpty;
+    const certificates = try arena.alloc(Config.Listener.Tls.Certificate, 1);
+    certificates[0] = .{ .cert_path = cert, .key_path = key, .names = &.{} };
+    return .{ .certificates = certificates };
 }
 
 /// A cluster's resolved pick: the policy, and — for `hash` — the key it
@@ -5453,6 +6753,25 @@ fn rejectHttpClusterSend(
     }
 }
 
+/// An `l4` listener's relay is transparent by definition: it forwards
+/// bytes and never originates TLS. A cluster that dials TLS expects a
+/// handshake, so handing it the client's bytes verbatim would be a
+/// listener that silently speaks the wrong protocol. Refused at load;
+/// the alternative — originating TLS on the relay's behalf — is a
+/// different proxy.
+fn rejectClusterTlsOnL4(
+    routes: []const router.Route,
+    clusters: []const Config.Cluster,
+) ValidationError!void {
+    assert(routes.len >= 1);
+    for (routes) |route| {
+        assert(route.cluster_index < clusters.len);
+        if (clusters[route.cluster_index].tls != null) {
+            return error.ClusterTlsOnL4Listener;
+        }
+    }
+}
+
 /// The same shape for a terminating listener (§4, #125). A TLS
 /// connection's client→upstream window is the engine's plaintext buffer,
 /// not the relay buffer — so the send-side PROXY header, which stages
@@ -5487,6 +6806,42 @@ fn resolveClusterProxyProtocol(
     ) orelse error.ClusterProxyProtocolSendUnknown;
 }
 
+/// Resolve a cluster's upstream TLS block: absent is plaintext, and what
+/// is checkable here is shape only (§5). The loader does no IO, so file
+/// existence and contents are startup's to prove — where the error can
+/// name the path. An empty path is refused here because it would reach
+/// `openat` as the working directory, and verification without roots is
+/// refused because it cannot be what the operator meant.
+fn resolveClusterTls(
+    tls_json: ?ClusterTlsJson,
+) ValidationError!?Config.Cluster.Tls {
+    const tls = tls_json orelse return null;
+    if (tls.server_name.len == 0) return error.ClusterTlsServerNameEmpty;
+    if (tls.ca_file) |path| {
+        if (path.len == 0) return error.ClusterTlsPathEmpty;
+    }
+    if (tls.client_cert) |path| {
+        if (path.len == 0) return error.ClusterTlsPathEmpty;
+    }
+    if (tls.client_key) |path| {
+        if (path.len == 0) return error.ClusterTlsPathEmpty;
+    }
+    if (tls.verify and tls.ca_file == null) return error.ClusterTlsCaRequired;
+    if (tls.client_cert != null and tls.client_key == null) {
+        return error.ClusterTlsClientCertWithoutKey;
+    }
+    if (tls.client_key != null and tls.client_cert == null) {
+        return error.ClusterTlsClientKeyWithoutCert;
+    }
+    return .{
+        .server_name = tls.server_name,
+        .ca_file = tls.ca_file,
+        .client_cert_path = tls.client_cert,
+        .client_key_path = tls.client_key,
+        .verify = tls.verify,
+    };
+}
+
 /// How many listeners ask for each of the four features whose pools and
 /// buffers are sized before any listener resolves. Split from
 /// `parseWithFiles` for the length limit, and it reads better whole: four
@@ -5506,6 +6861,12 @@ const ListenerFeatures = struct {
     /// Listeners routing by SNI (#298) — what decides whether the relay
     /// buffer has to be wide enough to stage a ClientHello.
     sni: u32 = 0,
+    /// Listeners carrying a listener-level rate limit (§7) — what decides
+    /// whether `limits.rate_limit_entries` is required.
+    rate_limit: u32 = 0,
+    /// Listeners capping concurrent connections per client (§7) — what
+    /// decides whether `limits.conn_limit_entries` is required.
+    conn_limit: u32 = 0,
 };
 
 fn countListenerFeatures(listeners: []const ListenerJson) ParseError!ListenerFeatures {
@@ -5529,6 +6890,8 @@ fn countListenerFeatures(listeners: []const ListenerJson) ParseError!ListenerFea
                 const allowed = try resolveUpgrades(upgrades);
                 if (allowed.any()) features.upgrades += 1;
             }
+            if (http_json.rate_limit != null) features.rate_limit += 1;
+            if (http_json.conn_limit != null) features.conn_limit += 1;
         }
         if (listener_json.l4) |l4_json| {
             if (l4_json.routes != null) features.sni += 1;
@@ -5542,6 +6905,8 @@ fn countListenerFeatures(listeners: []const ListenerJson) ParseError!ListenerFea
     assert(features.tls <= listeners.len);
     assert(features.upgrades <= listeners.len);
     assert(features.sni <= listeners.len);
+    assert(features.rate_limit <= listeners.len);
+    assert(features.conn_limit <= listeners.len);
     return features;
 }
 
@@ -5678,13 +7043,18 @@ fn validateTimeouts(timeouts: *const TimeoutsJson) ValidationError!void {
             return error.TimeoutOverLimit;
         }
     }
-    // The three optional caps (§6, §8): 0 means "no cap" on each — no age
-    // limit, no request deadline, and a drain that waits for the last
-    // connection — so only the shared ceiling is enforced.
+    // The four caps whose zero spells "no cap" (§6, §8): no age limit, no
+    // request deadline, a drain that waits for the last connection, and
+    // no deadline on an h3 exchange — so only the shared ceiling is
+    // enforced. The h3 one is `?u32` because absence resolves to its
+    // built-in default rather than to off; the default sits inside the
+    // ceiling, so the resolved value rides this same check.
     const optional = [_]u32{
         timeouts.max_lifetime_ms,
         timeouts.request_ms,
         timeouts.drain_deadline_ms,
+        timeouts.h3_exchange_ms orelse constants.h3_exchange_ms_default,
+        timeouts.h3_exchange_idle_ms,
     };
     for (optional) |value| {
         if (value > constants.timeout_ms_max) {
@@ -5771,6 +7141,7 @@ test "config: the shipped example parses and resolves" {
 
     const parsed = try expectParseOk(&arena_state, example_json);
     try std.testing.expectEqual(@as(usize, 1), parsed.listeners.len);
+    try std.testing.expectEqual(@as(usize, 1), parsed.h3_listeners.len);
     try std.testing.expectEqual(@as(usize, 1), parsed.clusters.len);
     // The `"cluster"` sugar resolves to one catch-all route.
     try std.testing.expectEqual(@as(usize, 1), parsed.listeners[0].routes.len);
@@ -5803,6 +7174,268 @@ test "config: the shipped example parses and resolves" {
     try std.testing.expectEqual(@as(u32, 0), parsed.drain_deadline_ms);
     try std.testing.expectEqual(@as(u32, 0), parsed.max_lifetime_ms);
     try std.testing.expectEqual(@as(u32, 0), parsed.request_timeout_ms);
+}
+
+test "config: h3 listeners resolve the route sugar, identity and caps" {
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+
+    const parsed = try expectParseOk(&arena_state,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"origin"}}],
+        \\ "clusters":{"origin":{"endpoints":["127.0.0.1:9000"]}},
+        \\ "h3_listeners":[{"bind":"127.0.0.1:4443","cluster":"origin",
+        \\   "tls":{"cert":"cert.pem","key":"key.pem"}}]}
+    );
+    try std.testing.expectEqual(@as(usize, 1), parsed.h3_listeners.len);
+    const listener = parsed.h3_listeners[0];
+    try std.testing.expectEqual(@as(u16, 4443), listener.bind_address.getPort());
+    // The `"cluster"` sugar resolves to one catch-all route, as on the
+    // HTTP/1.1 listener.
+    try std.testing.expectEqual(@as(usize, 1), listener.routes.len);
+    try std.testing.expectEqualStrings("/", listener.routes[0].prefix);
+    try std.testing.expectEqual(@as(?[]const u8, null), listener.routes[0].host);
+    try std.testing.expectEqual(@as(u16, 0), listener.routes[0].cluster_index);
+    try std.testing.expectEqualStrings("cert.pem", listener.cert_path);
+    try std.testing.expectEqualStrings("key.pem", listener.key_path);
+    try std.testing.expectEqual(constants.h3_connections_default, listener.max_connections);
+    try std.testing.expectEqual(constants.h3_response_bytes_max, listener.max_response_bytes);
+}
+
+const h3_test_prefix =
+    \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"origin"}}],
+    \\ "clusters":{"origin":{"endpoints":["127.0.0.1:9000"]},
+    \\   "backup":{"endpoints":["127.0.0.1:9001","127.0.0.1:9002"]},
+    \\   "secure":{"endpoints":["127.0.0.1:9443"],
+    \\     "tls":{"server_name":"origin.test","ca_file":"ca.pem"}},
+    \\   "local":{"endpoints":["unix:/tmp/origin.sock"]}},
+    \\ "h3_listeners":
+;
+
+test "config: h3 routes resolve, sort host-first longest-prefix-first" {
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+
+    const parsed = try expectParseOk(&arena_state, h3_test_prefix ++
+        \\[{"bind":"127.0.0.1:4443",
+        \\  "routes":[{"prefix":"/","cluster":"backup"},
+        \\            {"prefix":"/api","cluster":"origin"},
+        \\            {"host":"api.test","prefix":"/","cluster":"origin"}],
+        \\  "tls":{"cert":"cert.pem","key":"key.pem"}}]}
+    );
+    try std.testing.expectEqual(@as(usize, 1), parsed.h3_listeners.len);
+    const routes = parsed.h3_listeners[0].routes;
+    try std.testing.expectEqual(@as(usize, 3), routes.len);
+    // The §7 order the request-time scan depends on: host-specific first,
+    // then longest prefix within the any-host group.
+    try std.testing.expectEqualStrings("api.test", routes[0].host.?);
+    try std.testing.expectEqualStrings("/", routes[0].prefix);
+    try std.testing.expectEqual(@as(?[]const u8, null), routes[1].host);
+    try std.testing.expectEqualStrings("/api", routes[1].prefix);
+    try std.testing.expectEqual(@as(u16, 0), routes[1].cluster_index);
+    try std.testing.expectEqualStrings("/", routes[2].prefix);
+    try std.testing.expectEqual(@as(u16, 1), routes[2].cluster_index);
+}
+
+test "config: h3 routes carry the L7 dimensions — header predicates and per-route log suppression" {
+    // #302's header predicate and the per-route `access_log` flag parse
+    // through the same `resolveRoutes` pipeline the HTTP/1.1 listener
+    // builds: equals and present kinds, and a route opting out of the
+    // log line while staying counted.
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    const parsed = try expectParseOk(&arena_state, h3_test_prefix ++
+        \\[{"bind":"127.0.0.1:4443",
+        \\  "routes":[
+        \\    {"host":"api.example","prefix":"/","cluster":"origin",
+        \\     "header":{"name":"x-canary","equals":"1"},"access_log":false},
+        \\    {"prefix":"/","cluster":"origin",
+        \\     "header":{"name":"x-debug","present":true}}],
+        \\  "tls":{"cert":"cert.pem","key":"key.pem"}}]}
+    );
+    const routes = parsed.h3_listeners[0].routes;
+    // Config order holds the equal-specificity tie (the canary before
+    // the catch-all), and the sorted table keeps it.
+    try std.testing.expectEqual(@as(usize, 2), routes.len);
+    try std.testing.expectEqualStrings("api.example", routes[0].host.?);
+    const canary = routes[0].header.?;
+    try std.testing.expectEqualStrings("x-canary", canary.name);
+    try std.testing.expectEqual(router.HeaderMatch.Kind.equals, canary.kind);
+    try std.testing.expectEqualStrings("1", canary.value);
+    try std.testing.expectEqual(false, routes[0].access_log);
+    const debug = routes[1].header.?;
+    try std.testing.expectEqualStrings("x-debug", debug.name);
+    try std.testing.expectEqual(router.HeaderMatch.Kind.present, debug.kind);
+    try std.testing.expectEqual(true, routes[1].access_log);
+
+    // The sugar form names neither dimension, so it stays loadable.
+    var sugar_arena: std.heap.ArenaAllocator = undefined;
+    defer sugar_arena.deinit();
+    _ = try expectParseOk(&sugar_arena, h3_test_prefix ++
+        \\[{"bind":"127.0.0.1:4443","cluster":"origin",
+        \\  "tls":{"cert":"cert.pem","key":"key.pem"}}]}
+    );
+}
+
+test "config: h3 routes replay the per-route cluster checks" {
+    // A route selecting the TLS-dialing cluster is the supported shape
+    // now: the h3 exchange runs the same upstream client engine the TCP
+    // path dials with, so the cluster's `tls` block parses like any
+    // other. What stays refused is the endpoint shape the QUIC path
+    // cannot dial.
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    _ = try expectParseOk(&arena_state, h3_test_prefix ++
+        \\[{"bind":"127.0.0.1:4443",
+        \\  "routes":[{"prefix":"/","cluster":"origin"},
+        \\            {"prefix":"/secure","cluster":"secure"}],
+        \\  "tls":{"cert":"cert.pem","key":"key.pem"}}]}
+    );
+    try expectParseError(error.H3ListenerClusterUnixEndpoint, h3_test_prefix ++
+        \\[{"bind":"127.0.0.1:4443",
+        \\  "routes":[{"prefix":"/","cluster":"origin"},
+        \\            {"prefix":"/local","cluster":"local"}],
+        \\  "tls":{"cert":"cert.pem","key":"key.pem"}}]}
+    );
+    try expectParseError(error.ClusterUnknown, h3_test_prefix ++
+        \\[{"bind":"127.0.0.1:4443",
+        \\  "routes":[{"prefix":"/","cluster":"origin"},
+        \\            {"prefix":"/missing","cluster":"missing"}],
+        \\  "tls":{"cert":"cert.pem","key":"key.pem"}}]}
+    );
+    // Neither selector, or both: the same ListenerClusterOrRoutes fork the
+    // HTTP/1.1 listener answers.
+    try expectParseError(error.ListenerClusterOrRoutes, h3_test_prefix ++
+        \\[{"bind":"127.0.0.1:4443",
+        \\  "tls":{"cert":"cert.pem","key":"key.pem"}}]}
+    );
+    try expectParseError(error.ListenerClusterOrRoutes, h3_test_prefix ++
+        \\[{"bind":"127.0.0.1:4443","cluster":"origin",
+        \\  "routes":[{"prefix":"/","cluster":"origin"}],
+        \\  "tls":{"cert":"cert.pem","key":"key.pem"}}]}
+    );
+}
+
+test "config: h3 route prefixes gate against the resolved head buffer" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The default head buffer is 8 KiB, and a prefix longer than it can
+    // never match a parsed path — refused at load, the §7 rule the h3
+    // pass's move behind `resolveLimits` exists for.
+    const long_prefix = try arena.alloc(u8, constants.head_buffer_bytes_default + 1);
+    @memset(long_prefix, 'a');
+    // The prefix carries literal JSON braces, so it cannot ride inside
+    // the format string — the document body is rendered on its own and
+    // concatenated.
+    const body = try std.fmt.allocPrint(arena,
+        \\[{{
+        \\  "bind":"127.0.0.1:4443",
+        \\  "routes":[{{"prefix":"/","cluster":"origin"}},
+        \\            {{"prefix":"/{s}","cluster":"origin"}}],
+        \\  "tls":{{"cert":"cert.pem","key":"key.pem"}}}}]}}
+    , .{long_prefix});
+    const json = try std.fmt.allocPrint(arena, "{s}{s}", .{ h3_test_prefix, body });
+    try expectParseError(error.RoutePrefixNotCanonical, json);
+}
+
+test "config: h3 routes reuse the route table validation" {
+    // Two routes identical on every dimension are the same rule twice.
+    try expectParseError(error.RouteDuplicate, h3_test_prefix ++
+        \\[{"bind":"127.0.0.1:4443",
+        \\  "routes":[{"prefix":"/api","cluster":"origin"},
+        \\            {"prefix":"/api","cluster":"backup"}],
+        \\  "tls":{"cert":"cert.pem","key":"key.pem"}}]}
+    );
+    try expectParseError(error.RoutesEmpty, h3_test_prefix ++
+        \\[{"bind":"127.0.0.1:4443","routes":[],
+        \\  "tls":{"cert":"cert.pem","key":"key.pem"}}]}
+    );
+}
+
+test "config: h3 bind must be an IP literal" {
+    try expectParseError(error.H3ListenerBindInvalid, h3_test_prefix ++
+        \\[{"bind":"localhost:4443","cluster":"origin",
+        \\  "tls":{"cert":"cert.pem","key":"key.pem"}}]}
+    );
+    try expectParseError(error.H3ListenerBindInvalid, h3_test_prefix ++
+        \\[{"bind":"127.0.0.1:0","cluster":"origin",
+        \\  "tls":{"cert":"cert.pem","key":"key.pem"}}]}
+    );
+}
+
+test "config: h3 bind rejects unix sockets" {
+    try expectParseError(error.H3ListenerBindUnix, h3_test_prefix ++
+        \\[{"bind":"unix:/tmp/h3.sock","cluster":"origin",
+        \\  "tls":{"cert":"cert.pem","key":"key.pem"}}]}
+    );
+}
+
+test "config: h3 listener accepts a tls cluster and still refuses unix" {
+    // The sugar form routes the whole listener at one cluster; a
+    // TLS-dialing one is the supported upstream-TLS shape (the h3
+    // exchange terminates TLS to the origin with the same engine and
+    // trust semantics as the TCP path), and a unix endpoint stays
+    // refused — QUIC addresses have no socket path.
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    _ = try expectParseOk(&arena_state, h3_test_prefix ++
+        \\[{"bind":"127.0.0.1:4443","cluster":"secure",
+        \\  "tls":{"cert":"cert.pem","key":"key.pem"}}]}
+    );
+    try expectParseError(error.H3ListenerClusterUnixEndpoint, h3_test_prefix ++
+        \\[{"bind":"127.0.0.1:4443","cluster":"local",
+        \\  "tls":{"cert":"cert.pem","key":"key.pem"}}]}
+    );
+    try expectParseError(error.ClusterUnknown, h3_test_prefix ++
+        \\[{"bind":"127.0.0.1:4443","cluster":"missing",
+        \\  "tls":{"cert":"cert.pem","key":"key.pem"}}]}
+    );
+}
+
+test "config: h3 listener caps are bounded" {
+    try expectParseError(error.H3ListenerConnectionsOutOfRange, h3_test_prefix ++
+        \\[{"bind":"127.0.0.1:4443","cluster":"origin",
+        \\  "tls":{"cert":"cert.pem","key":"key.pem"},"max_connections":0}]}
+    );
+    // 16 MiB + 1: past the raised `h3_response_bytes_limit` ceiling, which
+    // a config may now approach (65536+1 inside it is legal since the cap
+    // stopped sizing a buffer).
+    try expectParseError(error.H3ListenerResponseBytesOutOfRange, h3_test_prefix ++
+        \\[{"bind":"127.0.0.1:4443","cluster":"origin",
+        \\  "tls":{"cert":"cert.pem","key":"key.pem"},"max_response_bytes":16777217}]}
+    );
+    // The ceiling moved with streaming: 1 MiB is a legal cap now, where
+    // the buffered slice refused anything past 64 KiB.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, h3_test_prefix ++
+            \\[{"bind":"127.0.0.1:4443","cluster":"origin",
+            \\  "tls":{"cert":"cert.pem","key":"key.pem"},"max_response_bytes":1048576}]}
+        );
+        try std.testing.expectEqual(
+            @as(u32, 1048576),
+            parsed.h3_listeners[0].max_response_bytes,
+        );
+    }
+}
+
+test "config: h3 listeners share one identity and cannot share a bind" {
+    // Different certificates: the QUIC-TLS binding has one server
+    // identity process-wide, so this is refused rather than silently
+    // served from whichever listener resolved first.
+    try expectParseError(error.H3ListenerTlsConflict, h3_test_prefix ++
+        \\[{"bind":"127.0.0.1:4443","cluster":"origin",
+        \\  "tls":{"cert":"cert.pem","key":"key.pem"}},
+        \\ {"bind":"127.0.0.1:4444","cluster":"origin",
+        \\  "tls":{"cert":"other.pem","key":"key.pem"}}]}
+    );
+    try expectParseError(error.H3ListenerBindDuplicate, h3_test_prefix ++
+        \\[{"bind":"127.0.0.1:4443","cluster":"origin",
+        \\  "tls":{"cert":"cert.pem","key":"key.pem"}},
+        \\ {"bind":"127.0.0.1:4443","cluster":"origin",
+        \\  "tls":{"cert":"cert.pem","key":"key.pem"}}]}
+    );
 }
 
 test "config: max_lifetime_ms is optional and defaults to disabled" {
@@ -5867,6 +7500,125 @@ test "config: request_ms is optional, defaults off, and shares the timeout ceili
         defer std.testing.allocator.free(json);
         try expectParseError(error.TimeoutOverLimit, json);
     }
+}
+
+test "config: h3_exchange_ms defaults to the built-in cap, 0 disables, and the ceiling binds" {
+    const head =
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+    ;
+    // Absent: the deadline shipped as a fixed ten seconds inside the h3
+    // proxy, and a config predating the knob must keep it — unlike the
+    // other optional caps, absence here is not "off".
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
+        );
+        try std.testing.expectEqual(constants.h3_exchange_ms_default, parsed.h3_exchange_ms);
+    }
+    // Explicit 0 is legal — "no deadline", not a TimeoutZero.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1,\"h3_exchange_ms\":0}}",
+        );
+        try std.testing.expectEqual(@as(u32, 0), parsed.h3_exchange_ms);
+    }
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1,\"h3_exchange_ms\":2500}}",
+        );
+        try std.testing.expectEqual(@as(u32, 2500), parsed.h3_exchange_ms);
+    }
+    // The shared ceiling still binds — a default-on cap is not an
+    // unbounded one.
+    {
+        const json = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{s}\"timeouts\":{{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1,\"h3_exchange_ms\":{d}}}}}",
+            .{ head, @as(u64, constants.timeout_ms_max) + 1 },
+        );
+        defer std.testing.allocator.free(json);
+        try expectParseError(error.TimeoutOverLimit, json);
+    }
+}
+
+test "config: h3_exchange_idle_ms defaults off and the ceiling binds" {
+    const head =
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+    ;
+    // Absent is off: the idle clock is the opt-in knob an SSE deployment
+    // names, not a default the absolute budget grew.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
+        );
+        try std.testing.expectEqual(@as(u32, 0), parsed.h3_exchange_idle_ms);
+    }
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1,\"h3_exchange_idle_ms\":20000}}",
+        );
+        try std.testing.expectEqual(@as(u32, 20000), parsed.h3_exchange_idle_ms);
+    }
+    {
+        const json = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{s}\"timeouts\":{{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1,\"h3_exchange_idle_ms\":{d}}}}}",
+            .{ head, @as(u64, constants.timeout_ms_max) + 1 },
+        );
+        defer std.testing.allocator.free(json);
+        try expectParseError(error.TimeoutOverLimit, json);
+    }
+}
+
+test "config: h3 listener error pages resolve through the L7 body pipeline" {
+    const head =
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"origin"}}],
+        \\ "clusters":{"origin":{"endpoints":["127.0.0.1:9000"]}},
+        \\ "bodies":{"oops":{"inline":"be right back","content_type":"text/plain"}},
+    ;
+    const tail =
+        \\ "tls":{"cert":"cert.pem","key":"key.pem"}}]}
+    ;
+    // Every key is independent: two name bodies, one stays on the
+    // built-in text, and the bodies resolve to the rendered page's
+    // body bytes (the seam writes its own HEADERS).
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++
+            \\ "h3_listeners":[{"bind":"127.0.0.1:4443","cluster":"origin",
+            \\   "error_pages":{"no_route":"oops","gateway_timeout":"oops"},
+        ++ tail);
+        const pages = parsed.h3_listeners[0].error_pages;
+        try std.testing.expect(pages.no_route != null);
+        try std.testing.expect(pages.gateway_timeout != null);
+        try std.testing.expect(pages.bad_gateway == null);
+        try std.testing.expect(std.mem.indexOf(u8, pages.no_route.?, "be right back") != null);
+        try std.testing.expect(std.mem.indexOf(u8, pages.no_route.?, "404") == null);
+    }
+    // A name the global bodies table does not carry is refused by the
+    // same pipeline the TCP listener's pages answer to.
+    try expectParseError(error.BodyUnknown, head ++
+        \\ "h3_listeners":[{"bind":"127.0.0.1:4443","cluster":"origin",
+        \\   "error_pages":{"no_route":"missing"},
+    ++ tail);
 }
 
 test "config: the whole timeouts block is optional, and every default is usable" {
@@ -6401,30 +8153,35 @@ test "config: sni routing needs a relay buffer that can stage a hello" {
     );
 }
 
-test "config: a relay buffer past one record is refused only with TLS on it" {
-    // `transformOut` encrypts a whole chunk into one record, so a
-    // terminating listener cannot carry a buffer wider than
-    // `tls_app_chunk_bytes` — the ceiling above it exists for the
-    // plaintext deployments that can use it (§4, §6).
-    try expectParseError(error.LimitRelayBufferOverTlsRecord,
-        \\{"listeners":[{"bind":"127.0.0.1:1",
-        \\   "tls":{"cert":"/c.pem","key":"/k.pem"},
-        \\   "http":{"cluster":"a"}}],
-        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "limits":{"relay_buffer_bytes":32768},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
-    );
-    // The same width is what the ceiling is for, with no listener
-    // terminating: this is the shape the large-body band runs.
-    var arena_state: std.heap.ArenaAllocator = undefined;
-    defer arena_state.deinit();
-    const config = try expectParseOk(&arena_state,
-        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a"}}],
-        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "limits":{"relay_buffer_bytes":32768},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
-    );
-    try std.testing.expectEqual(@as(u32, 32768), config.limits.relay_buffer_bytes);
+test "config: a relay buffer past one TLS record is legal on a terminating listener" {
+    // Every encrypting transform chunks at `tls_app_chunk_bytes`, so the
+    // 32 KiB relay ceiling belongs to TLS and plaintext alike (§4, §6).
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const terminating = try expectParseOk(&arena_state,
+            \\{"listeners":[{"bind":"127.0.0.1:1",
+            \\   "tls":{"cert":"/c.pem","key":"/k.pem"},
+            \\   "http":{"cluster":"a"}}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+            \\ "limits":{"relay_buffer_bytes":32768},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+        );
+        try std.testing.expectEqual(@as(u32, 32768), terminating.limits.relay_buffer_bytes);
+    }
+    // The same width with no listener terminating: the shape the
+    // large-body band runs.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const plain = try expectParseOk(&arena_state,
+            \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a"}}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+            \\ "limits":{"relay_buffer_bytes":32768},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+        );
+        try std.testing.expectEqual(@as(u32, 32768), plain.limits.relay_buffer_bytes);
+    }
 }
 
 test "config: explicit routes resolve, sorted longest-prefix-first" {
@@ -6434,7 +8191,7 @@ test "config: explicit routes resolve, sorted longest-prefix-first" {
         \\{"listeners":[{"bind":"127.0.0.1:1","http":{"routes":[
         \\   {"prefix":"/","cluster":"root"},
         \\   {"prefix":"/api/v2","cluster":"v2"},
-        \\   {"prefix":"/api","cluster":"api"}]}}],
+        \\   {"prefix":"/api","cluster":"api","access_log":false}]}}],
         \\ "clusters":{"root":{"endpoints":["127.0.0.1:2"]},
         \\   "api":{"endpoints":["127.0.0.1:3"]},
         \\   "v2":{"endpoints":["127.0.0.1:4"]}},
@@ -6451,6 +8208,12 @@ test "config: explicit routes resolve, sorted longest-prefix-first" {
         @as(?u16, routes[0].cluster_index),
         router.route(routes, null, "/api/v2/x", &.{}),
     );
+    // The matched rule carries the logging decision, and only `/api`
+    // opted out.
+    try std.testing.expect(router.find(routes, null, "/api/v2/x", &.{}).?.access_log);
+    try std.testing.expect(!router.find(routes, null, "/api/v1", &.{}).?.access_log);
+    try std.testing.expect(!routes[1].access_log);
+    try std.testing.expect(routes[0].access_log);
     try std.testing.expectEqual(
         @as(?u16, routes[2].cluster_index),
         router.route(routes, null, "/elsewhere", &.{}),
@@ -6568,6 +8331,121 @@ test "config: filters compile into rules with matches and actions" {
     try std.testing.expectEqual(@as(usize, 2), rule1.actions.len);
     try std.testing.expectEqualStrings("X-Via", rule1.actions[0].header_set.name);
     try std.testing.expectEqualStrings("/new", rule1.actions[1].rewrite_prefix.to);
+}
+
+test "config: a waf block compiles literal patterns and a reject status" {
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    const parsed = try expectParseOk(&arena_state,
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a",
+        \\   "waf":{"deny":["union select","<script","../"],"status":429}}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    const waf = parsed.listeners[0].waf.?;
+    try std.testing.expectEqual(@as(usize, 3), waf.patterns.len);
+    try std.testing.expectEqualStrings("union select", waf.patterns[0]);
+    try std.testing.expectEqualStrings("<script", waf.patterns[1]);
+    try std.testing.expectEqualStrings("../", waf.patterns[2]);
+    try std.testing.expectEqual(@as(u16, 429), waf.status);
+}
+
+/// A whole valid config whose one listener carries the given `waf` body,
+/// so a bound test states only the part it is about.
+fn wafJson(allocator: std.mem.Allocator, waf_body: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator,
+        \\{{"listeners":[{{"bind":"127.0.0.1:1","http":{{"cluster":"a",
+        \\ "waf":{{{s}}}}}}}],
+        \\ "clusters":{{"a":{{"endpoints":["127.0.0.1:2"]}}}},
+        \\ "timeouts":{{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}}}
+    , .{waf_body});
+}
+
+test "config: a waf deny list must be non-empty and bounded" {
+    // Empty is a typo; absence is how a listener says it has none.
+    const empty = try wafJson(std.testing.allocator, "\"deny\":[]");
+    defer std.testing.allocator.free(empty);
+    try expectParseError(error.WafDenyEmpty, empty);
+    // 65 patterns is past `filter.waf_patterns_max`.
+    var items: [320]u8 = undefined;
+    var len: usize = 0;
+    for (0..filter.waf_patterns_max + 1) |index| {
+        if (index != 0) {
+            items[len] = ',';
+            len += 1;
+        }
+        @memcpy(items[len..][0..3], "\"a\"");
+        len += 3;
+    }
+    var body: [320]u8 = undefined;
+    @memcpy(body[0..8], "\"deny\":[");
+    @memcpy(body[8 .. 8 + len], items[0..len]);
+    body[8 + len] = ']';
+    const many = try wafJson(std.testing.allocator, body[0 .. 9 + len]);
+    defer std.testing.allocator.free(many);
+    try expectParseError(error.WafDenyOverLimit, many);
+
+    // A pattern past `filter.waf_pattern_bytes_max`: 257 content bytes.
+    var quoted: [filter.waf_pattern_bytes_max + 3]u8 = undefined;
+    quoted[0] = '"';
+    @memset(quoted[1 .. quoted.len - 1], 'x');
+    quoted[quoted.len - 1] = '"';
+    var long_body: [filter.waf_pattern_bytes_max + 16]u8 = undefined;
+    @memcpy(long_body[0..8], "\"deny\":[");
+    @memcpy(long_body[8 .. 8 + quoted.len], &quoted);
+    long_body[8 + quoted.len] = ']';
+    const too_long = try wafJson(std.testing.allocator, long_body[0 .. 9 + quoted.len]);
+    defer std.testing.allocator.free(too_long);
+    try expectParseError(error.WafPatternTooLong, too_long);
+
+    // A status outside the responder's closed set.
+    const bad = try wafJson(std.testing.allocator, "\"deny\":[\"x\"],\"status\":503");
+    defer std.testing.allocator.free(bad);
+    try expectParseError(error.WafStatusInvalid, bad);
+}
+
+test "config: an l4 listener cannot carry a waf block" {
+    const tail =
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    // The key lives in the `http` body, so the strict parser refuses it
+    // in `l4` before any pattern could be validated (#305's shape rule).
+    try expectParseError(error.UnknownField, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"," ++
+        "\"waf\":{\"deny\":[\"../\"]}}}]," ++ tail);
+}
+
+test "config: query and path predicates compile against canonical views" {
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    const parsed = try expectParseOk(&arena_state,
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a","request_filters":[
+        \\   {"match":{"path_contains":"Private","query_contains":"token=bad",
+        \\             "query_prefix":"debug="},
+        \\    "actions":[{"reject":403}]}]}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    const match = parsed.listeners[0].request_filters[0].match;
+    // Values are stored verbatim; case folding happens at match time, so
+    // the loaded slice keeps the operator's spelling.
+    try std.testing.expectEqualStrings("Private", match.path_contains.?);
+    try std.testing.expectEqualStrings("token=bad", match.query_contains.?);
+    try std.testing.expectEqualStrings("debug=", match.query_prefix.?);
+}
+
+test "config: empty query and path predicates are refused at load" {
+    const tail =
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\",\"request_filters\":[";
+    try expectParseError(error.FilterQueryContainsEmpty, head ++
+        "{\"match\":{\"query_contains\":\"\"},\"actions\":[{\"reject\":403}]}]}}]," ++ tail);
+    try expectParseError(error.FilterQueryPrefixEmpty, head ++
+        "{\"match\":{\"query_prefix\":\"\"},\"actions\":[{\"reject\":403}]}]}}]," ++ tail);
+    try expectParseError(error.FilterPathContainsEmpty, head ++
+        "{\"match\":{\"path_contains\":\"\"},\"actions\":[{\"reject\":403}]}]}}]," ++ tail);
 }
 
 test "config: an allow rule compiles into the terminal that answers nothing" {
@@ -6985,6 +8863,181 @@ test "config: an http check resolves its request and expected status" {
         const http = parsed.clusters[0].check.?.http.?;
         try std.testing.expectEqual(@as(?[]const u8, null), http.host);
         try std.testing.expectEqual(@as(u16, 200), http.expect_status);
+    }
+}
+
+test "config: a cluster tls block resolves its name, roots and client identity" {
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    const parsed = try expectParseOk(&arena_state,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"plain"}}],
+        \\ "clusters":{
+        \\  "plain":{"endpoints":["127.0.0.1:2"]},
+        \\  "insecure":{"endpoints":["127.0.0.1:3"],
+        \\    "tls":{"server_name":"origin.example","verify":false}},
+        \\  "verified":{"endpoints":["127.0.0.1:4"],
+        \\    "tls":{"server_name":"origin.example","ca_file":"/etc/ssl/ca.pem"}},
+        \\  "mtls":{"endpoints":["127.0.0.1:5"],
+        \\    "tls":{"server_name":"origin.example","ca_file":"/etc/ssl/ca.pem",
+        \\      "client_cert":"/etc/ssl/client.pem",
+        \\      "client_key":"/etc/ssl/client.key"}}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    // Absent is plaintext.
+    try std.testing.expectEqual(@as(?Config.Cluster.Tls, null), parsed.clusters[0].tls);
+
+    // verify=false needs no CA: encryption without authentication, the
+    // documented danger. The name is still carried for SNI.
+    const insecure = parsed.clusters[1].tls.?;
+    try std.testing.expectEqualStrings("origin.example", insecure.server_name);
+    try std.testing.expectEqual(@as(?[]const u8, null), insecure.ca_file);
+    try std.testing.expect(!insecure.verify);
+
+    // verify defaults on, which is why the CA is required beside it.
+    const verified = parsed.clusters[2].tls.?;
+    try std.testing.expectEqualStrings("/etc/ssl/ca.pem", verified.ca_file.?);
+    try std.testing.expect(verified.verify);
+    try std.testing.expectEqual(@as(?[]const u8, null), verified.client_cert_path);
+
+    // mTLS resolves both halves of the client identity.
+    const mtls = parsed.clusters[3].tls.?;
+    try std.testing.expectEqualStrings("/etc/ssl/client.pem", mtls.client_cert_path.?);
+    try std.testing.expectEqualStrings("/etc/ssl/client.key", mtls.client_key_path.?);
+}
+
+test "config: a cluster tls block rejects shapes it cannot honor" {
+    const head =
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"tls":
+    ;
+    const tail =
+        \\}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    // An empty name cannot be SNI or a verification target.
+    try expectParseError(
+        error.ClusterTlsServerNameEmpty,
+        head ++ "{\"server_name\":\"\"}" ++ tail,
+    );
+    // verify defaults on, so a CA-less block is refused rather than
+    // silently downgraded to an unauthenticated connection.
+    try expectParseError(
+        error.ClusterTlsCaRequired,
+        head ++ "{\"server_name\":\"origin.example\"}" ++ tail,
+    );
+    // An empty path would reach openat as the working directory.
+    try expectParseError(
+        error.ClusterTlsPathEmpty,
+        head ++ "{\"server_name\":\"origin.example\",\"ca_file\":\"\"}" ++ tail,
+    );
+    // Half a client identity is a config error, not a default.
+    try expectParseError(
+        error.ClusterTlsClientCertWithoutKey,
+        head ++ "{\"server_name\":\"origin.example\",\"ca_file\":\"/ca.pem\"," ++
+            "\"client_cert\":\"/client.pem\"}" ++ tail,
+    );
+    try expectParseError(
+        error.ClusterTlsClientKeyWithoutCert,
+        head ++ "{\"server_name\":\"origin.example\",\"ca_file\":\"/ca.pem\"," ++
+            "\"client_key\":\"/client.key\"}" ++ tail,
+    );
+}
+
+test "config: upstream tls is allowed with an active check but refused on the l4 relay" {
+    // The prober completes the handshake through an `UpstreamTls` engine,
+    // so an encrypted origin behind a check is a supported shape.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state,
+            \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"origin"}}],
+            \\ "clusters":{"origin":{"endpoints":["127.0.0.1:2"],
+            \\   "check":{"type":"tcp"},
+            \\   "tls":{"server_name":"origin.example","verify":false}}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+        );
+        try std.testing.expect(parsed.clusters[0].check != null);
+        try std.testing.expect(parsed.clusters[0].tls != null);
+    }
+    // An l4 listener forwards bytes and never originates TLS, so a
+    // TLS-dialing cluster would receive the client's ciphertext as if it
+    // were application data.
+    try expectParseError(error.ClusterTlsOnL4Listener,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"origin"}}],
+        \\ "clusters":{"origin":{"endpoints":["127.0.0.1:2"],
+        \\   "tls":{"server_name":"origin.example","verify":false}}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    // The same cluster reached by an http listener is the supported shape.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state,
+            \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"origin"}}],
+            \\ "clusters":{"origin":{"endpoints":["127.0.0.1:2"],
+            \\   "tls":{"server_name":"origin.example","verify":false}}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+        );
+        try std.testing.expect(parsed.clusters[0].tls != null);
+    }
+}
+
+test "config: upstream tls widens the destinations one decrypt step can fill" {
+    // No TLS upstream: the operator's knobs are the effective widths.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state,
+            \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"origin"}}],
+            \\ "clusters":{"origin":{"endpoints":["127.0.0.1:2"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+        );
+        try std.testing.expectEqual(
+            parsed.limits.head_buffer_bytes,
+            parsed.effectiveUpstreamHeadBufferBytes(),
+        );
+        try std.testing.expectEqual(
+            parsed.limits.relay_buffer_bytes,
+            parsed.effectiveRelayBufferBytes(),
+        );
+    }
+    // A TLS upstream: one drive step can yield a whole wire record — or a
+    // full record plus a small one — so both destinations are at least
+    // that wide. This is the invariant the large-response path rests on.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state,
+            \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"origin"}}],
+            \\ "clusters":{"origin":{"endpoints":["127.0.0.1:2"],
+            \\   "tls":{"server_name":"origin.example","verify":false}}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+        );
+        try std.testing.expectEqual(
+            constants.tls_record_wire_bytes_max,
+            parsed.effectiveUpstreamHeadBufferBytes(),
+        );
+        try std.testing.expectEqual(
+            constants.tls_record_wire_bytes_max,
+            parsed.effectiveRelayBufferBytes(),
+        );
+    }
+    // An operator who already sized a head past a record keeps it: the
+    // floor widens, it never narrows what the config asked for.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state,
+            \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"origin"}}],
+            \\ "clusters":{"origin":{"endpoints":["127.0.0.1:2"],
+            \\   "tls":{"server_name":"origin.example","verify":false}}},
+            \\ "limits":{"head_buffer_bytes":65536},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+        );
+        try std.testing.expectEqual(
+            @as(u32, 65536),
+            parsed.effectiveUpstreamHeadBufferBytes(),
+        );
     }
 }
 
@@ -7533,6 +9586,10 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "ClusterPickNameInvalid", .gap = .literal_syntax },
     .{ .name = "ClusterProxyProtocolOnHttpListener", .gap = .cross_block },
     .{ .name = "ClusterProxyProtocolOnTlsListener", .gap = .cross_block },
+    .{ .name = "ClusterTlsCaRequired", .gap = .cross_block },
+    .{ .name = "ClusterTlsClientCertWithoutKey", .gap = .cross_block },
+    .{ .name = "ClusterTlsClientKeyWithoutCert", .gap = .cross_block },
+    .{ .name = "ClusterTlsOnL4Listener", .gap = .cross_block },
     .{ .name = "ClusterUnknown", .gap = .cross_reference },
     .{ .name = "EndpointInvalid", .gap = .literal_syntax },
     .{ .name = "EndpointPortZero", .gap = .literal_syntax },
@@ -7549,13 +9606,17 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "FilterHeaderNameReserved", .gap = .literal_syntax },
     .{ .name = "FilterHeaderValueInvalid", .gap = .literal_syntax },
     .{ .name = "FilterRedirectTarget", .gap = .literal_syntax },
+    .{ .name = "H3ListenerBindDuplicate", .gap = .duplicate },
+    .{ .name = "H3ListenerBindInvalid", .gap = .literal_syntax },
+    .{ .name = "H3ListenerBindUnix", .gap = .literal_syntax },
+    .{ .name = "H3ListenerClusterUnixEndpoint", .gap = .cross_block },
+    .{ .name = "H3ListenerTlsConflict", .gap = .cross_block },
     .{ .name = "LimitAccessLogBufferUnderLine", .gap = .budget },
     .{ .name = "LimitAccessLogBufferWithoutSink", .gap = .budget },
     .{ .name = "LimitConnSlotsOverCqFill", .gap = .budget },
     .{ .name = "LimitHeadBuffersOutOfRange", .gap = .budget },
     .{ .name = "LimitHeadBuffersOverConnSlots", .gap = .budget },
     .{ .name = "LimitHeadBuffersWithoutHttpListener", .gap = .budget },
-    .{ .name = "LimitRelayBufferOverTlsRecord", .gap = .budget },
     .{ .name = "LimitRelayBufferUnderSniRouting", .gap = .budget },
     .{ .name = "LimitRelayBuffersOverConnSlots", .gap = .budget },
     .{ .name = "LimitTlsEnginesOverConnSlots", .gap = .budget },
@@ -7563,6 +9624,12 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "LimitTunnelsOverConnSlots", .gap = .budget },
     .{ .name = "LimitTunnelsRequired", .gap = .budget },
     .{ .name = "LimitTunnelsWithoutUpgrades", .gap = .budget },
+    .{ .name = "LimitRateLimitEntriesRequired", .gap = .cross_block },
+    .{ .name = "LimitRateLimitEntriesWithoutRateLimit", .gap = .cross_block },
+    .{ .name = "LimitConnLimitEntriesRequired", .gap = .cross_block },
+    .{ .name = "LimitConnLimitEntriesWithoutConnLimit", .gap = .cross_block },
+    .{ .name = "ListenerConnLimitOutOfRange", .gap = .budget },
+    .{ .name = "ListenerRateLimitBurstBelowRequests", .gap = .cross_block },
     .{ .name = "LimitUpstreamHeadBuffersOutOfRange", .gap = .budget },
     .{ .name = "LimitUpstreamHeadBuffersOverUpstreamSlots", .gap = .budget },
     .{ .name = "LimitUpstreamHeadBuffersWithoutHttpListener", .gap = .budget },
@@ -7574,6 +9641,12 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "ListenerModeInvalid", .gap = .literal_syntax },
     .{ .name = "ListenerModeWithoutUnixBind", .gap = .cross_block },
     .{ .name = "ListenerTlsWithSniRoutes", .gap = .cross_block },
+    .{ .name = "ListenerTlsNoCertificates", .gap = .cross_block },
+    .{ .name = "ListenerTlsFormMixed", .gap = .cross_block },
+    .{ .name = "ListenerTlsCertPathEmpty", .gap = .cross_block },
+    .{ .name = "ListenerTlsKeyPathEmpty", .gap = .cross_block },
+    .{ .name = "ListenerTlsCertificatesOutOfRange", .gap = .budget },
+    .{ .name = "ListenerTlsNameEmpty", .gap = .literal_syntax },
     .{ .name = "ListenerUnixBindClientMatch", .gap = .cross_block },
     .{ .name = "ListenerUnixBindClusterSend", .gap = .cross_block },
     .{ .name = "ListenerUnixBindForwarded", .gap = .cross_block },
@@ -7587,15 +9660,15 @@ const schema_gaps = [_]SchemaGapEntry{
 };
 
 comptime {
-    // 81 rows against 146 error members is ~12k comparisons, well past
+    // 75 rows against 151 error members is ~11k comparisons, well past
     // the default budget and still trivial at compile time.
     @setEvalBranchQuota(200_000);
     // Every name here must be a real member, or a renamed error would
     // leave a row that excuses nothing and hides its successor.
     for (schema_gaps) |entry| {
         var found = false;
-        for (@typeInfo(ValidationError).error_set.?) |candidate| {
-            if (std.mem.eql(u8, candidate.name, entry.name)) found = true;
+        for (@typeInfo(ValidationError).error_set.error_names.?) |candidate| {
+            if (std.mem.eql(u8, candidate, entry.name)) found = true;
         }
         if (!found) @compileError("schema_gaps names no such ValidationError: " ++ entry.name);
     }
@@ -7648,8 +9721,8 @@ test "config: the schema's debt to the loader only ever falls (#305)" {
 /// parser's. `ParseError` is the union of both, and only the loader's
 /// half is a claim about config *shape*.
 fn isValidationError(expected: ParseError) bool {
-    inline for (@typeInfo(ValidationError).error_set.?) |candidate| {
-        if (expected == @field(ValidationError, candidate.name)) return true;
+    inline for (@typeInfo(ValidationError).error_set.error_names.?) |candidate| {
+        if (expected == @field(ValidationError, candidate)) return true;
     }
     return false;
 }
@@ -8102,8 +10175,8 @@ test "config: the fuzz seed carrying every block parses" {
     try std.testing.expectEqual(@as(u16, 200), rules[3].actions[0].respond.status);
     // The #125 grammar and the limit that follows it: both in the seed, so
     // the mutator has the vocabulary for either branch.
-    try std.testing.expectEqualStrings("/c.pem", parsed.listeners[1].tls.?.cert_path);
-    try std.testing.expectEqualStrings("/k.pem", parsed.listeners[1].tls.?.key_path);
+    try std.testing.expectEqualStrings("/c.pem", parsed.listeners[1].tls.?.certificates[0].cert_path);
+    try std.testing.expectEqualStrings("/k.pem", parsed.listeners[1].tls.?.certificates[0].key_path);
     try std.testing.expectEqual(@as(u32, 16), parsed.limits.tls_engines);
 }
 
@@ -8142,8 +10215,12 @@ fn fuzzParse(context: void, smith: *std.testing.Smith) !void {
             }
             if (listener.tls) |tls| {
                 tls_listeners += 1;
-                assert(tls.cert_path.len >= 1);
-                assert(tls.key_path.len >= 1);
+                assert(tls.certificates.len >= 1);
+                for (tls.certificates) |certificate| {
+                    assert(certificate.cert_path.len >= 1);
+                    assert(certificate.key_path.len >= 1);
+                    for (certificate.names) |name| assert(name.len >= 1);
+                }
             }
         }
         assert((tls_listeners >= 1) == (parsed.limits.tls_engines >= 1));
@@ -8259,8 +10336,8 @@ test "config: the access-log block resolves a sink, absent leaves it off" {
 
 test "config: a cluster name is bounded, because the access log echoes it" {
     const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"";
-    const long_name = "n" ** (constants.cluster_name_bytes_max + 1);
-    const at_limit = "n" ** constants.cluster_name_bytes_max;
+    const long_name: [constants.cluster_name_bytes_max + 1]u8 = @splat('n');
+    const at_limit: [constants.cluster_name_bytes_max]u8 = @splat('n');
 
     // At the cap it resolves; one byte over fails. Without the bound a log
     // line's width would be a function of the config file rather than of
@@ -8442,7 +10519,7 @@ test "config: a request-derived pick name is required, bounded, and a token" {
     );
     // The bound is exact: at `pick_name_bytes_max` the name loads, one
     // past it fails — the stamp's Set-Cookie scratch is sized by it.
-    const at_limit = "x" ** constants.pick_name_bytes_max;
+    const at_limit: [constants.pick_name_bytes_max]u8 = @splat('x');
     {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
@@ -8558,6 +10635,70 @@ test "config: bodies render into complete pages, both variants, HEAD as prefix" 
     }
 }
 
+test "config: every configured body carries its pre-built gzip variant" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const parsed = try parse(
+        arena_state.allocator(),
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"," ++
+            "\"request_filters\":[{\"match\":{\"path_prefix\":\"/robots.txt\"}," ++
+            "\"actions\":[{\"respond\":{\"status\":200,\"body\":\"robots\"}}]}]}}]," ++
+            "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+            "\"bodies\":{\"oops\":{\"inline\":\"gone\",\"content_type\":\"text/plain\"}," ++
+            "\"robots\":{\"inline\":\"User-agent: *\\n\",\"content_type\":\"text/plain\"}}," ++
+            "\"error_pages\":{\"404\":\"oops\"}," ++ bodies_tail,
+    );
+    // Both consumers of a body — an error page and a `respond` action —
+    // render the same two-plus-two variants, with the gzip encoding built
+    // once per body at load.
+    const page = parsed.error_pages[0];
+    const respond = parsed.listeners[0].request_filters[0].actions[0].respond;
+    for ([_]*const Config.StaticPage{ page, respond }) |candidate| {
+        for ([_]shed.PageVariant{
+            candidate.gzip_keep.?,
+            candidate.gzip_close.?,
+        }) |variant| {
+            const compressed = variant.bytes[variant.head_len..];
+            // RFC 1952's identity, and a body length that is the
+            // compressed one — the whole point of the variant.
+            try std.testing.expect(compressed.len >= 2);
+            try std.testing.expectEqual(@as(u8, 0x1f), compressed[0]);
+            try std.testing.expectEqual(@as(u8, 0x8b), compressed[1]);
+            try std.testing.expect(compressed.len != candidate.keep.len - candidate.keep_head_len);
+            var storage: parser.HeaderStorage = undefined;
+            const head = try parser.parseResponseHead(variant.bytes, false, &storage, .get);
+            try std.testing.expectEqualStrings(
+                "gzip",
+                parser.headerValue(head.headers, "content-encoding").?,
+            );
+            try std.testing.expectEqualStrings(
+                "Accept-Encoding",
+                parser.headerValue(head.headers, "vary").?,
+            );
+            try std.testing.expectEqual(
+                parser.BodyFraming{ .content_length = compressed.len },
+                head.framing,
+            );
+            const decoded = try testGunzip(compressed);
+            defer std.testing.allocator.free(decoded);
+            const plain = candidate.keep;
+            try std.testing.expectEqualStrings(
+                plain[plain.len - decoded.len ..],
+                decoded,
+            );
+        }
+    }
+}
+
+/// Decompress one gzip member at test time, through the same std
+/// implementation the loader compressed with.
+fn testGunzip(compressed: []const u8) ![]u8 {
+    var reader: std.Io.Reader = .fixed(compressed);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompress: std.compress.flate.Decompress = .init(&reader, .gzip, &window);
+    return decompress.reader.allocRemaining(std.testing.allocator, .limited(4096));
+}
+
 test "config: a body names exactly one source, and its grammar is enforced" {
     // Neither arm, and both arms: the redirect target's exactly-one rule.
     try expectParseError(
@@ -8589,7 +10730,7 @@ test "config: a body names exactly one source, and its grammar is enforced" {
     );
     try expectParseError(
         error.BodyNameTooLong,
-        bodies_head ++ "\"bodies\":{\"" ++ ("n" ** (constants.body_name_bytes_max + 1)) ++
+        bodies_head ++ "\"bodies\":{\"" ++ @as([constants.body_name_bytes_max + 1]u8, @splat('n')) ++
             "\":{\"inline\":\"a\",\"content_type\":\"t/p\"}}," ++ bodies_tail,
     );
     // `parse` without a file source refuses every file arm — the fuzzer
@@ -8725,7 +10866,7 @@ test "config: logged header names are lowercased, deduped and bounded (#140)" {
     try expectParseError(
         error.AccessLogHeaderNameTooLong,
         head ++ ",\"request_headers\":[\"" ++
-            ("x" ** (constants.access_log_header_name_bytes_max + 1)) ++ "\"]" ++ tail,
+            @as([constants.access_log_header_name_bytes_max + 1]u8, @splat('x')) ++ "\"]" ++ tail,
     );
 }
 
@@ -9065,7 +11206,7 @@ test "config: an endpoint may be a Unix socket path (#303)" {
     // a shortened path names a *different* socket, and the kernel would
     // have no way to say so.
     {
-        const too_long = "/" ++ ("p" ** constants.unix_socket_path_bytes_max);
+        const too_long = "/" ++ @as([constants.unix_socket_path_bytes_max]u8, @splat('p'));
         try expectParseError(
             error.EndpointUnixPathInvalid,
             head ++ "\"unix:" ++ too_long ++ "\"" ++ tail,
@@ -9295,6 +11436,70 @@ test "config: proxy_status is off unless asked for, and is http-only" {
     );
 }
 
+test "config: h3_advertise resolves verbatim, bounded, and is http-only" {
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"";
+    const tail = "}}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+    const value = "h3=\\\":4443\\\"; ma=3600";
+
+    // Absent advertises nothing: every config predating the feature
+    // must keep answering plain HTTP/1.1.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ tail);
+        try std.testing.expect(parsed.listeners[0].h3_advertise == null);
+    }
+    // The value resolves verbatim — the operator writes the full
+    // Alt-Svc field content, `ma=` included, and the head sends it
+    // uninterpreted.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ ",\"h3_advertise\":\"" ++ value ++ "\"" ++ tail,
+        );
+        try std.testing.expectEqualStrings(
+            "h3=\":4443\"; ma=3600",
+            parsed.listeners[0].h3_advertise.?,
+        );
+    }
+    // The bound is exact: at `alt_svc_value_bytes_max` the value loads,
+    // one past it fails, and empty is a typo that would emit a bare
+    // `Alt-Svc:` line.
+    const at_limit: [constants.alt_svc_value_bytes_max]u8 = @splat('x');
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ ",\"h3_advertise\":\"" ++ at_limit ++ "\"" ++ tail,
+        );
+        try std.testing.expectEqual(
+            @as(usize, constants.alt_svc_value_bytes_max),
+            parsed.listeners[0].h3_advertise.?.len,
+        );
+    }
+    try expectParseError(
+        error.ListenerH3AdvertiseInvalid,
+        head ++ ",\"h3_advertise\":\"" ++ at_limit ++ "x\"" ++ tail,
+    );
+    try expectParseError(
+        error.ListenerH3AdvertiseInvalid,
+        head ++ ",\"h3_advertise\":\"\"" ++ tail,
+    );
+    // An l4 relay renders no response head to carry the field, so the
+    // key does not exist there — the strict parser is the rule (#305).
+    try expectParseError(
+        error.UnknownField,
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"," ++
+            "\"h3_advertise\":\"" ++ value ++ "\"}}]," ++
+            "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+            "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
+    );
+}
+
 test "config: the forwarded block resolves a mode, and is http-only" {
     // The head opens the `http` body, so the fields each case appends
     // land inside it — which is the whole shape (#305): `forwarded` is
@@ -9323,6 +11528,20 @@ test "config: the forwarded block resolves a mode, and is http-only" {
             std.meta.stringToEnum(Config.Listener.Forwarded, mode).?,
             parsed.listeners[0].forwarded.?,
         );
+        // The companions default off beside either mode.
+        try std.testing.expect(!parsed.listeners[0].forwarded_real_ip);
+        try std.testing.expect(!parsed.listeners[0].forwarded_proto);
+    }
+    // They are independent opt-ins inside the same block.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ ",\"forwarded\":{\"mode\":\"replace\",\"real_ip\":true,\"proto\":true}" ++ tail,
+        );
+        try std.testing.expect(parsed.listeners[0].forwarded_real_ip);
+        try std.testing.expect(parsed.listeners[0].forwarded_proto);
     }
 
     // An l4 listener has no header to carry an address, so asking for one
@@ -9430,8 +11649,8 @@ test "config: the tls block resolves paths, and only shape-checks them" {
                 ",\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/k.pem\"}" ++ tail,
         );
         const tls = parsed.listeners[0].tls.?;
-        try std.testing.expectEqualStrings("/c.pem", tls.cert_path);
-        try std.testing.expectEqualStrings("/k.pem", tls.key_path);
+        try std.testing.expectEqualStrings("/c.pem", tls.certificates[0].cert_path);
+        try std.testing.expectEqualStrings("/k.pem", tls.certificates[0].key_path);
     }
     // Paths that do not exist still load: this loader does no IO (§1), and
     // `main` is where a missing file becomes an error that can name it.
@@ -9457,12 +11676,55 @@ test "config: the tls block resolves paths, and only shape-checks them" {
     // Both paths are required: a certificate with no key is not a
     // half-configured listener, it is one that cannot answer a handshake.
     try expectParseError(
-        error.MissingField,
+        error.ListenerTlsKeyPathEmpty,
         head ++ ",\"tls\":{\"cert\":\"/c.pem\"}" ++ tail,
     );
     try expectParseError(
-        error.MissingField,
+        error.ListenerTlsCertPathEmpty,
         head ++ ",\"tls\":{\"key\":\"/k.pem\"}" ++ tail,
+    );
+}
+
+test "config: the tls certificates list is an SNI set" {
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"}";
+    const tail = "}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ ",\"tls\":{\"certificates\":[" ++
+                "{\"cert\":\"/a.pem\",\"key\":\"/a.key\"," ++
+                "\"names\":[\"a.example\",\"*.a.example\"]}," ++
+                "{\"cert\":\"/b.pem\",\"key\":\"/b.key\"}]}" ++ tail,
+        );
+        const tls = parsed.listeners[0].tls.?;
+        try std.testing.expectEqual(@as(usize, 2), tls.certificates.len);
+        try std.testing.expectEqualStrings("/a.pem", tls.certificates[0].cert_path);
+        try std.testing.expectEqualStrings("/a.key", tls.certificates[0].key_path);
+        try std.testing.expectEqual(@as(usize, 2), tls.certificates[0].names.len);
+        try std.testing.expectEqualStrings("a.example", tls.certificates[0].names[0]);
+        try std.testing.expectEqualStrings("*.a.example", tls.certificates[0].names[1]);
+        try std.testing.expectEqual(@as(usize, 0), tls.certificates[1].names.len);
+    }
+
+    // One form or the other: both at once is ambiguous, and neither is
+    // a listener that cannot answer a handshake.
+    try expectParseError(
+        error.ListenerTlsFormMixed,
+        head ++ ",\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/k.pem\"," ++
+            "\"certificates\":[{\"cert\":\"/a.pem\",\"key\":\"/a.key\"}]}" ++ tail,
+    );
+    try expectParseError(
+        error.ListenerTlsNoCertificates,
+        head ++ ",\"tls\":{}" ++ tail,
+    );
+    try expectParseError(
+        error.ListenerTlsNameEmpty,
+        head ++ ",\"tls\":{\"certificates\":[{" ++
+            "\"cert\":\"/a.pem\",\"key\":\"/a.key\",\"names\":[\"\"]}]}" ++ tail,
     );
 }
 
@@ -9638,13 +11900,20 @@ test "config: a filter may not name the header zoxy manages" {
     // Case-insensitively, per RFC 9110 field-name comparison.
     try expectParseError(error.FilterHeaderNameReserved, head ++
         "{\"actions\":[{\"header_remove\":\"x-forwarded-for\"}]}" ++ tail);
+    // The nginx-compatible companions are reserved on the same grounds:
+    // a constant address and a constant scheme are each a lie for every
+    // client but one listener's.
+    inline for (.{ "X-Real-IP", "X-Forwarded-Proto" }) |name| {
+        try expectParseError(error.FilterHeaderNameReserved, head ++
+            "{\"actions\":[{\"header_set\":{\"name\":\"" ++ name ++ "\",\"value\":\"x\"}}]}" ++ tail);
+    }
     // A neighbouring name is still editable — the guard is the header, not
     // a prefix of it.
     {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state, head ++
-            "{\"actions\":[{\"header_set\":{\"name\":\"X-Forwarded-Proto\",\"value\":\"https\"}}]}" ++ tail);
+            "{\"actions\":[{\"header_set\":{\"name\":\"X-Forwarded-Host\",\"value\":\"example\"}}]}" ++ tail);
         try std.testing.expectEqual(@as(usize, 1), parsed.listeners[0].request_filters.len);
     }
 }
@@ -9778,6 +12047,215 @@ test "config: upgrades are refused on an l4 listener" {
         \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a","upgrades":{"websocket":true}}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
         \\ "limits":{"tunnels":4},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+}
+
+test "config: a listener rate limit parses, defaults burst, and needs a table" {
+    const head =
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a",
+        \\ "rate_limit":
+    ;
+    const tail =
+        \\}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
+        \\ "limits":{"rate_limit_entries":64},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ "{\"requests\":5,\"window_ms\":1000}" ++ tail,
+        );
+        const policy = parsed.listeners[0].rate_limit.?;
+        try std.testing.expectEqual(@as(u32, 5), policy.requests);
+        try std.testing.expectEqual(@as(u32, 1000), policy.window_ms);
+        // Omitted burst is one window's allowance.
+        try std.testing.expectEqual(@as(u32, 5), policy.burst);
+        try std.testing.expectEqual(@as(u32, 64), parsed.limits.rate_limit_entries);
+    }
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        // A burst above the rate is an idle client's accumulated
+        // allowance, and stays legal up to its own ceiling.
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ "{\"requests\":2,\"window_ms\":1000,\"burst\":9}" ++ tail,
+        );
+        try std.testing.expectEqual(@as(u32, 9), parsed.listeners[0].rate_limit.?.burst);
+    }
+    // requests >= 1.
+    try expectParseError(
+        error.ListenerRateLimitRequestsOutOfRange,
+        head ++ "{\"requests\":0,\"window_ms\":1000}" ++ tail,
+    );
+    // window_ms in 1..timeout_ms_max.
+    try expectParseError(
+        error.ListenerRateLimitWindowOutOfRange,
+        head ++ "{\"requests\":1,\"window_ms\":0}" ++ tail,
+    );
+    try expectParseError(
+        error.ListenerRateLimitWindowOutOfRange,
+        head ++ "{\"requests\":1,\"window_ms\":3600001}" ++ tail,
+    );
+    // burst >= requests: a smaller capacity smooths a policy the block
+    // did not state.
+    try expectParseError(
+        error.ListenerRateLimitBurstBelowRequests,
+        head ++ "{\"requests\":4,\"window_ms\":1000,\"burst\":2}" ++ tail,
+    );
+    try expectParseError(
+        error.ListenerRateLimitBurstOutOfRange,
+        head ++ "{\"requests\":1,\"window_ms\":1000,\"burst\":0}" ++ tail,
+    );
+    // The table is required exactly when a listener asks for the
+    // feature, and reserving one nobody draws on is the mirror image.
+    const no_entries_tail =
+        \\}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    try expectParseError(
+        error.LimitRateLimitEntriesRequired,
+        head ++ "{\"requests\":1,\"window_ms\":1000}" ++ no_entries_tail,
+    );
+    try expectParseError(error.LimitRateLimitEntriesOutOfRange, head ++ "{\"requests\":1,\"window_ms\":1000}" ++
+        \\}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
+        \\ "limits":{"rate_limit_entries":0},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    try expectParseError(error.LimitRateLimitEntriesWithoutRateLimit,
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
+        \\ "limits":{"rate_limit_entries":8},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    // Absent requests or window is the parser's refusal, not the
+    // loader's: both are required fields of the block's shape.
+    try expectParseError(
+        error.MissingField,
+        head ++ "{\"window_ms\":1000}" ++ tail,
+    );
+}
+
+test "config: a rate limit is refused on an l4 listener" {
+    // A byte relay has no request to count, and the `l4` body has no
+    // `rate_limit` key — the same shape as `upgrades`.
+    try expectParseError(error.UnknownField,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a",
+        \\ "rate_limit":{"requests":1,"window_ms":1000}}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
+        \\ "limits":{"rate_limit_entries":8},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+}
+
+test "config: compression is a listener switch, and min_bytes defaults" {
+    const head =
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a",
+        \\ "compress":
+    ;
+    const tail =
+        \\}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ "{}" ++ tail);
+        try std.testing.expectEqual(
+            @as(?u32, constants.compress_min_bytes_default),
+            parsed.listeners[0].compress_min_bytes,
+        );
+        try std.testing.expect(parsed.hasCompression());
+    }
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ "{\"min_bytes\":64}" ++ tail);
+        try std.testing.expectEqual(@as(?u32, 64), parsed.listeners[0].compress_min_bytes);
+    }
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        // No block: no compressor is allocated for the listener.
+        const parsed = try expectParseOk(&arena_state,
+            \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a"}}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+        );
+        try std.testing.expectEqual(@as(?u32, null), parsed.listeners[0].compress_min_bytes);
+        try std.testing.expect(!parsed.hasCompression());
+    }
+    // A byte relay has no response head to rewrite, so `compress` is not
+    // part of the `l4` shape.
+    try expectParseError(error.UnknownField,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a",
+        \\ "compress":{}}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+}
+
+test "config: a connection cap parses, needs a table, and is http-only" {
+    const head =
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a",
+        \\ "conn_limit":
+    ;
+    const tail =
+        \\}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
+        \\ "limits":{"conn_limit_entries":64},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ "{\"max\":16}" ++ tail);
+        try std.testing.expectEqual(@as(?u32, 16), parsed.listeners[0].conn_limit_max);
+        try std.testing.expectEqual(@as(u32, 64), parsed.limits.conn_limit_entries);
+        try std.testing.expect(parsed.hasConnLimit());
+    }
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        // No block: no table is reserved and the feature is off.
+        const parsed = try expectParseOk(&arena_state,
+            \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a"}}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+        );
+        try std.testing.expectEqual(@as(?u32, null), parsed.listeners[0].conn_limit_max);
+        try std.testing.expect(!parsed.hasConnLimit());
+    }
+    try expectParseError(error.ListenerConnLimitOutOfRange, head ++ "{\"max\":0}" ++ tail);
+    try expectParseError(
+        error.ListenerConnLimitOutOfRange,
+        head ++ "{\"max\":11458}" ++ tail,
+    );
+    // A cap without a table would fail open for everyone.
+    try expectParseError(error.LimitConnLimitEntriesRequired,
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a",
+        \\ "conn_limit":{"max":1}}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    try expectParseError(error.LimitConnLimitEntriesWithoutConnLimit,
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
+        \\ "limits":{"conn_limit_entries":8},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    // A byte relay has no requests to count connections by.
+    try expectParseError(error.UnknownField,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a",
+        \\ "conn_limit":{"max":1}}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
 }

@@ -9,3 +9,4 @@ result-*
 .devenv*
 devenv.local.nix
 .claude/worktrees
+__pycache__/

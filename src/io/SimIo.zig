@@ -34,6 +34,16 @@ const inbox_bytes_max: u32 = 8 * 1024;
 /// a head larger than it still arrives in pieces by default and the §7
 /// detect-and-retry re-parse keeps being exercised.
 const inbox_bytes_default: u32 = 4096;
+/// One simulated datagram's payload cap. 2 KiB covers a QUIC Initial under
+/// ordinary MTUs; a larger send is refused the way a real `sendto` would
+/// refuse an oversize datagram.
+const udp_payload_max: u16 = 2048;
+/// Datagrams one simulator instance can hold across all sockets. Queues
+/// are linked indices, not inline rings: a UDP socket costs two u16s,
+/// and the bytes live in this bounded pool.
+const udp_slots_max: u16 = 64;
+const udp_none: u16 = std.math.maxInt(u16);
+const udp_port_base: u16 = 45_000;
 comptime {
     assert(inbox_bytes_default >= 1);
     assert(inbox_bytes_default <= inbox_bytes_max);
@@ -87,7 +97,23 @@ const client_ip_bytes: [4]u8 = .{ 198, 51, 100, 1 };
 /// distinguishable in the access log by address alone.
 const client_port_base: u16 = 50_000;
 
+/// One queued datagram in the simulator's bounded pool. `next` links a
+/// receiving socket's queue; `source` is per datagram, the property that
+/// separates UDP from every TCP entry in this file.
+const Datagram = struct {
+    next: u16 = udp_none,
+    source: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) },
+    len: u16 = 0,
+    bytes: [udp_payload_max]u8 = undefined,
+};
+
 sockets: Pool(SocketEntry),
+/// The datagram pool and its per-slot free flags. Bounded and independent
+/// of the socket pool, so a UDP socket's queue costs two indices rather
+/// than an inline ring.
+udp_slots: [udp_slots_max]Datagram,
+udp_free: [udp_slots_max]bool,
+next_udp_port: u16,
 listeners: []ListenerEntry,
 listeners_count: u16,
 pending: []*Completion,
@@ -292,7 +318,9 @@ pub const OpKind = enum(u8) {
     connect,
     recv,
     recv_group,
+    udp_recv,
     send,
+    udp_send,
     close,
     log_write,
     timer,
@@ -306,7 +334,9 @@ const Op = union(OpKind) {
     connect: struct { address: Io.Address, fate: ConnectFate, canceled: bool },
     recv: struct { socket: Socket, buffer: []u8 },
     recv_group: struct { socket: Socket },
+    udp_recv: struct { socket: Socket, buffer: []u8 },
     send: struct { socket: Socket, bytes: []const u8 },
+    udp_send: struct { socket: Socket, destination: std.Io.net.IpAddress, bytes: []const u8 },
     close: struct { socket: Socket },
     log_write: struct { bytes: []const u8 },
     timer: struct { fire_at_ns: u64, canceled: bool },
@@ -321,7 +351,9 @@ const Result = union(enum) {
     connect: Io.ConnectError!Socket,
     recv: Io.RecvError!u32,
     recv_group: Io.RecvGroupError!Io.GroupRecv,
+    udp_recv: Io.RecvError!Io.UdpDatagram,
     send: Io.SendError!u32,
+    udp_send: Io.SendError!u32,
     close: void,
     log_write: Io.LogWriteError!u32,
     timer: Io.TimerError!void,
@@ -401,6 +433,13 @@ const SocketEntry = struct {
     linger_rst: bool,
     nodelay: bool,
     inbox: Ring,
+    /// True for a datagram socket. UDP entries use no peer, no FIN/reset
+    /// flags and no ring; their queue is `udp_head`/`udp_tail` into the
+    /// simulator's datagram pool.
+    udp: bool = false,
+    bound: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) },
+    udp_head: u16 = udp_none,
+    udp_tail: u16 = udp_none,
 };
 
 const ListenerEntry = struct {
@@ -492,6 +531,9 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     io.pending = try arena.alloc(*Completion, pending_ops_max);
     io.sink = try arena.alloc(u8, sink_bytes_max);
     try io.sockets.init(arena, sockets_max);
+    io.udp_slots = undefined;
+    io.udp_free = @splat(true);
+    io.next_udp_port = udp_port_base;
     io.listeners_count = 0;
     io.pending_count = 0;
     io.pending_signals = undefined;
@@ -808,6 +850,224 @@ pub fn send(
         .callback = erasedResult(Userdata, .send, callback),
     };
     io.enqueue(completion);
+}
+
+/// The simulator's datagram arm. A UDP socket is a pool entry with
+/// `udp = true` and a bound address; datagrams live in a bounded shared
+/// pool and queues are linked indices. Delivery is deterministic: a send
+/// appends to the destination's queue, and an armed recv becomes ready on
+/// the next readiness pass.
+pub const UdpSocket = Socket;
+pub const UdpCompletion = Completion;
+
+pub fn udpBind(io: *SimIo, address: *const Io.Address) Io.ListenError!UdpSocket {
+    const ip = switch (address.*) {
+        .ip => |value| value,
+        .unix => return error.Unexpected,
+    };
+    if (ip.getPort() != 0 and io.findUdp(&ip) != null) return error.AddressInUse;
+    const port = if (ip.getPort() != 0) ip.getPort() else try io.assignUdpPort();
+    const bound: std.Io.net.IpAddress = switch (ip) {
+        .ip4 => |v4| .{ .ip4 = .{ .bytes = v4.bytes, .port = port } },
+        .ip6 => |v6| .{ .ip6 = .{
+            .bytes = v6.bytes,
+            .port = port,
+            .flow = v6.flow,
+            .interface = v6.interface,
+        } },
+    };
+    const entry = io.sockets.acquire() orelse return error.Unexpected;
+    initSocketEntry(entry, inbox_bytes_default);
+    entry.udp = true;
+    entry.bound = bound;
+    entry.local_address = bound;
+    entry.peer_address = bound;
+    return io.socketHandle(entry);
+}
+
+pub fn udpAddress(io: *SimIo, socket: UdpSocket) std.Io.net.IpAddress {
+    const entry = io.socketEntry(socket);
+    assert(entry.udp);
+    return entry.bound;
+}
+
+pub fn udpRecv(
+    io: *SimIo,
+    socket: UdpSocket,
+    buffer: []u8,
+    completion: *Completion,
+    comptime Userdata: type,
+    userdata: *Userdata,
+    comptime callback: fn (*Userdata, Io.RecvError!Io.UdpDatagram) void,
+) void {
+    assert(completion.state == .dead);
+    assert(buffer.len >= 1);
+    const entry = io.socketEntry(socket);
+    assert(entry.udp);
+    completion.* = .{
+        .op = .{ .udp_recv = .{ .socket = socket, .buffer = buffer } },
+        .userdata = userdata,
+        .callback = erasedResult(Userdata, .udp_recv, callback),
+    };
+    io.enqueue(completion);
+}
+
+pub fn udpSend(
+    io: *SimIo,
+    socket: UdpSocket,
+    destination: std.Io.net.IpAddress,
+    bytes: []const u8,
+    completion: *Completion,
+    comptime Userdata: type,
+    userdata: *Userdata,
+    comptime callback: fn (*Userdata, Io.SendError!u32) void,
+) void {
+    assert(completion.state == .dead);
+    assert(bytes.len >= 1);
+    const entry = io.socketEntry(socket);
+    assert(entry.udp);
+    completion.* = .{
+        .op = .{ .udp_send = .{
+            .socket = socket,
+            .destination = destination,
+            .bytes = bytes,
+        } },
+        .userdata = userdata,
+        .callback = erasedResult(Userdata, .udp_send, callback),
+    };
+    io.enqueue(completion);
+}
+
+pub fn udpCloseNow(io: *SimIo, socket: UdpSocket) void {
+    const entry = io.socketEntry(socket);
+    assert(entry.udp);
+    io.closeEntry(socket);
+}
+
+fn assignUdpPort(io: *SimIo) Io.ListenError!u16 {
+    var attempts: u16 = 0;
+    while (attempts <= sockets_max) : (attempts += 1) {
+        const candidate = io.next_udp_port;
+        io.next_udp_port = if (candidate == std.math.maxInt(u16))
+            udp_port_base
+        else
+            candidate + 1;
+        var used = false;
+        for (io.sockets.slots) |*entry| {
+            if (!io.sockets.isAcquired(entry)) continue;
+            if (entry.udp and entry.bound.getPort() == candidate) {
+                used = true;
+                break;
+            }
+        }
+        if (!used) return candidate;
+    }
+    return error.AddressUnavailable;
+}
+
+fn findUdp(io: *SimIo, address: *const std.Io.net.IpAddress) ?*SocketEntry {
+    for (io.sockets.slots) |*entry| {
+        if (!io.sockets.isAcquired(entry)) continue;
+        if (!entry.udp) continue;
+        if (entry.bound.eql(address)) return entry;
+    }
+    return null;
+}
+
+fn enqueueDatagram(
+    io: *SimIo,
+    entry: *SocketEntry,
+    source: std.Io.net.IpAddress,
+    bytes: []const u8,
+) void {
+    var slot: u16 = udp_none;
+    var index: u16 = 0;
+    while (index < udp_slots_max) : (index += 1) {
+        if (io.udp_free[index]) {
+            slot = index;
+            break;
+        }
+    }
+    // No slot is a dropped datagram, which is what UDP does under
+    // pressure; the sender is not told.
+    if (slot == udp_none) return;
+    io.udp_free[slot] = false;
+    const datagram = &io.udp_slots[slot];
+    datagram.* = .{
+        .next = udp_none,
+        .source = source,
+        .len = @intCast(bytes.len),
+    };
+    @memcpy(datagram.bytes[0..bytes.len], bytes);
+    if (entry.udp_tail == udp_none) {
+        entry.udp_head = slot;
+    } else {
+        io.udp_slots[entry.udp_tail].next = slot;
+    }
+    entry.udp_tail = slot;
+}
+
+fn freeDatagrams(io: *SimIo, entry: *SocketEntry) void {
+    var slot = entry.udp_head;
+    var hops: u16 = 0;
+    while (slot != udp_none and hops < udp_slots_max) : (hops += 1) {
+        const datagram = &io.udp_slots[slot];
+        const next = datagram.next;
+        io.udp_free[slot] = true;
+        datagram.next = udp_none;
+        slot = next;
+    }
+    entry.udp_head = udp_none;
+    entry.udp_tail = udp_none;
+}
+
+fn finishUdpSend(
+    io: *SimIo,
+    socket: Socket,
+    destination: std.Io.net.IpAddress,
+    bytes: []const u8,
+) Io.SendError!u32 {
+    const entry = io.socketEntry(socket);
+    if (entry.kernel_pressure) {
+        entry.kernel_pressure = false;
+        io.recordPressure();
+        return error.Unexpected;
+    }
+    if (bytes.len > udp_payload_max) return error.Unexpected;
+    // A destination nobody bound is a dropped datagram, not an error:
+    // that is exactly what an ICMP-port-unreachable looks like to a UDP
+    // sender, and it keeps sendto's success contract.
+    if (io.findUdp(&destination)) |target| {
+        enqueueDatagram(io, target, entry.bound, bytes);
+    }
+    return @intCast(bytes.len);
+}
+
+fn finishUdpRecv(
+    io: *SimIo,
+    socket: Socket,
+    buffer: []u8,
+) Io.RecvError!Io.UdpDatagram {
+    const entry = io.socketEntry(socket);
+    if (entry.kernel_pressure) {
+        entry.kernel_pressure = false;
+        io.recordPressure();
+        return error.Unexpected;
+    }
+    if (entry.udp_head == udp_none) return error.Unexpected;
+    const slot = entry.udp_head;
+    const datagram = &io.udp_slots[slot];
+    entry.udp_head = datagram.next;
+    if (entry.udp_head == udp_none) entry.udp_tail = udp_none;
+    // recvfrom truncates rather than refusing a short buffer (MSG_TRUNC
+    // aside), and the returned length is what landed in the caller's
+    // buffer.
+    const len = @min(buffer.len, datagram.len);
+    @memcpy(buffer[0..len], datagram.bytes[0..len]);
+    const source = datagram.source;
+    io.udp_free[slot] = true;
+    datagram.next = udp_none;
+    return .{ .source = source, .len = @intCast(len) };
 }
 
 pub fn close(
@@ -1150,7 +1410,7 @@ pub fn dropPendingOps(io: *SimIo, kind: OpKind) u32 {
     }
     // Into the trace, so a run that dropped a different number of ops
     // cannot hash equal to one that dropped this many.
-    io.mix(@intFromEnum(kind));
+    io.mix(@backingInt(kind));
     io.mix(dropped);
     return dropped;
 }
@@ -1192,7 +1452,7 @@ pub fn droppedNextOp(io: *const SimIo) ?OpKind {
 fn kindBit(kind: OpKind) u16 {
     comptime assert(std.enums.values(OpKind).len <= @bitSizeOf(u16));
     assert(kind != .none);
-    return @as(u16, 1) << @intCast(@intFromEnum(kind));
+    return @as(u16, 1) << @intCast(@backingInt(kind));
 }
 
 /// §8's two watchdogs (#226, #311), the simulator's half. Production arms
@@ -1309,7 +1569,9 @@ pub fn pendingOpsReferenceLiveSockets(io: *const SimIo) bool {
         const socket = switch (completion.op) {
             .recv => |op| op.socket,
             .recv_group => |op| op.socket,
+            .udp_recv => |op| op.socket,
             .send => |op| op.socket,
+            .udp_send => |op| op.socket,
             .close => |op| op.socket,
             .none,
             .accept,
@@ -1559,7 +1821,7 @@ fn maybeDropOnSubmit(io: *SimIo, completion: *Completion) void {
     // match, so the rest of the teardown proceeds as the schedule wrote it.
     io.drop_next_kinds = 0;
     io.drop_next_taken = kind;
-    io.mix(@intFromEnum(kind));
+    io.mix(@backingInt(kind));
 }
 
 fn unlink(io: *SimIo, completion: *Completion) void {
@@ -1613,6 +1875,10 @@ fn opReady(io: *SimIo, completion: *Completion) bool {
             break :ready entry.kernel_pressure or entry.reset or entry.inbox.count > 0 or
                 entry.read_shutdown or entry.fin_received;
         },
+        .udp_recv => |op| ready: {
+            const entry = io.socketEntry(op.socket);
+            break :ready entry.kernel_pressure or entry.udp_head != udp_none;
+        },
         .send => |op| ready: {
             const entry = io.socketEntry(op.socket);
             if (entry.kernel_pressure or entry.reset or
@@ -1622,6 +1888,7 @@ fn opReady(io: *SimIo, completion: *Completion) bool {
             }
             break :ready io.peerEntry(entry).inbox.freeSpace() > 0;
         },
+        .udp_send => true,
         .close, .timer_cancel, .connect_cancel => true,
         // A sink that takes its time is the whole point of the staging
         // buffers (§8): while this write is out, lines pile up in the
@@ -1659,7 +1926,9 @@ fn deliverOne(io: *SimIo, completion: *Completion) void {
         },
         .recv => |op| .{ .recv = io.finishRecv(op.socket, op.buffer) },
         .recv_group => |op| .{ .recv_group = io.finishRecvGroup(op.socket) },
+        .udp_recv => |op| .{ .udp_recv = io.finishUdpRecv(op.socket, op.buffer) },
         .send => |op| .{ .send = io.finishSend(op.socket, op.bytes) },
+        .udp_send => |op| .{ .udp_send = io.finishUdpSend(op.socket, op.destination, op.bytes) },
         .log_write => |op| .{ .log_write = io.finishLogWrite(op.bytes) },
         .close => |op| close: {
             io.closeEntry(op.socket);
@@ -1906,7 +2175,7 @@ fn deliverDueSignals(io: *SimIo) void {
         if (pending_signal.at_ns <= io.now_ns_value) {
             io.pending_signals[index] = io.pending_signals[io.pending_signals_count - 1];
             io.pending_signals_count -= 1;
-            io.mix(@as(u64, @intFromEnum(pending_signal.signal)) +% 0x5349474e);
+            io.mix(@as(u64, @backingInt(pending_signal.signal)) +% 0x5349474e);
             io.signal_callback.?(io.signal_userdata, pending_signal.signal);
         } else {
             index += 1;
@@ -2060,6 +2329,10 @@ fn initSocketEntry(entry: *SocketEntry, inbox_capacity: u32) void {
     entry.kernel_pressure = false;
     entry.linger_rst = false;
     entry.nodelay = false;
+    entry.udp = false;
+    entry.bound = .{ .ip4 = .loopback(0) };
+    entry.udp_head = udp_none;
+    entry.udp_tail = udp_none;
     entry.inbox.head = 0;
     entry.inbox.count = 0;
     entry.inbox.capacity = inbox_capacity;
@@ -2072,6 +2345,7 @@ fn initSocketEntry(entry: *SocketEntry, inbox_capacity: u32) void {
 
 fn closeEntry(io: *SimIo, socket: Socket) void {
     const entry = io.socketEntry(socket);
+    if (entry.udp) freeDatagrams(io, entry);
     if (entry.peer != peer_none) {
         const peer = io.peerEntry(entry);
         // Unread inbox data or SO_LINGER-0 means the peer sees a reset,
@@ -2095,16 +2369,16 @@ fn closeEntryWithReset(io: *SimIo, socket: Socket) void {
 /// Deliveries of one op kind so far this run (§9).
 pub fn deliveredCount(io: *const SimIo, kind: OpKind) u64 {
     assert(kind != .none);
-    return io.delivered[@intFromEnum(kind)];
+    return io.delivered[@backingInt(kind)];
 }
 
 fn traceMix(io: *SimIo, completion: *const Completion, result: *const Result) void {
     // Every delivery funnels through here, which is what makes one
     // increment enough to count them all.
     assert(completion.op != .none);
-    io.delivered[@intFromEnum(completion.op)] += 1;
-    io.mix(@intFromEnum(completion.op));
-    io.mix(@intFromEnum(result.*));
+    io.delivered[@backingInt(completion.op)] += 1;
+    io.mix(@backingInt(completion.op));
+    io.mix(@backingInt(result.*));
     const detail: u64 = switch (result.*) {
         .recv => |r| if (r) |n| n else |err| 1000 + @intFromError(err),
         // Both halves matter to a trace: the same bytes landing in a
@@ -2113,7 +2387,12 @@ fn traceMix(io: *SimIo, completion: *const Completion, result: *const Result) vo
             (@as(u64, g.buffer_id) << 32) | g.len
         else |err|
             11000 + @intFromError(err),
+        .udp_recv => |r| if (r) |d|
+            (@as(u64, d.source.getPort()) << 32) | d.len
+        else |err|
+            12000 + @intFromError(err),
         .send => |r| if (r) |n| n else |err| 2000 + @intFromError(err),
+        .udp_send => |r| if (r) |n| 15000 + @as(u64, n) else |err| 16000 + @intFromError(err),
         .accept => |r| if (r) |s| @as(u32, @bitCast(s)) else |err| 3000 + @intFromError(err),
         .connect => |r| if (r) |s| @as(u32, @bitCast(s)) else |err| 4000 + @intFromError(err),
         .timer => |r| if (r) |_| 5000 else |err| 5001 + @intFromError(err),

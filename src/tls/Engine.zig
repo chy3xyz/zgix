@@ -225,9 +225,10 @@ pub const emitted_record_bytes_max: usize = @max(flight_bytes_max, app_record_by
 
 /// Ciphertext staged for the transport. Sized for the largest burst one
 /// step can produce — a ServerHello record plus the encrypted server
-/// flight — and, in steady state, one staged application record while an
-/// earlier one is still draining.
-const outbox_bytes: usize = 2 * emitted_record_bytes_max;
+/// flight — and, on a relay where both directions share this outbox, two
+/// staged application records while an earlier one is still draining,
+/// plus room for the control record a decrypt step may answer with.
+const outbox_bytes: usize = 3 * emitted_record_bytes_max;
 
 /// The floor on the caller's `plaintext` buffer.
 ///
@@ -264,9 +265,13 @@ pub const Config = struct {
     x25519_seed: [32]u8,
     /// ServerHello random (RFC 8446 §4.1.3) — same injection rule.
     random: [32]u8,
-    /// This listener's cert chain and signing key. Borrowed, not owned:
-    /// shared across the listener's engines, and must outlive them.
+    /// This listener's default cert chain and signing key. Borrowed, not
+    /// owned: shared across the listener's engines, and must outlive them.
     credentials: *const Credentials,
+    /// Optional SNI selection over the listener's credential set. When
+    /// null, `credentials` is the only certificate. The callback's
+    /// context must outlive every engine that borrows it.
+    credential_selector: ?zssl.ServerHandshake.CredentialSelector = null,
     /// The sealing keys resumption runs on, or null to offer none. Same
     /// borrowing rule as `credentials`: the server owns them for the
     /// process, an engine only reads them.
@@ -291,9 +296,15 @@ pub fn plaintextBytesFor(head_buffer_bytes: u32) u32 {
     assert(head_buffer_bytes >= constants.head_buffer_bytes_min);
     assert(head_buffer_bytes <= constants.head_buffer_bytes_max);
     // The head destination, then the body's. The first has to cover a
-    // whole L7 head as well as a decrypt; the second only ever holds
-    // body bytes, so the floor is enough for it.
-    const head = @max(head_buffer_bytes, plaintext_bytes_min);
+    // whole L7 head *plus the next decrypt step*, because the step that
+    // follows an `Incomplete` parse can carry a whole record: without the
+    // margin, a legal body landing beside a near-limit head would be
+    // reported as an overflow instead of forwarded. The second only ever
+    // holds body bytes, so the floor is enough for it.
+    const head = @max(
+        head_buffer_bytes + constants.tls_record_wire_bytes_max,
+        plaintext_bytes_min,
+    );
     const bytes = head + plaintext_bytes_min;
     assert(bytes >= 2 * plaintext_bytes_min);
     return @intCast(bytes);
@@ -338,6 +349,7 @@ pub fn init(engine: *Engine, config: *const Config) !void {
     key_share_private[0..config.x25519_seed.len].* = config.x25519_seed;
     engine.hs = .init(&.{
         .credentials = &config.credentials.inner,
+        .credential_selector = config.credential_selector,
         .server_random = config.random,
         .key_share_private = key_share_private,
         // x25519 alone, which is what this proxy has always negotiated.

@@ -13,6 +13,7 @@ const config_module = @import("config.zig");
 const constants = @import("constants.zig");
 const io_module = @import("io/io.zig");
 const Credentials = @import("tls/Credentials.zig");
+const CredentialSet = @import("tls/CredentialSet.zig");
 const router = @import("http/router.zig");
 const sni_router = @import("net/sni_router.zig");
 const Io = @import("io/io.zig");
@@ -275,7 +276,7 @@ pub const TestBed = struct {
     /// One slot, matching the one listener. Held by the bed rather than
     /// by the server because a `Credentials` owns a libcrypto key with a
     /// single `deinit`, and the server borrows what it is handed.
-    tls_credentials: [1]?Credentials,
+    tls_credentials: [1]?CredentialSet,
 
     pub const SetUpOptions = struct {
         server: ServerSim.InitOptions = .{ .conn_slots = 4, .relay_buffers = 2 },
@@ -377,19 +378,36 @@ pub const TestBed = struct {
         server_options: ServerSim.InitOptions,
     ) !void {
         bed.tls_credentials = .{null};
-        if (options.tls) {
-            assert(server_options.tls_engines >= 1);
-            bed.tls_credentials[0] = try Credentials.load(
-                arena,
-                fixture_cert_pem,
-                fixture_key_pem,
-                // Deterministic signatures, so a seeded run replays a
-                // byte-exact handshake — the §9 property the whole
-                // simulation rests on. Never set in production.
-                .{ .deterministic_nonce = true },
-            );
-            bed.server.setTlsCredentials(&bed.tls_credentials);
-        }
+        if (!options.tls) return;
+        assert(server_options.tls_engines >= 1);
+        bed.tls_credentials[0] = try loadFixtureCredentials(arena);
+        bed.server.setTlsCredentials(&bed.tls_credentials);
+    }
+
+    /// Deterministic signatures, so a seeded run replays a byte-exact
+    /// handshake — the §9 property the whole simulation rests on. Never
+    /// set in production.
+    fn loadFixtureCredentials(arena: std.mem.Allocator) !CredentialSet {
+        return CredentialSet.load(
+            arena,
+            &.{.{
+                .cert_pem = fixture_cert_pem,
+                .key_pem = fixture_key_pem,
+            }},
+            .{ .deterministic_nonce = true },
+        );
+    }
+
+    /// One number on both sides (§5): the ring the sim registers is the
+    /// limit the server accounts against — `Server.init` asserts the
+    /// match, so a bed cannot drift them apart. The unit size has to
+    /// match too, not just the count, because the health prober's buffer
+    /// follows the head size whether or not a ring was registered.
+    fn initSimIo(bed: *TestBed, arena: std.mem.Allocator, options: SetUpOptions) !void {
+        var sim_options = options.sim;
+        sim_options.buffer_group_count = options.server.head_buffers;
+        sim_options.buffer_group_bytes = options.server.head_buffer_bytes;
+        try bed.sim_io.init(arena, sim_options);
     }
 
     pub fn setUp(bed: *TestBed, gpa: std.mem.Allocator, options: SetUpOptions) !void {
@@ -397,16 +415,7 @@ pub const TestBed = struct {
         errdefer bed.arena_state.deinit();
         const arena = bed.arena_state.allocator();
 
-        // One number on both sides (§5): the ring the sim registers is
-        // the limit the server accounts against — Server.init asserts the
-        // match, so a bed cannot drift them apart.
-        var sim_options = options.sim;
-        sim_options.buffer_group_count = options.server.head_buffers;
-        // The unit size has to match too, not just the count: `Server.init`
-        // asserts both, because the health prober's buffer follows the head
-        // size whether or not a ring was registered.
-        sim_options.buffer_group_bytes = options.server.head_buffer_bytes;
-        try bed.sim_io.init(arena, sim_options);
+        try bed.initSimIo(arena, options);
         try bed.initEndpoints(arena, options.blackholed_endpoints);
         bed.clusters = .{.{
             .name = "origin",
@@ -429,7 +438,11 @@ pub const TestBed = struct {
             // states is only that the listener terminates — which is what
             // `Server.start` checks its credentials against.
             .tls = if (options.tls)
-                .{ .cert_path = "cert.pem", .key_path = "key.pem" }
+                .{ .certificates = &.{.{
+                    .cert_path = "cert.pem",
+                    .key_path = "key.pem",
+                    .names = &.{},
+                }} }
             else
                 null,
         }};
@@ -2080,7 +2093,9 @@ test "tls: an operator's head size widens the plaintext buffer, and is priced" {
     // The one runtime input to the engine's footprint. An L7 head
     // accumulates until the parser is satisfied, so a slot has to cover
     // `limits.head_buffer_bytes` when that exceeds the engine's own floor
-    // — and the banner has to charge for the same widening.
+    // — plus one decrypt step's margin, because the record that follows
+    // an `Incomplete` parse may carry a whole body beside the head. The
+    // banner charges the same widening.
     const wide_head = TlsEngine.plaintext_bytes_min * 2;
     var bed: TestBed = undefined;
     try bed.setUp(std.testing.allocator, .{
@@ -2095,17 +2110,21 @@ test "tls: an operator's head size widens the plaintext buffer, and is priced" {
     });
     defer bed.tearDown();
 
+    const head_destination = @max(
+        wide_head + constants.tls_record_wire_bytes_max,
+        TlsEngine.plaintext_bytes_min,
+    );
     const engine = &bed.server.tls_engines.slots[0];
     // The head destination follows the operator's size; the body's keeps
     // the engine's own floor, because a body never has to hold a head.
-    try std.testing.expectEqual(@as(usize, wide_head), engine.plaintext.len);
+    try std.testing.expectEqual(@as(usize, head_destination), engine.plaintext.len);
     try std.testing.expectEqual(TlsEngine.plaintext_bytes_min, engine.body_plaintext.len);
     // Distinct regions: the two legs run concurrently (§7), so a slot that
     // handed the same slice twice would let a request-body chunk clobber
     // the response head still being written out of it.
     try std.testing.expect(engine.plaintext.ptr != engine.body_plaintext.ptr);
     try std.testing.expectEqual(
-        wide_head + TlsEngine.plaintext_bytes_min,
+        head_destination + TlsEngine.plaintext_bytes_min,
         TlsEngine.plaintextBytesFor(wide_head),
     );
 }

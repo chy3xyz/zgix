@@ -285,13 +285,11 @@ const uncovered = [_]Uncovered{
     .{
         .name = "l7_body_too_large",
         .why = .unreached,
-        .reason = "only a terminated connection can overrun its head buffer " ++
-            "— one record decrypts to up to 16 KiB at once, where a plaintext " ++
-            "read cannot deliver more than the buffer holds — and the seeds " ++
-            "that do terminate send a token far under it; " ++
-            "src/http_proxy_test.zig drives it with a small head and an " ++
-            "oversize body in one record, against a listener whose head " ++
-            "limit sits below the engine's own decrypt floor",
+        .reason = "the terminated head destination is sized for the head " ++
+            "limit plus a whole decrypt step, so a legal body landing in " ++
+            "the same record as its head is forwarded rather than refused; " ++
+            "the rung stays as the ladder's answer for a source that could " ++
+            "still overrun it, and no seed reaches it",
     },
     .{
         .name = "tls_relay_failed",
@@ -309,6 +307,46 @@ const uncovered = [_]Uncovered{
         .reason = "the sim's route table is a single \"/\" prefix, which no " ++
             "path can miss; src/http_proxy_test.zig covers the path- and " ++
             "host-miss 404s",
+    },
+    .{
+        .name = "l7_rate_limited",
+        .why = .unreached,
+        .reason = "the rate limiter is opt-in per listener and no seed " ++
+            "configures a rate_limit block; src/http_proxy_test.zig drives " ++
+            "two requests from one client against burst 1 and asserts the " ++
+            "second gets 429",
+    },
+    .{
+        .name = "l7_rate_limit_full",
+        .why = .unreached,
+        .reason = "same opt-in: no seed configures a rate limit, and the " ++
+            "fail-open rung needs a table too narrow for the clients " ++
+            "arriving; src/rate_limit.zig's unit test drives a one-entry " ++
+            "table to the verdict",
+    },
+    .{
+        .name = "l7_conn_limited",
+        .why = .unreached,
+        .reason = "the connection cap is opt-in per listener and no seed " ++
+            "configures a conn_limit block; src/http_proxy_test.zig holds " ++
+            "one keep-alive connection against max 1 and asserts a second " ++
+            "client gets 503 while the first serves two requests",
+    },
+    .{
+        .name = "l7_conn_limit_full",
+        .why = .unreached,
+        .reason = "same opt-in: no seed configures a connection cap, and " ++
+            "the fail-open rung needs a table too narrow for the clients " ++
+            "arriving; src/conn_limit.zig's unit test drives a one-slot " ++
+            "table to the verdict",
+    },
+    .{
+        .name = "l7_waf_blocked",
+        .why = .unreached,
+        .reason = "no sim seed configures a listener `waf` block, and the " ++
+            "sweep's scripts carry no denylisted literal; " ++
+            "src/http_proxy_test.zig drives a query hit (403, counter, no " ++
+            "dial) and a clean forward on the same listener",
     },
     .{
         .name = "l7_shed_upstream_slots",
@@ -391,6 +429,73 @@ const uncovered = [_]Uncovered{
             "is a directed-test control; src/access_log_test.zig covers " ++
             "the keep-the-old-sink arm",
     },
+    // The experimental HTTP/3 path (`h3_listeners`, the QUIC/UDP surface).
+    // The sweep is TCP-only: no seed configures an h3 listener or moves a
+    // UDP datagram — the udp_recv/udp_send rows in `uncovered_ops` are the
+    // seam side of the same exemption — so the whole `h3_*` family sits at
+    // zero by construction here. The seam's own SimIo tests drive the
+    // witnesses (src/http/h3/proxy.zig's exchange test, listener.zig's
+    // session tests), and the live aioquic gate moves them against a real
+    // process. `.unreached` rather than `.must_stay_zero`: the day a
+    // scenario grows QUIC transport, the gate should say delete this group.
+    .{
+        .name = "h3_requests",
+        .why = .unreached,
+        .reason = "no seed hands the h3 request handler a request; " ++
+            "src/http/h3/proxy.zig's SimIo exchange test counts real ones, " ++
+            "and the live aioquic gate moves the counter against a served " ++
+            "process",
+    },
+    .{
+        .name = "h3_responses",
+        .why = .unreached,
+        .reason = "with no h3 traffic no exchange completes; " ++
+            "src/http/h3/proxy.zig's SimIo exchange test drives a completed " ++
+            "origin answer through the relay",
+    },
+    .{
+        .name = "h3_bad_gateway",
+        .why = .unreached,
+        .reason = "no seed's dial fails over h3 because no seed dials h3; " ++
+            "src/http/h3/proxy.zig drives the 502 verdict directly " ++
+            "(an origin that closes mid-exchange)",
+    },
+    .{
+        .name = "h3_gateway_timeout",
+        .why = .unreached,
+        .reason = "the sweep arms no h3 exchange deadline because it runs " ++
+            "no h3 exchange; src/http/h3/proxy.zig lets a mute origin " ++
+            "outlive one and asserts the 504 lands here",
+    },
+    .{
+        .name = "h3_shed_busy",
+        .why = .unreached,
+        .reason = "the sweep exhausts no h3 exchange pool because it " ++
+            "configures no h3 listener; src/http/h3/proxy.zig drives the " ++
+            "acquire-miss 503 directly",
+    },
+    .{
+        .name = "h3_no_route",
+        .why = .unreached,
+        .reason = "a seed would have to route an h3 request to miss — " ++
+            "the sweep runs no h3 listener at all, so no seed walks the " ++
+            "no-route path; src/http/h3/proxy.zig drives the 404 " ++
+            "witness directly",
+    },
+    .{
+        .name = "h3_connections",
+        .why = .unreached,
+        .reason = "no seed opens a QUIC session; src/http/h3/listener.zig's " ++
+            "SimIo tests open real ones end to end, and the live aioquic " ++
+            "gate opens more",
+    },
+    .{
+        .name = "h3_connections_closed",
+        .why = .unreached,
+        .reason = "same exemption as h3_connections: no session opens, so " ++
+            "none closes; src/http/h3/listener.zig's SimIo tests tear " ++
+            "sessions down on every path",
+    },
 };
 
 comptime {
@@ -437,6 +542,18 @@ const uncovered_ops = [_]struct { kind: SimIo.OpKind, reason: []const u8 }{
             "every serving path closes synchronously via closeNow — and the " ++
             "sweep configures no admin listener; src/admin_test.zig covers it, " ++
             "and the Tier-0.5 live gate delivers real ones through its scrapes",
+    },
+    .{
+        .kind = .udp_recv,
+        .reason = "the UDP arm belongs to the not-yet-served HTTP/3 path, and no " ++
+            "seed binds a datagram socket; src/io/contract_test.zig delivers a " ++
+            "datagram with its source on both backends",
+    },
+    .{
+        .kind = .udp_send,
+        .reason = "same opt-in: the HTTP/3 path is not served, so no seed sends " ++
+            "a datagram; src/io/contract_test.zig pins send/receive and the " ++
+            "per-datagram source on XevIo and SimIo",
     },
 };
 
@@ -519,11 +636,11 @@ const Census = struct {
         }
         for (std.enums.values(SimIo.OpKind)) |kind| {
             if (kind == .none) continue;
-            const before = census.ops[@intFromEnum(kind)];
-            census.ops[@intFromEnum(kind)] += harness.io.deliveredCount(kind);
+            const before = census.ops[@backingInt(kind)];
+            census.ops[@backingInt(kind)] += harness.io.deliveredCount(kind);
             // As the counter loop above: a wrap would read as an op going
             // quiet, which is the one thing this table exists to notice.
-            assert(census.ops[@intFromEnum(kind)] >= before);
+            assert(census.ops[@backingInt(kind)] >= before);
         }
     }
 
@@ -586,7 +703,7 @@ const Census = struct {
         var carried: usize = 0;
         for (std.enums.values(SimIo.OpKind)) |kind| {
             if (kind == .none) continue;
-            const delivered = census.ops[@intFromEnum(kind)];
+            const delivered = census.ops[@backingInt(kind)];
             if (delivered != 0) carried += 1;
             const reason = opReasonFor(kind);
             if (reason == null and delivered == 0) {

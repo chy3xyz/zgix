@@ -55,6 +55,11 @@ pub const DirectionState = struct {
     framed_len: u32 = 0,
     /// How many of those the target has accepted.
     credited_len: u32 = 0,
+    /// The read side ended and a TLS `close_notify` is staged for the
+    /// target: the wire still owes that control record before the write
+    /// half can shut down. Only a relay raises this, and only when the
+    /// target speaks TLS; false everywhere else.
+    closing: bool = false,
 
     pub const Phase = enum(u8) { idle, receiving, sending, finished };
 
@@ -230,6 +235,10 @@ pub const LogState = struct {
     /// fallback cannot emit a second one for an exchange that already
     /// reported its own outcome.
     emitted: bool = false,
+    /// The matched route opted out of the access log. Checked by
+    /// `logExchange` before it renders anything; counters and metrics are
+    /// untouched, so this suppresses a line, not an observation.
+    suppressed: bool = false,
     method_len: u8 = 0,
     host_len: u16 = 0,
     path_len: u16 = 0,
@@ -264,6 +273,7 @@ pub const LogState = struct {
         state.status = 0;
         state.outcome = .aborted;
         state.emitted = false;
+        state.suppressed = false;
         state.method_len = 0;
         state.host_len = 0;
         state.path_len = 0;
@@ -441,6 +451,13 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             request_leg: Leg = .idle,
             response_leg: Leg = .idle,
             request_method: parser.Method = .get,
+            /// Whether this request's `Accept-Encoding` accepts gzip,
+            /// parsed once from the head (RFC 9110 §12.5.3) and read
+            /// only by static-page selection. It lives in `l7` so the
+            /// wholesale clear at every keep-alive turnaround resets it
+            /// with the rest of the request — a stale `true` would send
+            /// a gzip body to a client that never asked.
+            request_accepts_gzip: bool = false,
             request_framing: Framing = .none,
             response_framing: Framing = .none,
             /// Bytes of `head` consumed by the request head; body excess
@@ -456,6 +473,24 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             /// (`ClientWrite`).
             rendered_request_len: u32 = 0,
             request_head_sent: u32 = 0,
+            /// Plaintext bytes of the rendered request head encrypted into
+            /// the upstream TLS outbox but not yet credited as sent. Zero
+            /// on a plaintext dial, where the socket cursor is the only
+            /// cursor; on a TLS dial the wire carries ciphertext, so
+            /// `request_head_sent` advances only once the record holding
+            /// this chunk has drained.
+            request_head_staged: u32 = 0,
+            /// The same cursor for the body excess that arrived coalesced
+            /// with the head (`request_head_len..head_len`). Its own field
+            /// because the two writers are sequential but distinct: the
+            /// head cursor is zero before this one starts, and this one is
+            /// zero before the body pump takes over.
+            request_excess_staged: u32 = 0,
+            /// Where the upstream TLS handshake is, while `.l7_dialing`
+            /// stays the umbrella connection state (so every teardown and
+            /// static-response assert that names the dial keeps holding).
+            /// `.none` is a plaintext dial or a handshake already finished.
+            upstream_tls_phase: UpstreamTlsPhase = .none,
             /// Response body bytes that arrived coalesced with the response
             /// head and did not fit in `conn.head` beside the rendered head:
             /// they follow it from `upstream.head[response_head_len_marker..]`
@@ -582,6 +617,16 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             /// the endpoint set ran out first, because that last failure
             /// is recorded and then answered rather than retried.
             retries_used: u16 = 0,
+
+            /// One data op is armed on the upstream socket in both
+            /// non-`.none` phases: a send of staged ciphertext, or a recv
+            /// into the engine's record buffer. `.none` is the plaintext
+            /// path and the moment the session comes up.
+            pub const UpstreamTlsPhase = enum(u8) {
+                none,
+                sending,
+                receiving,
+            };
 
             pub const Leg = enum(u8) {
                 idle,
