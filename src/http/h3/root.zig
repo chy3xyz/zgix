@@ -2,7 +2,7 @@
 //! primitives behind one import.
 //!
 //! **Nothing in the serving path imports this file yet.** The proxy still
-//! speaks HTTP/1.1 downstream and HTTP/1.1 upstream; zoxy has no UDP Io
+//! speaks HTTP/1.1 downstream and HTTP/1.1 upstream; zgix has no UDP Io
 //! contract, no bounded QUIC session model and no QUIC-TLS binding, so a
 //! listener cannot honestly advertise `h3`. What this seam buys is that
 //! the dependency, the Zig 0.17 fit and the API surface stay compiled and
@@ -13,7 +13,7 @@
 //! `Connection` accepts and produces raw QUIC packets without owning a
 //! socket (`queueIncomingRawPacket` / `drainOutgoingRawPackets`), exposes
 //! loss-recovery deadlines (`recoveryDeadline`) and retained plaintext for
-//! retransmission. What is missing is zoxy's side: a UDP arm in the Io
+//! retransmission. What is missing is zgix's side: a UDP arm in the Io
 //! seam, a per-connection fixed arena the session can allocate from, and
 //! an exchange model that maps QUIC streams onto §7's one-request unit of
 //! work. Those are a design milestone, not a wrapper.
@@ -86,7 +86,7 @@ test "h3 seam: QPACK round-trips the request pseudo-headers" {
         try .init(std.testing.allocator, ":method", "GET"),
         try .init(std.testing.allocator, ":scheme", "https"),
         try .init(std.testing.allocator, ":path", "/"),
-        try .init(std.testing.allocator, "user-agent", "zoxy-h3-check"),
+        try .init(std.testing.allocator, "user-agent", "zgix-h3-check"),
     };
     defer for (&fields) |*field| field.deinit();
 
@@ -102,7 +102,7 @@ test "h3 seam: QPACK round-trips the request pseudo-headers" {
     try std.testing.expectEqualStrings(":method", decoded[0].name);
     try std.testing.expectEqualStrings("GET", decoded[0].value);
     try std.testing.expectEqualStrings("user-agent", decoded[3].name);
-    try std.testing.expectEqualStrings("zoxy-h3-check", decoded[3].value);
+    try std.testing.expectEqualStrings("zgix-h3-check", decoded[3].value);
 }
 
 test "h3 seam: a connection and one stream fit a fixed arena" {

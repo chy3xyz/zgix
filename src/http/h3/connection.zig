@@ -1818,7 +1818,7 @@ const TestClient = struct {
         self.crypto = try PacketCrypto.init(allocator, &self.tls_ctx, null);
         self.tls = try qtls.Tls.initClient(
             allocator,
-            "spike.zoxy.test",
+            "spike.zgix.test",
             &[_]u8{0},
             .{ .insecure_skip_verify = true },
         );

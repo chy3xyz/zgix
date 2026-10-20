@@ -295,7 +295,7 @@ pub fn encodeField(encoder: *Encoder, target: []u8, field: Field) FieldError!u32
 /// peer-controlled input reaching a `pub fn`; guarding it with an assertion
 /// left `setCapacity`'s `catch unreachable` genuinely reachable, and under
 /// `-Dassertions=false` in ReleaseFast that is undefined behaviour — measured
-/// as an unkillable spin, which is a remote livelock on zoxy's threat model.
+/// as an unkillable spin, which is a remote livelock on zgix's threat model.
 ///
 /// Checked before anything is written, so a rejected call leaves `target`
 /// untouched — the same atomicity `encodeField` documents.

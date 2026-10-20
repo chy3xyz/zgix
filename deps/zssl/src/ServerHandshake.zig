@@ -62,7 +62,7 @@ ccs_seen: u8,
 session_echo_bytes: u8,
 session_echo: [32]u8,
 /// Whether this session came up on an accepted PSK — the fact behind
-/// zoxy's `tls_resumed` counter.
+/// zgix's `tls_resumed` counter.
 resumed: bool,
 /// The description byte of the fatal alert the peer sent, or null while
 /// it has sent none.
@@ -1838,7 +1838,7 @@ pub const alert_bytes_min: u8 = record.header_bytes + alert.bytes + 1 + cipher_s
 
 /// §4.6.1: derive the PSK a ticket nonce will stand for. Separate from
 /// sending, because a stateless embedder needs the PSK *before* the
-/// ticket that seals it exists — zoxy's `Tickets.seal` order.
+/// ticket that seals it exists — zgix's `Tickets.seal` order.
 /// §4.2.9: whether a NewSessionTicket may be sent to this peer. False
 /// only when the ClientHello advertised key exchange modes and none of
 /// them is one zssl can resume under. An embedder should ask before

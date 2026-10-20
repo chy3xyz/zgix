@@ -14,9 +14,9 @@
 
 const std = @import("std");
 
-const zoxy = @import("zoxy");
+const zgix = @import("zgix");
 
-const Io = zoxy.Io;
+const Io = zgix.Io;
 
 const assert = std.debug.assert;
 
@@ -60,7 +60,7 @@ pub fn Client(comptime IoType: type) type {
         socket: IoType.Socket = undefined,
         silent: bool = false,
         connected: bool = false,
-        /// This client's own address — the peer zoxy observes — captured
+        /// This client's own address — the peer zgix observes — captured
         /// at connect for the harness's #142 send-identity oracle.
         observed_address: ?std.Io.net.IpAddress = null,
         connect_settled: bool = false,

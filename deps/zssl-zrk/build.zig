@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) void {
 
     // libcrypto, built by Zig for the target — never found on the system.
     // Zig's C sanitizers are off for the vendored C in every mode: this is
-    // zoxy's #283 verbatim (ReleaseSafe arms `-fsanitize=function` as a
+    // zgix's #283 verbatim (ReleaseSafe arms `-fsanitize=function` as a
     // `ud1` trap, and `OPENSSL_sk_pop_free` calling its `free_func` through
     // a cast pointer SIGILLs at key load). One setting for every mode keeps
     // the shipped archive identical to the tested one.

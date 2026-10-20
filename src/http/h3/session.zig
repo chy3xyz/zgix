@@ -320,7 +320,7 @@ pub const H3Session = struct {
         try self.sender.send(self.sender.ctx, control_stream_id, control[0..writer.end], false);
 
         // RFC 9114 §6.2.3: 0x02 names a QPACK encoder stream, 0x03 a QPACK
-        // decoder stream. zoxy is the server: stream 7 carries its encoder
+        // decoder stream. zgix is the server: stream 7 carries its encoder
         // instructions for response blocks, stream 11 the Insert Count
         // Increments and Section Acknowledgments its decoder emits.
         const encoder_type = [_]u8{0x02};
@@ -1584,7 +1584,7 @@ fn requestBlock(out: []u8, allocator: std.mem.Allocator, path: []const u8) ![]co
     const fields = [_]qpack.HeaderField{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":scheme", .value = "https" },
-        .{ .name = ":authority", .value = "spike.zoxy.test" },
+        .{ .name = ":authority", .value = "spike.zgix.test" },
         .{ .name = ":path", .value = path },
     };
     const block = try qpack.encode(allocator, &fields);
@@ -2512,7 +2512,7 @@ fn dynamicRequestBlock(out: []u8, allocator: std.mem.Allocator, path: []const u8
     const fields = [_]qpack.HeaderField{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":scheme", .value = "https" },
-        .{ .name = ":authority", .value = "spike.zoxy.test" },
+        .{ .name = ":authority", .value = "spike.zgix.test" },
         .{ .name = ":path", .value = path },
     };
     const static_block = try qpack.encode(allocator, &fields);
@@ -2684,7 +2684,7 @@ fn dynamicRequestBlockTwo(out: []u8, allocator: std.mem.Allocator, path: []const
     const fields = [_]qpack.HeaderField{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":scheme", .value = "https" },
-        .{ .name = ":authority", .value = "spike.zoxy.test" },
+        .{ .name = ":authority", .value = "spike.zgix.test" },
         .{ .name = ":path", .value = path },
     };
     const static_block = try qpack.encode(allocator, &fields);
@@ -2712,7 +2712,7 @@ test "h3 session: a decodable block never parks" {
     const fields = [_]qpack.HeaderField{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":scheme", .value = "https" },
-        .{ .name = ":authority", .value = "spike.zoxy.test" },
+        .{ .name = ":authority", .value = "spike.zgix.test" },
         .{ .name = ":path", .value = "/static" },
     };
     const static_block = try qpack.encode(std.testing.allocator, &fields);

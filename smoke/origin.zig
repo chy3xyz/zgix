@@ -7,9 +7,9 @@
 //! per-change gate wants the opposite trade. nginx in the CI closure is a
 //! new dependency to fetch on every run — devenv.nix keeps that closure
 //! to zig plus kcov deliberately — and the gate's verdicts are equalities
-//! on zoxy's own output, which no property of the origin's C makes truer.
+//! on zgix's own output, which no property of the origin's C makes truer.
 //! Owning the origin also makes its *deliveries* something the gate can
-//! shape, which some of what this tier reaches (a response filling zoxy's
+//! shape, which some of what this tier reaches (a response filling zgix's
 //! head buffer, §7) is a property of.
 //!
 //! Concurrency is a fixed pool, not a task per connection: the harness's
@@ -27,7 +27,7 @@ const Io = std.Io;
 const assert = std.debug.assert;
 
 /// Connections the origin can carry at once. Every parked upstream
-/// connection holds a task blocked in `read` until zoxy closes it, so
+/// connection holds a task blocked in `read` until zgix closes it, so
 /// this is a *residency* bound, not a throughput one: it must exceed the
 /// harness's peak open-connection count, which `start` asserts.
 pub const serve_tasks: u8 = 16;
@@ -35,13 +35,13 @@ pub const serve_tasks: u8 = 16;
 /// What an ordinary request is answered with. Small on purpose: these
 /// bodies price nothing — the gate counts exchanges, it does not time
 /// them.
-pub const body = "zoxy-smoke-origin\n";
+pub const body = "zgix-smoke-origin\n";
 
 /// The one target answered differently, and the body it carries. This is
 /// the shape the simulator cannot build (§9's census exempts
 /// `l7_response_excess_sent` because no seed raises the adversary's recv
 /// cap that far): a single delivery large enough that the origin's head
-/// and the front of its body reach zoxy together and overrun the head
+/// and the front of its body reach zgix together and overrun the head
 /// buffer, so the excess has to leave in a write of its own.
 ///
 /// It has to exceed the head buffer the harness's config leaves at its
@@ -63,7 +63,7 @@ pub const request_body_bytes_max: u32 = 4 * 1024;
 /// magnitude fewer, so reaching it means the peer is looping.
 const requests_per_connection_max: u32 = 4096;
 
-/// Head bytes one request may spend. zoxy's own head buffer is the real
+/// Head bytes one request may spend. zgix's own head buffer is the real
 /// limit in front of this; a request that overruns here is a broken peer,
 /// answered by dropping the connection.
 const request_head_bytes_max: u32 = 2048;
@@ -102,7 +102,7 @@ fn renderResponse(comptime payload: []const u8) []const u8 {
 
 comptime {
     // The pool must be able to hold more than one connection or the
-    // origin serializes zoxy's data path behind its health probes.
+    // origin serializes zgix's data path behind its health probes.
     assert(serve_tasks >= 2);
     assert(requests_per_connection_max >= 1);
     assert(request_head_bytes_max >= 64);
@@ -163,7 +163,7 @@ pub const Origin = struct {
         origin.listener = try address.listen(io, .{ .mode = .stream });
         origin.port = origin.listener.socket.address.getPort();
         // A kernel-assigned port is never zero; a zero here would mean the
-        // harness went on to write ":0" into zoxy's config.
+        // harness went on to write ":0" into zgix's config.
         assert(origin.port != 0);
         var index: u8 = 0;
         while (index < serve_tasks) : (index += 1) {
@@ -246,7 +246,7 @@ fn serveTask(origin: *Origin, index: u8) void {
 }
 
 /// Answer requests on one connection until the peer stops asking. Keep-
-/// alive is the point: it is what lets zoxy park an upstream connection
+/// alive is the point: it is what lets zgix park an upstream connection
 /// and reuse it (§3, §5), which is a live shape the simulator's scripted
 /// origins do not stand in for.
 fn serveConnection(origin: *Origin, stream: Io.net.Stream, buffers: *TaskBuffers) void {
@@ -296,7 +296,7 @@ fn serveConnection(origin: *Origin, stream: Io.net.Stream, buffers: *TaskBuffers
             // One `writeAll` into a buffer that holds the whole thing, then
             // one flush: the large response has to reach the kernel as a
             // single write or the delivery it exists to provoke is split
-            // before zoxy ever sees it.
+            // before zgix ever sees it.
             writer.interface.writeAll(if (request.large) large_response else response) catch return;
         }
         writer.interface.flush() catch return;
@@ -346,7 +346,7 @@ fn readRequest(reader: *Io.Reader) ?Request {
         const line = taken orelse return null;
         assert(line.len <= request_head_bytes_max);
         // The blank line ends the head. Both spellings are accepted: what
-        // arrives here is zoxy's rendering, and the gate is not the place
+        // arrives here is zgix's rendering, and the gate is not the place
         // to re-litigate its CRLF discipline (§7 already does).
         if (line.len == 0 or (line.len == 1 and line[0] == '\r')) {
             return .{

@@ -1,4 +1,4 @@
-//! zoxy — bullet-proof L4/L7 proxy (see docs/DESIGN.md). This module root
+//! zgix — bullet-proof L4/L7 proxy (see docs/DESIGN.md). This module root
 //! re-exports the library surface and references every source file so that
 //! `zig build test` compiles and runs all tests.
 
@@ -73,7 +73,7 @@ pub const tls = struct {
         pub const key_pem = @embedFile("tls/testdata/key.pem");
         /// The certificate's SAN: a client offering any other name fails
         /// verification for a reason unrelated to what is under test.
-        pub const host_name = "spike.zoxy.test";
+        pub const host_name = "spike.zgix.test";
     };
 };
 /// Shared test-support harness pieces, factored out so multiple test

@@ -1,11 +1,11 @@
-# zssl adopts zoxy's style contract verbatim
+# zssl adopts zgix's style contract verbatim
 
-This file is a byte copy of zoxy's docs/TIGER_STYLE.md; when the two
-drift, zoxy's is the source of truth.
+This file is a byte copy of zgix's docs/TIGER_STYLE.md; when the two
+drift, zgix's is the source of truth.
 
-# zoxy style — adopted from TigerStyle
+# zgix style — adopted from TigerStyle
 
-zoxy adopts [TigerBeetle's TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md).
+zgix adopts [TigerBeetle's TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md).
 That document is the source of truth; this file records **the rules we enforce**
 and the **proxy-specific deltas**. When in doubt, read the original.
 
@@ -41,7 +41,7 @@ and the **proxy-specific deltas**. When in doubt, read the original.
   propagate on the first occurrence, because retrying it changes nothing but
   burns the CPU the rest of the process needs to recover. Never `catch continue`
   over a whole error set — name the retryable members. This is
-  [#222](https://github.com/zoxy-io/zoxy/issues/222): a `while (true) … catch
+  [#222](https://github.com/zoxy-io/zgix/issues/222): a `while (true) … catch
   continue` sized for a once-in-2^32 bad scalar met a persistently full heap and
   spun at 100% CPU forever, taking both listeners and the admin plane with it.
   The shed rung that should have handled it (`shed_tls_crypto`) was unreachable

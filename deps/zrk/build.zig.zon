@@ -41,7 +41,7 @@
             // + Zig 0.17 compatibility delta (repetition, type-info, EnumSet)
             .path = "../h2",
         },
-        // The HTTP/1.1 response parser, shared with the zoxy benchmark harness
+        // The HTTP/1.1 response parser, shared with the zgix benchmark harness
         // rather than hand-rolled a third time. zurl owns framing — chunked,
         // bodyless statuses, TE-beats-CL, conflicting Content-Length — and zrk
         // owns the request, which it builds once and replays: `writeRequest`

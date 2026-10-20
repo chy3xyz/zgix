@@ -7,12 +7,12 @@
 
 zcrypto is a dependency of the zquic snapshot under `vendor/zquic`
 (zhttp v0.22.0's copy). Its `build.zig.zon` declares an optional `zsync`
-URL dependency; zoxy builds zcrypto with `enable_async = false`, so
+URL dependency; zgix builds zcrypto with `enable_async = false`, so
 `src/async_crypto.zig` is never imported and zsync is not required.
 
-zoxy does not build zcrypto into the proxy. It is compiled only by the
+zgix does not build zcrypto into the proxy. It is compiled only by the
 experimental `zig build h3-check` step, with feature switches supplied by
-zoxy's own `build.zig` (TLS and hardware acceleration on; post-quantum,
+zgix's own `build.zig` (TLS and hardware acceleration on; post-quantum,
 VPN, blockchain, WASM, enterprise, ZKP, async, TPM, PKCS#11 and Secure
 Enclave off).
 

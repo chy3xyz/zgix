@@ -23,7 +23,7 @@
 //!
 //! **Why `hash` is stateless, and why that is not merely a simplification.**
 //! Stickiness is usually a *table*: HAProxy records client → server as
-//! connections arrive. That mechanism cannot work here. zoxy scales out as
+//! connections arrive. That mechanism cannot work here. zgix scales out as
 //! N independent processes behind SO_REUSEPORT (§3), the kernel picks the
 //! listening socket by hashing the connection's **4-tuple** — source port
 //! included — so one client's connections land on *different processes*,
@@ -1934,7 +1934,7 @@ test "balancer: a cookie tag names its endpoint through any load" {
             .name = "sticky",
             .endpoints = &endpoints,
             .pick = .hash,
-            .hash_key = .{ .cookie = "zoxy-srv" },
+            .hash_key = .{ .cookie = "zgix-srv" },
         },
     };
     const config = testConfig(&clusters);
@@ -1969,7 +1969,7 @@ test "balancer: a tag naming nothing eligible re-homes by load" {
             .name = "sticky",
             .endpoints = &endpoints,
             .pick = .hash,
-            .hash_key = .{ .cookie = "zoxy-srv" },
+            .hash_key = .{ .cookie = "zgix-srv" },
             .weights = &weights,
         },
     };

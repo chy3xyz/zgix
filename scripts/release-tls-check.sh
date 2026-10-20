@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Boot a zoxy binary with a `tls` listener and drive one request through each
+# Boot a zgix binary with a `tls` listener and drive one request through each
 # listener it declares. Run against a *built artifact*, on the platform that
 # artifact is for — release.yml calls it on every leg, before packaging.
 #
@@ -18,10 +18,10 @@
 # macOS one, and no generated material whose algorithm choice could drift away
 # from what the smoke harness exercises.
 #
-# Usage: release-tls-check.sh <zoxy-binary>
+# Usage: release-tls-check.sh <zgix-binary>
 set -eu
 
-readonly bin="${1:?usage: release-tls-check.sh <zoxy-binary>}"
+readonly bin="${1:?usage: release-tls-check.sh <zgix-binary>}"
 readonly root="$(cd "$(dirname "$0")/.." && pwd)"
 readonly cert="$root/src/tls/testdata/cert.pem"
 readonly key="$root/src/tls/testdata/key.pem"
@@ -37,7 +37,7 @@ readonly port_admin=41101
 [ -f "$cert" ] && [ -f "$key" ] || { echo "::error::missing TLS fixture under $root/src/tls/testdata"; exit 1; }
 
 work="$(mktemp -d)"
-log="$work/zoxy.log"
+log="$work/zgix.log"
 pid=""
 
 cleanup() {
@@ -53,7 +53,7 @@ trap cleanup EXIT
 # the process starts, terminates TLS and answers; whether it can reach an
 # origin is a different gate's business, and standing up one here would add a
 # dependency for no verdict.
-cat > "$work/zoxy.json" <<JSON
+cat > "$work/zgix.json" <<JSON
 {
   "listeners": [
     { "bind": "127.0.0.1:$port_http", "http": { "cluster": "origin" } },
@@ -72,7 +72,7 @@ fail() {
     exit 1
 }
 
-"$bin" "$work/zoxy.json" > "$log" 2>&1 &
+"$bin" "$work/zgix.json" > "$log" 2>&1 &
 pid=$!
 
 # Startup is where #283 lands, so a death here is reported as itself rather

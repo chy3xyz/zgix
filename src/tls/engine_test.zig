@@ -85,9 +85,9 @@ const Client = struct {
         client.hs = .init(&.{
             .client_random = @splat(0x52),
             .x25519_private = @splat(0x51),
-            .server_name = "spike.zoxy.test",
+            .server_name = "spike.zgix.test",
             // The fixture is self-signed and what these tests exercise is
-            // zoxy's engine, not this client's trust decisions.
+            // zgix's engine, not this client's trust decisions.
             .certificate_policy = .insecure_no_verification,
             .reassembly = &client.reassembly,
         });
@@ -236,10 +236,10 @@ test "engine: a handshake completes and carries application data both ways" {
         bed.to_client.app[0..bed.to_client.app_len],
     );
 
-    try bed.engine.sendApp("hello-from-zoxy");
+    try bed.engine.sendApp("hello-from-zgix");
     bed.drainOutbound();
     try bed.client.feed(bed.to_client.take(), &bed.to_server);
-    try std.testing.expectEqualStrings("hello-from-zoxy", bed.client.app[0..bed.client.app_len]);
+    try std.testing.expectEqualStrings("hello-from-zgix", bed.client.app[0..bed.client.app_len]);
 }
 
 test "engine: an orderly close is observable from both ends" {

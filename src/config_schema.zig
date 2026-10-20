@@ -50,9 +50,9 @@ pub fn writeSchema(w: *Writer) Writer.Error!void {
     try out.objectField("$schema");
     try out.write("https://json-schema.org/draft/2020-12/schema");
     try out.objectField("$id");
-    try out.write("https://zoxy.io/schema/config.schema.json");
+    try out.write("https://zgix.io/schema/config.schema.json");
     try out.objectField("title");
-    try out.write("zoxy configuration");
+    try out.write("zgix configuration");
     // The root object's own body (type/description/properties/...) is
     // appended into the still-open object begun above.
     try writeObjectBody(&out, config.ConfigJson, true);

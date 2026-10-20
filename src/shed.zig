@@ -44,7 +44,7 @@ pub const date_placeholder = "Xxx, 00 Xxx 0000 00:00:00 GMT";
 /// answered, which is the cheapest tell that a `503` is the ladder's and
 /// not the origin's (§8: they are the same three digits and opposite
 /// events).
-pub const server_line = "Server: zoxy\r\n";
+pub const server_line = "Server: zgix\r\n";
 
 comptime {
     assert(date_placeholder.len == date_bytes);
@@ -99,7 +99,7 @@ fn staticTemplate(
 /// bare token rather than a hostname: 9209 permits either, and a
 /// hostname would put deployment topology on the wire for every client
 /// — which is the same reason `next-hop` is deliberately not emitted.
-pub const proxy_status_identity = "zoxy";
+pub const proxy_status_identity = "zgix";
 
 /// What a refusal is *about*, in the terms RFC 9209 registered (#300).
 ///
@@ -136,7 +136,7 @@ pub const ProxyStatusCause = enum {
 /// left out for the opposite reason: `l7_bad_gateway` answers a refused
 /// dial, a reset mid-leg and a malformed origin head at one call site,
 /// and 9209 has a distinct token for each, so any single one would be
-/// right by accident. So a `Proxy-Status` from zoxy always carries
+/// right by accident. So a `Proxy-Status` from zgix always carries
 /// something the status line did not.
 fn causeToken(comptime cause: ProxyStatusCause) ?[]const u8 {
     return switch (cause) {
@@ -147,7 +147,7 @@ fn causeToken(comptime cause: ProxyStatusCause) ?[]const u8 {
         // client's answer rather than an internal error.
         .no_route => "destination_not_found",
         .denied => "http_request_denied",
-        // Every 503 rung is one fact to a client: zoxy is full, and the
+        // Every 503 rung is one fact to a client: zgix is full, and the
         // origin was never asked. Which pool ran out is the operator's
         // question, and the access log and the counters answer it.
         .limit => "connection_limit_reached",
@@ -717,15 +717,15 @@ test "shed: an opted-in listener names the cause it refused for" {
     // 9209 asks for: after `Server`, before the terminator.
     try std.testing.expectEqualStrings(
         "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n" ++
-            "Date: " ++ date_placeholder ++ "\r\nServer: zoxy\r\n" ++
-            "Proxy-Status: zoxy; error=connection_limit_reached\r\n" ++
+            "Date: " ++ date_placeholder ++ "\r\nServer: zgix\r\n" ++
+            "Proxy-Status: zgix; error=connection_limit_reached\r\n" ++
             "Connection: close\r\n\r\n",
         table.get(503, .limit, .close, true).bytes,
     );
     try std.testing.expectEqualStrings(
         "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n" ++
-            "Date: " ++ date_placeholder ++ "\r\nServer: zoxy\r\n" ++
-            "Proxy-Status: zoxy; error=http_response_timeout\r\n\r\n",
+            "Date: " ++ date_placeholder ++ "\r\nServer: zgix\r\n" ++
+            "Proxy-Status: zgix; error=http_response_timeout\r\n\r\n",
         table.get(504, .timeout, .keep, true).bytes,
     );
     // The whole reason the table is keyed on the rung: one status, two
@@ -733,14 +733,14 @@ test "shed: an opted-in listener names the cause it refused for" {
     // and a `404` a filter chose are indistinguishable by status.
     try std.testing.expectEqualStrings(
         "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n" ++
-            "Date: " ++ date_placeholder ++ "\r\nServer: zoxy\r\n" ++
-            "Proxy-Status: zoxy; error=destination_not_found\r\n\r\n",
+            "Date: " ++ date_placeholder ++ "\r\nServer: zgix\r\n" ++
+            "Proxy-Status: zgix; error=destination_not_found\r\n\r\n",
         table.get(404, .no_route, .keep, true).bytes,
     );
     try std.testing.expectEqualStrings(
         "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n" ++
-            "Date: " ++ date_placeholder ++ "\r\nServer: zoxy\r\n" ++
-            "Proxy-Status: zoxy; error=http_request_denied\r\n\r\n",
+            "Date: " ++ date_placeholder ++ "\r\nServer: zgix\r\n" ++
+            "Proxy-Status: zgix; error=http_request_denied\r\n\r\n",
         table.get(404, .denied, .keep, true).bytes,
     );
     // A rung with no token ignores the opt-in rather than emitting an
@@ -842,12 +842,12 @@ test "shed: static responses are exact bytes with close announced" {
     // makes the offset checkable without a clock.
     try std.testing.expectEqualStrings(
         "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n" ++
-            "Date: " ++ date_placeholder ++ "\r\nServer: zoxy\r\nConnection: close\r\n\r\n",
+            "Date: " ++ date_placeholder ++ "\r\nServer: zgix\r\nConnection: close\r\n\r\n",
         table.get(503, .none, .close, false).bytes,
     );
     try std.testing.expectEqualStrings(
         "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n" ++
-            "Date: " ++ date_placeholder ++ "\r\nServer: zoxy\r\n\r\n",
+            "Date: " ++ date_placeholder ++ "\r\nServer: zgix\r\n\r\n",
         table.get(503, .none, .keep, false).bytes,
     );
     // And a stamp lands in the response, not beside it: the slice the
@@ -855,7 +855,7 @@ test "shed: static responses are exact bytes with close announced" {
     formatHttpDate(784_111_777, table.get(503, .none, .keep, false).date);
     try std.testing.expectEqualStrings(
         "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n" ++
-            "Date: Sun, 06 Nov 1994 08:49:37 GMT\r\nServer: zoxy\r\n\r\n",
+            "Date: Sun, 06 Nov 1994 08:49:37 GMT\r\nServer: zgix\r\n\r\n",
         table.get(503, .none, .keep, false).bytes,
     );
     // Each entry owns its own slot: stamping one leaves the rest alone.
@@ -942,7 +942,7 @@ test "shed: the status set is one set, comptime and runtime" {
 }
 
 test "shed: every static response parses as a valid bodiless head" {
-    // Round-trip through zoxy's own parser: each response must be a
+    // Round-trip through zgix's own parser: each response must be a
     // complete, correctly framed head whose persistence matches the
     // requested one — the same verdict a strict client would reach.
     var table: StaticTable = undefined;

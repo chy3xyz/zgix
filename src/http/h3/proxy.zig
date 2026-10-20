@@ -68,7 +68,7 @@ const request_stream = @import("request_stream.zig");
 const session = @import("session.zig");
 const connection = @import("connection.zig");
 
-// The upstream TLS client engine and its trust store are zoxy-side files
+// The upstream TLS client engine and its trust store are zgix-side files
 // shared with the HTTP/1.1 path, reached file-relatively so the `h3-check`
 // build compiles them without the seam importing the zssl module by name
 // (the lint boundary keeps that text in src/tls/). See `Cluster.tls`.
@@ -146,7 +146,7 @@ pub const Options = struct {
     /// standalone (`zig build h3-check`), whose module cannot import the
     /// counters module's transitive dependencies (hparse, zssl). The
     /// adapter that fills this in owns the counter names, so the seam
-    /// itself carries no `zoxy_` vocabulary and stays testable with the
+    /// itself carries no `zgix_` vocabulary and stays testable with the
     /// hook null.
     counters: ?Counters = null,
 };
@@ -366,7 +366,7 @@ const ClientCredentials =
 /// closing its socket or canceling its dial without ever answering the
 /// session, which is being torn down and must not be touched. The
 /// callback shape (untyped ctx, session pointer) keeps the seam free of
-/// any zoxy import, the same constraint the `Counters` hook answers.
+/// any zgix import, the same constraint the `Counters` hook answers.
 pub const SessionTeardown = struct {
     ctx: *anyopaque,
     forget: *const fn (ctx: *anyopaque, h3: *session.H3Session) void,
@@ -6924,8 +6924,8 @@ test "h3 proxy: transient transport backpressure parks the unit and the tick dra
 const fixture_cert_pem = @embedFile("../../tls/testdata/cert.pem");
 const fixture_key_pem = @embedFile("../../tls/testdata/key.pem");
 /// The fixture identity's CN/SAN — what the cluster's `server_name` names.
-const fixture_origin_name = "spike.zoxy.test";
-/// Inside the fixture's 2026-07-25 .. 2036-07-22 validity window. The
+const fixture_origin_name = "spike.zgix.test";
+/// Inside the fixture's 2026-10-20 .. 2036-10-17 validity window. The
 /// simulated wall clock starts at 2020-01-01, so every TLS test jumps to
 /// here before dialing.
 const fixture_valid_now_unix: u64 = 1_800_000_000;

@@ -73,14 +73,14 @@ pub fn load(
     const storage = try arena.alloc(u8, zssl.Credentials.chain_bytes_max);
     var inner = zssl.Credentials.load(cert_pem, key_pem, storage, options.deterministic_nonce) catch |err| switch (err) {
         // zssl reports "no usable chain" for both an empty PEM and one
-        // with too many entries; zoxy's callers have always been told
+        // with too many entries; zgix's callers have always been told
         // which, and the first is the one an operator actually hits.
         error.BadCertificateChain => return error.NoCertificates,
         error.UnsupportedKey => return error.UnsupportedCertKey,
         else => |remaining| return remaining,
     };
     errdefer inner.deinit();
-    // ECDSA only, and this is now zoxy's rule to keep: zssl's signer
+    // ECDSA only, and this is now zgix's rule to keep: zssl's signer
     // learned RSA-PSS, so `UnsupportedKey` no longer covers an RSA leaf
     // and the module doc's promise would otherwise have left with the
     // dependency bump. The reason it is a promise is the loop — an RSA
@@ -119,6 +119,26 @@ pub fn load(
     const chain = try arena.alloc([]const u8, decoded.len);
     @memcpy(chain, decoded);
     return .{ .chain = chain, .inner = inner };
+}
+
+/// The first PEM block's `notAfter` as whole epoch seconds — the
+/// `cert_info` metric family's expiry source (§B1), read at
+/// `Labeled.init` against the startup clock. Best-effort by contract:
+/// null where the PEM will not decode or the DER will not parse, the
+/// same refusals `load` makes loudly — production has already run `load`
+/// over these bytes before the metric walk, so a null here is an
+/// embedder or test config, and the family renders no row for it rather
+/// than a fabricated expiry. `der_storage` bounds the decoded leaf; a
+/// block past it is refused, which is the refusal `load`'s chain bound
+/// makes too.
+pub fn pemLeafNotAfter(cert_pem: []const u8, der_storage: []u8) ?u64 {
+    assert(cert_pem.len >= 1);
+    assert(der_storage.len >= 1);
+    var blocks = zssl.pem.Iterator.init(cert_pem, der_storage);
+    const block = (blocks.next() catch return null) orelse return null;
+    const certificate: std.crypto.Certificate = .{ .buffer = block.der, .index = 0 };
+    const parsed = certificate.parse() catch return null;
+    return parsed.validity.not_after;
 }
 
 pub fn deinit(credentials: *Credentials) void {
@@ -165,11 +185,24 @@ test "credentials: an ECDSA P-256 PEM pair loads with the right scheme" {
     _ = try cert.parse();
 }
 
+test "credentials: the fixture leaf's notAfter parses to its epoch seconds" {
+    // The cert_info family's source (§B1): 2036-10-17T06:56:58Z, the
+    // spelling `openssl x509 -noout -enddate` reports for the fixture.
+    // Garbage refuses quietly — the metric walk renders no row for it
+    // rather than a fabricated expiry.
+    var storage: [4096]u8 = undefined;
+    try std.testing.expectEqual(
+        @as(?u64, 2107839418),
+        pemLeafNotAfter(fixture_cert_pem, &storage),
+    );
+    try std.testing.expectEqual(@as(?u64, null), pemLeafNotAfter("not a pem", &storage));
+}
+
 test "credentials: an RSA key is refused, whatever zssl can sign with it" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     // zssl's signer takes this key and offers three RSA-PSS schemes for
-    // it; the refusal is zoxy's own, and this is the gate on it. An RSA
+    // it; the refusal is zgix's own, and this is the gate on it. An RSA
     // leaf that loaded would serve — slowly, ~1-2 ms per handshake on
     // the loop — rather than fail, which is exactly the silent downgrade
     // the module doc refuses.

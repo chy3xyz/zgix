@@ -234,7 +234,7 @@ pub fn Origin(comptime IoType: type) type {
 
             /// Accumulate and judge the #142 header. Monotonic verdicts
             /// make the re-parse sound; a buffer that fills without one
-            /// is a violation too, since zoxy's own writers top out at
+            /// is a violation too, since zgix's own writers top out at
             /// 104 bytes and anything longer was never a sent header.
             fn feedProxyHeader(conn: *Conn, received: u32) void {
                 const origin = conn.origin;

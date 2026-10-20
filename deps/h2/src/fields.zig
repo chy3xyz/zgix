@@ -12,7 +12,7 @@
 //! Everything here answers a question and refuses nothing. Whether a malformed
 //! field ends a stream, gets logged, or is deliberately sent anyway is a
 //! consumer's decision, and this package has two consumers who answer
-//! differently: zoxy refuses, and zrk is a load generator that may want to send
+//! differently: zgix refuses, and zrk is a load generator that may want to send
 //! something malformed to find out what a server does with it. The check itself
 //! is RFC text and is identical for both, so this package owns the check and
 //! neither consumer owns a copy of it.

@@ -27,7 +27,7 @@ test "h3 seam: the QUIC-TLS bridge completes a handshake" {
     defer server.destroy();
     const client = try qtls.Tls.initClient(
         std.testing.allocator,
-        "spike.zoxy.test",
+        "spike.zgix.test",
         &params,
         .{ .insecure_skip_verify = true },
     );
@@ -140,7 +140,7 @@ test "h3 seam: QUIC Initial, Handshake and 1-RTT complete over raw packets" {
     const params = [_]u8{0};
     const client_tls = try qtls.Tls.initClient(
         allocator,
-        "spike.zoxy.test",
+        "spike.zgix.test",
         &params,
         .{ .insecure_skip_verify = true },
     );
@@ -265,9 +265,9 @@ fn h3RequestFrames(out: []u8, allocator: std.mem.Allocator) ![]const u8 {
     var fields = [_]H3.HeaderField{
         try .init(allocator, ":method", "GET"),
         try .init(allocator, ":scheme", "https"),
-        try .init(allocator, ":authority", "spike.zoxy.test"),
+        try .init(allocator, ":authority", "spike.zgix.test"),
         try .init(allocator, ":path", "/hello"),
-        try .init(allocator, "user-agent", "zoxy-h3-check"),
+        try .init(allocator, "user-agent", "zgix-h3-check"),
     };
     defer freeHeaderFields(&fields);
     const block = try encoder.encode(&fields, allocator);

@@ -158,7 +158,7 @@ pub const relay_buffer_bytes_max: u32 = 32 * 1024;
 /// 107. Must fit the relay buffer, where the receive phase stages the
 /// header and whatever payload arrived coalesced behind it.
 /// The §8 latency histogram's bucket ladder (#299), in nanoseconds, as
-/// `le` upper bounds. Compiled in rather than configured: every zoxy's
+/// `le` upper bounds. Compiled in rather than configured: every zgix's
 /// p99 is then directly comparable to every other's, the exposition's
 /// closed form stays a function of the cluster count alone, and a ladder
 /// is not the kind of thing a deployment should have to get right before
@@ -269,7 +269,7 @@ pub const pressure_idle_divisor: u32 = 4;
 /// complete inside the configured budget is answered 414 (request line
 /// still open) or 431 (header section); an oversize origin response head
 /// tears the exchange down (§7). The default stays 8 KiB deliberately:
-/// zoxy already accepts roughly half of HAProxy's ~15 KiB usable head,
+/// zgix already accepts roughly half of HAProxy's ~15 KiB usable head,
 /// and shrinking further would reject heads its peers accept — the knob
 /// exists to *raise* for big-cookie/JWT deployments, and to lower only
 /// for operators who know their traffic.
@@ -360,7 +360,7 @@ pub const tls_record_wire_bytes_max: u32 = tls_record_plaintext_bytes_max + 256 
 /// destination to twice a record (§4).
 pub const tls_read_chunk_bytes: u32 = tls_record_plaintext_bytes_max;
 
-/// The most plaintext zoxy hands the engine to encrypt at once. Emitting
+/// The most plaintext zgix hands the engine to encrypt at once. Emitting
 /// smaller records than a peer would accept is always legal — no
 /// negotiation, no conformance risk — and it is what keeps the engine's
 /// outbound staging a fixed size instead of a function of
@@ -634,6 +634,14 @@ pub const h3_session_slot_bytes: u32 = 388 * 1024;
 /// outgrows it fails the build rather than the banner.
 pub const h3_exchange_slot_bytes: u32 = 108 * 1024;
 
+/// The `zgix_info{version=…}` inventory row's worst-case label width, the
+/// one budget term the labeled closed forms cannot derive from the config
+/// (a version is build-pinned, not config-pinned): semver plus a
+/// pre-release spelling fits comfortably. `main` comptime-asserts the
+/// real version against it; `Labeled.init` asserts again at runtime so a
+/// library caller cannot build a row the budget never priced.
+pub const version_label_bytes_max: u32 = 32;
+
 /// Idle window an HTTP/3 listener's pooled upstream keep-alive connection
 /// is kept after its last response: the parked slot holds an fd with no
 /// armed op until the proxy's one coarse timer reaps it with a
@@ -852,7 +860,7 @@ pub const endpoint_weight_max: u16 = 256;
 /// Default cap on requests one client connection may serve (#237) —
 /// nginx's `keepalive_requests`, which also ships on. `0` is unlimited.
 ///
-/// Unlike a body cap this one zoxy *can* honestly answer, and that is
+/// Unlike a body cap this one zgix *can* honestly answer, and that is
 /// what earns it a default: it bounds this proxy's own slot occupancy
 /// rather than stating anything about an origin. `idle_ms` reaps a
 /// connection that stops speaking and `max_lifetime_ms` one that has been
@@ -873,7 +881,7 @@ pub const keepalive_requests_default: u32 = 1000;
 /// figure most application stacks are deployed assuming something in
 /// front enforces.
 ///
-/// zoxy itself is unharmed by a large body: the strict recv → send → recv
+/// zgix itself is unharmed by a large body: the strict recv → send → recv
 /// relay (§6) means per-connection memory is constant whatever the stream
 /// size, so an unbounded upload costs one relay buffer and no more. The
 /// exposure this bounds is entirely the *origin's*, which is why the
@@ -891,7 +899,7 @@ pub const request_body_bytes_default: u64 = 1 << 20;
 /// cap" for anyone who genuinely wants none.
 pub const request_body_bytes_max: u64 = 1 << 40;
 
-/// The largest proxied response body zoxy will compress at all. The
+/// The largest proxied response body zgix will compress at all. The
 /// compressor runs only when the whole body arrived with its head, so
 /// this is also the memory the shared gzip state must hold. Above it the
 /// response is forwarded untouched.
@@ -1370,6 +1378,37 @@ pub const access_log_method_bytes_max: u8 = 24;
 /// Raw bytes of one operator-named header value kept for its log line
 /// (#140). The value lives in a head buffer the render writes over (§7
 /// rotation), so it is copied out under this cap while it is still
+/// The admin scrape's access-log ring: the newest `log_ring_lines` HTTP
+/// access-log lines in fixed `log_ring_line_bytes` slots, reserved
+/// unconditionally (§8's admin-plane terms, on `h3_listener_status_bytes_max`'s
+/// precedent) and arena-allocated once. The ring is the panel "logs" view's
+/// data: readable from the admin endpoint whether or not a sink is
+/// configured, bounded so the admin response bound stays closed-form.
+pub const log_ring_lines: usize = 128;
+pub const log_ring_line_bytes: usize = 512;
+
+/// Escaped-output caps for the ring's string fields, each INCLUDING the
+/// surrounding JSON quotes. The ring is a summary view, not the archival
+/// log: a field's escaped form is truncated with a "..." marker at its cap
+/// (the writer below), which is what keeps a line inside
+/// `log_ring_line_bytes` without the 6× escape factor the sink line's
+/// bound pays — pathological all-control-char hosts and paths are the
+/// attack shape, and a capped summary of one is still a useful log line,
+/// where an unbounded one would be a 2 KiB ring slot.
+pub const log_ring_method_cap: usize = access_log_method_bytes_max + 2; // quotes
+pub const log_ring_host_cap: usize = 48 + 2;
+pub const log_ring_path_cap: usize = 80 + 2;
+pub const log_ring_cluster_cap: usize = cluster_name_bytes_max + 2;
+/// The upstream address renders as an IP literal or a `unix:` path; the
+/// cap covers either at the loader's renderable bound.
+pub const log_ring_upstream_cap: usize = "unix:".len + unix_socket_path_bytes_max + 2 + 2;
+
+/// Fixed-output widths the ring line bound composes from: the timestamp's
+/// RFC 3339 spelling at its widest, and the longest outcome tag
+/// ("upstream_failed").
+pub const log_ring_timestamp_cap: usize = 24; // 2026-10-20T04:00:00.123Z
+pub const log_ring_outcome_cap: usize = 15;
+
 /// there — `access_log_path_bytes_max`'s rule, one field over —
 /// truncated with a trailing `...` rather than dropped.
 pub const access_log_header_bytes_max: u16 = 256;

@@ -40,7 +40,7 @@ fn buildChunked(gpa: std.mem.Allocator, total_body: usize, chunk: usize) ![]u8 {
     // Exposition-shaped payload: ~100-byte metric lines, chunk framing at a
     // fixed 2 KiB cadence exactly like Go's chunked writer — the framing that
     // corrupted the benchmark's hand-rolled reader for months.
-    const line = "container_cpu_usage_seconds_total{cpu=\"total\",id=\"/system.slice/docker-abc.scope\",name=\"zoxy\"} 1.5 17\n";
+    const line = "container_cpu_usage_seconds_total{cpu=\"total\",id=\"/system.slice/docker-abc.scope\",name=\"zgix\"} 1.5 17\n";
     var body: Io.Writer.Allocating = .init(gpa);
     defer body.deinit();
     while (body.written().len < total_body) try body.writer.writeAll(line);

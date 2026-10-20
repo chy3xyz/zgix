@@ -3,7 +3,7 @@
 //! response off it, plus the raw echo the L4 path needs.
 //!
 //! Deliberately not zrk (Tier 1's generator): this tier issues a counted
-//! handful of requests and asserts an equality on what zoxy wrote about
+//! handful of requests and asserts an equality on what zgix wrote about
 //! them, so what it needs from a client is *exactness* — every response
 //! read to its last body byte before the next request goes out — rather
 //! than pacing, histograms or concurrency.
@@ -19,7 +19,7 @@ const Io = std.Io;
 
 const assert = std.debug.assert;
 
-/// Response head bytes the client will read. zoxy's own head buffer
+/// Response head bytes the client will read. zgix's own head buffer
 /// bounds what it can forward, so this only has to be no smaller.
 const response_head_bytes_max: u32 = 8192;
 
@@ -46,7 +46,7 @@ pub const Response = struct {
     status: u16,
     body_bytes: u32,
     /// Whether the head carried the #175 response-filter stamp the smoke
-    /// config sets unconditionally (`X-Zoxy-Smoke: 1`) — the live gate's
+    /// config sets unconditionally (`X-Zgix-Smoke: 1`) — the live gate's
     /// witness that the response edit path ran on this very hop.
     edited: bool,
     /// The #178 endpoint tag the head's Set-Cookie announced, or null
@@ -157,7 +157,7 @@ pub const Client = struct {
         // The client's own handshake randomness, from the OS: this is the
         // one thing in the run that must *not* be reproducible, and
         // nothing here replays, so it comes straight off `io` rather than
-        // through zoxy's seeded seam.
+        // through zgix's seeded seam.
         var entropy: [entropy_len]u8 = undefined;
         io.random(&entropy);
         client.tls = try .init(&client.reader.interface, &client.writer.interface, .{
@@ -207,7 +207,7 @@ pub const Client = struct {
 
     /// End the session the way TLS says to: a `close_notify` alert, then
     /// the socket. The alert is the point — a bare FIN is indistinguishable
-    /// from a truncation attack, so zoxy has a separate in-band path for
+    /// from a truncation attack, so zgix has a separate in-band path for
     /// this (§6's transform seam treats the alert as the EOF), and only a
     /// client that actually sends one walks it.
     pub fn endTls(client: *Client) !void {
@@ -229,7 +229,7 @@ pub const Client = struct {
     /// than a fresh guess about where the last response ended.
     ///
     /// `persistence` is explicit at every call site because it decides
-    /// more than this connection's fate: announcing close makes zoxy
+    /// more than this connection's fate: announcing close makes zgix
     /// *inject* a `Connection: close` into the response head (§7), which
     /// is the one thing that renders a head longer than the origin's —
     /// and therefore the only way a coalesced body excess can fail to fit
@@ -468,12 +468,12 @@ const Head = struct {
 /// what the binary *wrote*, so a drift must fail loudly.
 fn readHeaders(reader: *Io.Reader) !Head {
     const length_name = "content-length:";
-    const stamp = "x-zoxy-smoke: 1";
+    const stamp = "x-zgix-smoke: 1";
     // #234, spelled here for the same reason the stamp is: what this
     // gate reads is what the binary wrote, so a drift must fail rather
     // than agree with itself.
     const date_name = "date:";
-    const server_line = "server: zoxy";
+    const server_line = "server: zgix";
     var body_bytes: ?u32 = null;
     var edited = false;
     var sticky_tag: ?[16]u8 = null;
@@ -536,10 +536,10 @@ fn readHeaders(reader: *Io.Reader) !Head {
 /// not in the whole minted grammar (`name=` plus sixteen tag bytes plus
 /// the exact attributes), because a mangled stamp must fail the gate,
 /// not read as present or absent. The header name is case-insensitive;
-/// the cookie name is not (RFC 6265), and zoxy forwards what it minted.
+/// the cookie name is not (RFC 6265), and zgix forwards what it minted.
 fn stickyTagOf(line: []const u8) !?[16]u8 {
     const header_name = "set-cookie:";
-    const cookie_prefix = "zoxy-smoke-srv=";
+    const cookie_prefix = "zgix-smoke-srv=";
     const attributes = "; Path=/; HttpOnly";
     if (line.len <= header_name.len) return null;
     if (!std.ascii.startsWithIgnoreCase(line, header_name)) return null;

@@ -746,7 +746,7 @@ fn statusDigits(status: u16) [3]u8 {
 }
 
 // Tests. The load-bearing oracle is parse → render → reparse: whatever
-// zoxy accepts must render into a head zoxy itself accepts, with the
+// zgix accepts must render into a head zgix itself accepts, with the
 // routing- and framing-relevant fields intact and hop-by-hop gone.
 
 const testing = std.testing;

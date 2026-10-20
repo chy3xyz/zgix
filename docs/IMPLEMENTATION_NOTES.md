@@ -1,4 +1,4 @@
-# zoxy — implementation notes
+# zgix — implementation notes
 
 Measured findings, shelved experiments, and open technical questions,
 recorded so they are not re-chased. The settled design lives in
@@ -44,7 +44,7 @@ and ztls carries no Ed25519 CertificateVerify).
 
 The engine is [ztls](https://github.com/mattrobenolt/ztls) — a sans-I/O
 TLS 1.3 state machine in Zig over libcrypto primitives — through the
-audited `zoxy-io/ztls` fork (`zoxy-tls` branch). It settled §4's reserved
+audited `zoxy-io/ztls` fork (`zgix-tls` branch). It settled §4's reserved
 C-dependency decision: the protocol layer, where TLS CVEs live, stays
 auditable Zig; the constant-time primitives get the most-watched assembly
 available. The fork carries four commits, each re-audited in
@@ -644,7 +644,7 @@ requests" below) because they share one completion-queue budget:
 `conn_slots × 4 + upstream_slots + fixed <= 57344`. That's the right
 point on the line for an L7 deployment, but it's still a compile-time
 policy choice — an L4-only deployment wants no upstream slots at all and
-would rather spend the whole budget on conn slots, and zoxy ships
+would rather spend the whole budget on conn slots, and zgix ships
 prebuilt release binaries, so a build-time knob is invisible to anyone
 who installs rather than compiles.
 
@@ -734,7 +734,7 @@ by the fork" below). Still queued, in rough value order:
 > reasoning about *why* each item was needed is what justified writing
 > zssl in the first place.
 
-Same pin policy, same batching. Landed in `zoxy-tls`: deterministic
+Same pin policy, same batching. Landed in `zgix-tls`: deterministic
 ECDSA nonces, `mem_hooks`, the bounded `fin_frag` wipe, NewSessionTicket
 issuance (see "TLS termination" above, and build.zig.zon's audit notes).
 Queued:
@@ -745,7 +745,7 @@ Queued:
    the content up to the last non-zero byte, so a non-conforming peer can
    hand a caller up to 16623 bytes where the spec allows 16384 — 239 past
    any buffer sized to the RFC. The length check exists on the *send*
-   path only (`RecordLayer.encrypt`). zoxy refuses the over-long record in
+   path only (`RecordLayer.encrypt`). zgix refuses the over-long record in
    `Engine.pump` and its buffers are sized on that refusal, so nothing is
    exposed here; but a caller who trusted `max_plaintext_len` without
    checking would overflow, and `record_overflow` is the alert §5.2
@@ -761,13 +761,13 @@ Queued:
   with CPU headroom, not compute-bound. The ~45% off-CPU residue at the
   ceiling is unexplained; `perf sched` is the follow-up.
 - 98.6% of cycles sit inside the one `io_uring_enter` (io_send ~79% —
-  the loopback sender pays the receiver's TCP stack too). zoxy user
+  the loopback sender pays the receiver's TCP stack too). zgix user
   code is **1.26% of cycles**: do not optimize the Zig side.
 - Syscall shape: ~3.2 syscalls/request at 20 k req/s, batching to ~122
   ring ops per enter at the ceiling.
 - Box tax ~12–15% of the profile: nft+conntrack ~6%, systemd BPF
   firewall ~5.6%, kernel alloc-tagging ~2.4%. An nft loopback bypass
-  would clean the bench bands — environmental work, not zoxy work.
+  would clean the bench bands — environmental work, not zgix work.
 
 All three candidates this profile ranked have since been measured (ring
 flags: landed; multishot recv: parked 2026-07-12 and **closed**
@@ -779,7 +779,7 @@ large bodies — see "Open questions" above).
 ## Ring setup flags — landed 2026-07-12 (196ffbf)
 
 `SINGLE_ISSUER | COOP_TASKRUN | DEFER_TASKRUN`, exposed through the
-fork's `Options.io_uring_flags` (branch `zoxy-ring-flags`, c369817).
+fork's `Options.io_uring_flags` (branch `zgix-ring-flags`, c369817).
 Measured: interrupt-driven task_work eliminated (`tctx_task_work` 10.8%
 → 0, re-batched as `__io_run_local_work` in the wait path), steady loop
 CPU −3.4%, p90 improved within overlapping bands, saturation unchanged.
@@ -841,7 +841,7 @@ the log off — the default — to **two** `CLOCK_REALTIME` reads per
 request. Its own comment priced this as "one `CLOCK_REALTIME` read per
 request … against the ~25 us of loop time a request already costs". Two
 corrections: it was two reads, and the denominator is wrong — the
-relevant base is zoxy's *own* userspace work (~3300 cycles/request), not
+relevant base is zgix's *own* userspace work (~3300 cycles/request), not
 the wall latency, which is mostly kernel and network. Against that, ~100
 cycles is ~3%, not ~0.1%.
 
@@ -895,13 +895,13 @@ profiler's headline symbol is not re-chased.
 
 Half of that revisit condition has since been tested and the other half
 found unreachable on this box — see "The loopback harness cannot
-saturate zoxy" below. Under large batches the symbol gets *cheaper*, so
+saturate zgix" below. Under large batches the symbol gets *cheaper*, so
 nothing here reopens.
 
-## The loopback harness cannot saturate zoxy (2026-08-01)
+## The loopback harness cannot saturate zgix (2026-08-01)
 
 A rate sweep looking for misspent cycles found the knee, then found the
-knee is not zoxy's. L7, 64 connections, `--threads 6`, 10 s rows:
+knee is not zgix's. L7, 64 connections, `--threads 6`, 10 s rows:
 
 | offered | delivered | p50 | p99 | cqes/wake |
 |---|---|---|---|---|
@@ -913,10 +913,10 @@ knee is not zoxy's. L7, 64 connections, `--threads 6`, 10 s rows:
 Delivered flattens at ~210–215 k however hard it is pushed. What is
 saturated at that point is **not the proxy**. Two `/proc` measurements,
 each on its own 250 k-offered 20 s run (so they are two runs, not one
-row): zoxy's dedicated core runs **57.2% busy — 51.9 points kernel, 5.2
+row): zgix's dedicated core runs **57.2% busy — 51.9 points kernel, 5.2
 points user**, while the whole box runs 82.7% of 8 cores = 6.62 cores
 active, leaving ~6.05 cores on the other seven for nginx and zrk, i.e.
-**86%**. The origin and the load generator run out of machine while zoxy
+**86%**. The origin and the load generator run out of machine while zgix
 still has 43% of its core idle.
 
 So #40's "genuine CPU saturation" is unreachable here, and no rate on
@@ -954,7 +954,7 @@ Three caveats, each of which changes what the table above means.
 - **`zig build profile` samples `cpu_core/cycles/u` — userspace only.**
   Every percentage it prints is a share of ~5% of one core, not of the
   machine. "http parser 35.7%" is ~1.9% of a core; the kernel outweighs
-  all of zoxy's userspace work about 10:1 and the profiler cannot see
+  all of zgix's userspace work about 10:1 and the profiler cannot see
   it. This is the easiest number in the repo to misread, and it was
   misread once before believing the `/proc` measurement above.
 - Ops/req measured 4.00 flat at every rate, matching the 4.0 already
@@ -968,7 +968,7 @@ That gap is now closed — see the next section.
 it, so the same constant decided two things: how many round trips a body
 costs, and the plaintext size of every TLS record a terminating listener
 emits. RFC 8446 §5.1 caps a record at 2^14, and haproxy's `tune.bufsize`
-defaults to exactly that — so zoxy was emitting quarter-size records
+defaults to exactly that — so zgix was emitting quarter-size records
 against a peer emitting full ones, while already *decrypting* full ones
 (`tls_read_chunk_bytes` was 16 KiB all along). The asymmetry was the tell.
 
@@ -977,17 +977,17 @@ Tier-1 bands, four runs alternating in one session, p50 µs, large body =
 
 | | 4 KiB [A, B] | 16 KiB [A, B] |
 |---|---|---|
-| zoxy L4 | [1081, 1105] | [722, 573] |
-| zoxy L7 | [1069, 1050] | [601, 600] |
-| **zoxy L7 TLS** | **[1248, 1199]** | **[745, 858]** |
+| zgix L4 | [1081, 1105] | [722, 573] |
+| zgix L7 | [1069, 1050] | [601, 600] |
+| **zgix L7 TLS** | **[1248, 1199]** | **[745, 858]** |
 | haproxy https (control) | [788, 777] | [722, 782] |
 
-Non-overlapping on every zoxy row: L7 TLS −35%, L7 −43%, L4 −35..−48%.
+Non-overlapping on every zgix row: L7 TLS −35%, L7 −43%, L4 −35..−48%.
 The control holds at [722, 788] across all four, which is what rules out
-session drift — haproxy did not move while zoxy halved. Against haproxy,
-zoxy L7 TLS goes from 58% worse to roughly parity.
+session drift — haproxy did not move while zgix halved. Against haproxy,
+zgix L7 TLS goes from 58% worse to roughly parity.
 
-**Keep-alive shows nothing, and the first reading of it was wrong.** zoxy
+**Keep-alive shows nothing, and the first reading of it was wrong.** zgix
 L7 TLS [68, 92] at 4 KiB against [62, 66] at 16 KiB, inside the control's
 own [55, 68] spread. A single-pair reading had this as a −33% win; the 92
 was one noisy run. Recorded because the mistake is the reusable part: one
@@ -1020,7 +1020,7 @@ TLS is refused above `tls_app_chunk_bytes` at load
 `tls_record_plaintext_bytes_max` now, not to `relay_buffer_bytes_max`, so
 the engine outbox no longer moves when the relay ceiling does — the two
 numbers are deliberately different. The default stays 16 KiB, so every
-measurement above still describes what a stock zoxy does. See
+measurement above still describes what a stock zgix does. See
 "The 100k band is round-trip bound, not CPU bound" below for why the
 ceiling moved.
 
@@ -1045,36 +1045,36 @@ is why it went unmeasured for so long.
 
 The cross-proxy nightly (zoxy-io/benchmark, run `20260918-014014`, four
 1-CPU proxies pinned to core 0 against a four-node nginx origin, open-loop
-ramp to 100k) put zoxy last on the 100 KiB body band. It is the only band
+ramp to 100k) put zgix last on the 100 KiB body band. It is the only band
 it loses, and the CPU column says why it is not a throughput problem.
 
-| band | body | zoxy | nginx | zoxy CPU at knee | zoxy rps/core |
+| band | body | zgix | nginx | zgix CPU at knee | zgix rps/core |
 |---|---|---|---|---|---|
 | c1k-64 | 64 B | **62,772** | 28,440 | 0.97 | 64,927 |
 | c1k | 1 KiB | **61,301** | 26,488 | 0.97 | 62,896 |
 | c1k-100k | 100 KiB | 4,228 | 5,838 | **0.47** | 9,066 |
 
-zoxy is 2.2-2.3x nginx where a body is one relay chunk, with the core
+zgix is 2.2-2.3x nginx where a body is one relay chunk, with the core
 saturated. At 100 KiB it stops at **0.466 of one core** — 0.875 at its
 worst overload, never near the wall — while nginx, pingora and haproxy
-all reach 0.94-1.00. Everyone else converts CPU into throughput; zoxy
+all reach 0.94-1.00. Everyone else converts CPU into throughput; zgix
 runs out of something else first.
 
-That something is not shedding. Of zoxy's errors, **5,586 were timeouts
+That something is not shedding. Of zgix's errors, **5,586 were timeouts
 and 85 were connect** — it refuses almost nothing, it gets slow, and the
 generator's 1 s timeout turns the latency into lost throughput. nginx
 recorded zero errors of any kind. Latency past the knee is where the two
 part company:
 
-| offered | zoxy p50 | nginx p50 |
+| offered | zgix p50 | nginx p50 |
 |---|---|---|
 | 4,026 | 2.0 ms | 3.7 ms |
 | 4,358 | 2.5 ms | 6.9 ms |
 | 5,024 | **379 ms** | 112 ms |
 | 5,356 | **868 ms** | 92 ms |
 
-Below the knee zoxy is *faster* (p99 32 ms against nginx's 378 ms at
-4,026). Past it zoxy goes superlinear and nginx does not.
+Below the knee zgix is *faster* (p99 32 ms against nginx's 378 ms at
+4,026). Past it zgix goes superlinear and nginx does not.
 
 **The mechanism, and why the buffer is the lever.** 100 KiB is the first
 body that does not fit one relay buffer: 7 chunks at the 16 KiB default,
@@ -1083,7 +1083,7 @@ serialized (§6; `pump.zig` arms the next recv only once the send drains).
 That is ~14 event-loop turns per response. nginx runs `proxy_buffering
 off` in this harness, so it has no read-ahead either — but epoll over
 non-blocking sockets lets it drain a whole body inside *one* handler with
-back-to-back syscalls, ~1-2 turns. As loop depth grows, zoxy multiplies
+back-to-back syscalls, ~1-2 turns. As loop depth grows, zgix multiplies
 the queueing delay ~14x and nginx ~2x. It predicts exactly the shape
 above: parity or better at one chunk, divergence at seven.
 
@@ -1096,7 +1096,7 @@ record size" above.
 
 **Unverified.** No run has yet measured 32 KiB on this band; the
 prediction is that throughput scales with the turn reduction, and the
-honest test is one ramp. Two caveats travel with the table. zoxy's
+honest test is one ramp. Two caveats travel with the table. zgix's
 *peak* window hit 5,452 rps / 559 MB/s against nginx's 656 MB/s, so raw
 capability is ~15% apart rather than 38% — the rest is the keepup metric
 (achieved ≥ 90% of offered) punishing a post-knee collapse. And the
@@ -1104,7 +1104,7 @@ proxy VM's NIC carries proxied traffic twice, so at these rates the rig
 itself may be in play; `cloud/variables.tf` warns that standard-v3
 scales NIC bandwidth with vCPUs.
 
-**The 10 KiB control is missing and matters most.** zoxy has no c1k-10k
+**The 10 KiB control is missing and matters most.** zgix has no c1k-10k
 row in this run at all — it failed to start (`error: AddressInUse`, the
 EADDRINUSE class that harness has hit before). 10 KiB is the last body
 that fits one 16 KiB buffer, so it is precisely the point that separates
@@ -1116,7 +1116,7 @@ Re-take it before trusting any of this.
 The gap above, measured. `bench/profile.zig` grew a `--kernel` flag that
 drops the `u` modifier from the cycles event, and the box granted
 `perf_event_paranoid=0`, `kptr_restrict=0` and `yama.ptrace_scope=0`.
-L7, 100 k req/s offered, 64 connections, 20 s, zoxy alone on a P-core.
+L7, 100 k req/s offered, 64 connections, 20 s, zgix alone on a P-core.
 **73 K samples, 0 lost.**
 
     kernel  89.3%
@@ -1138,7 +1138,7 @@ Grouped, and the groups are what matter rather than any single symbol:
 | io_uring (`io_submit_sqes` and friends) | 7.0% |
 | spinlocks (`_raw_spin_lock_irqsave`/`_bh`) | 5.4% |
 | copy paths (`_copy_to_iter`, `__skb_datagram_iter`) | 4.4% |
-| all of zoxy's own code | 10.5% |
+| all of zgix's own code | 10.5% |
 
 Top single symbol is `nft_do_chain` at 3.23%, then
 `_raw_spin_lock_irqsave` 2.98%, `skb_release_data` 2.09%,
@@ -1154,12 +1154,12 @@ Three findings, in order of what they change.
   the bottleneck today"; this is the number behind the sentence. What
   dominates instead — skb lifecycle and TCP protocol work — `splice` does
   not touch at all.
-- **The largest single cost is not zoxy's.** nft + conntrack is 7.2%,
-  more than every line of zoxy's own code but for a rounding error, and
+- **The largest single cost is not zgix's.** nft + conntrack is 7.2%,
+  more than every line of zgix's own code but for a rounding error, and
   more than any kernel subsystem except TCP itself. The nft loopback
-  bypass recorded above as "environmental work, not zoxy work" is now
+  bypass recorded above as "environmental work, not zgix work" is now
   priced: it would clean ~7 points out of every profile taken here.
-- **zoxy's own code is 10.5%, and the parser is ~2.2% of the total**
+- **zgix's own code is 10.5%, and the parser is ~2.2% of the total**
   (`parseResponseHead` 0.75, `analyzeHeaders` 0.66, `parseRequest` 0.53,
   `classifyHeaderName` 0.28). This is the closing argument for "do not
   optimize the Zig side", now from the kernel's side of the fence rather
@@ -1184,7 +1184,7 @@ decimal, and it is the only claim in this section resting on more than
 one run.
 
 The other honest gap is untouched and now matters more: at the 165 k
-req/s ceiling zoxy is at ~55% of its core, latency-bound with CPU
+req/s ceiling zgix is at ~55% of its core, latency-bound with CPU
 headroom. Cutting CPU does not raise that ceiling, so the ~45% off-CPU
 residue is the measurement with the most left in it — `perf sched`, and
 the paranoid sysctl this section needed is the one it needs too.
@@ -1336,14 +1336,14 @@ protected was available more cheaply. Reversed deliberately, no knob:
   run. The warmup stays, to push RSS toward the bound so holding it is
   non-vacuous (measured at the bench shape: idle 9.8 MiB, after warmup
   18.8, after the full window 21.2, budget 35.2). The overload band
-  keeps its flat check — that zoxy's whole pool budget sits inside the
+  keeps its flat check — that zgix's whole pool budget sits inside the
   1 MiB tolerance, so only an allocation can trip it (measured flat:
   2044 → 2044 KiB).
 - The trade recorded honestly: under heuristic overcommit, a
   memory-tight box now learns of a shortfall at its first traffic peak
   (OOM kill mid-serving) instead of at startup. Accepted with eyes
   open — an operator who needs the old guarantee can preallocate at the
-  OS level (cgroup memory.min); zoxy no longer does it for everyone.
+  OS level (cgroup memory.min); zgix no longer does it for everyone.
 - SimIo keeps zeroing its slab — that was never residency, it is seed
   determinism (a replayed schedule must see identical bytes).
 
@@ -1443,7 +1443,7 @@ justification (§13). The performance half is answered *no*, and it is
 answered by three measurements already in this file rather than by a new
 one.
 
-- **zoxy user code is 1.26% of cycles** ("Loop profile at the Tier-1
+- **zgix user code is 1.26% of cycles** ("Loop profile at the Tier-1
   band", above): 98.6% sit inside one `io_uring_enter`, and the profile's
   own conclusion is "do not optimize the Zig side". Constant-folding
   config takes a fraction of that fraction.
@@ -1476,7 +1476,7 @@ instantiated only by `main.zig` while `admin_test` runs over `SimIo`.
 Doubling the matrix doubles the surface that no gate walks.
 
 Revisit condition, and it is deliberately a profile rather than an
-opinion: a workload in which zoxy user code is not a rounding error —
+opinion: a workload in which zgix user code is not a rounding error —
 which today means after `splice`/`send_zc` (§4, "Open questions") or
 #173 changes the shape of the data path. Even then the verdict is a
 proxy-level band, never a micro-bench delta; that mistake is what the
@@ -1616,7 +1616,7 @@ a scripted clock can carry a timing oracle the sweep cannot (#258).
 ## io_uring op upgrades — evaluated, deferred (2026-07-16)
 
 §4's "plain ops only" holds: on the loop profile above (latency-bound,
-zoxy user code ~1.3% of cycles) none of the deferred ops pays for
+zgix user code ~1.3% of cycles) none of the deferred ops pays for
 itself. The durable "why" for each, so it is not re-chased.
 
 - **Multishot accept** — parked, unmeasured. Saves only the userspace
@@ -1736,7 +1736,7 @@ Fixed in zssl (`backend: drain libcrypto's error queue on failure`): an
 `errdefer` clearing the queue at each of the eight entry points that
 reach libcrypto, gated by a test that reads `ERR_peek_error` after three
 deliberately chatty failures and negative-controlled against a stubbed
-drain. zoxy inherits it at the pin.
+drain. zgix inherits it at the pin.
 
 ### `shed_tls_crypto` has no gate, and why the obvious one does not work
 
@@ -1830,12 +1830,12 @@ exists as of the scan; Geun-Oh/zigtls is aimed the right way but
 
 ## The TLS bands, with resumption (2026-08-11, #125)
 
-The Tier-1 bands carry `zoxy L7 TLS` and `haproxy https` now, both
+The Tier-1 bands carry `zgix L7 TLS` and `haproxy https` now, both
 terminating the same fixture certificate in front of the same plaintext
 origin. Run on `main` with session tickets wired, one pinned core for the
 proxy, load and origin off it. Bands, not single numbers.
 
-| band | zoxy L7 TLS | haproxy https |
+| band | zgix L7 TLS | haproxy https |
 |---|---|---|
 | keep-alive, 20k/s offered | 19899–19935 req/s, p50 43–48 µs | 19931–19933 req/s, p50 44–48 µs |
 | large body, 400/s (100 MiB/s) | 398–399 req/s, p50 507–542 µs | 398–399 req/s, p50 383–385 µs |
@@ -1844,12 +1844,12 @@ proxy, load and origin off it. Bands, not single numbers.
 **The stall fix worked, and the close band is where it shows.** PR #84
 measured 664 of 2000 req/s offered against haproxy's 831 — behind, and
 failing the rate floor. With tickets: 843 against haproxy's 830 at the
-same 2000/s offer, and at a feasible offer zoxy's p50 is between a
+same 2000/s offer, and at a feasible offer zgix's p50 is between a
 quarter and a third of haproxy's. The post-handshake flight is what a
 client's Nagle was waiting for, and it is no longer waiting.
 
 Worth noting which half of that comparison is stable: across two runs
-zoxy's close-band p50 moved 158→161 µs while haproxy's moved 607→429 µs.
+zgix's close-band p50 moved 158→161 µs while haproxy's moved 607→429 µs.
 The gap is not in question — every pairing of those ranges is a large
 one — but the *size* of it quoted from a single run would be.
 
@@ -1864,7 +1864,7 @@ rule, written into `benchPassed` before this: *haproxy missing the offer
 means the offer is wrong*. It fired on both TLS paths and it was right.
 
 Steady state is parity — 20k req/s at a p50 within a few µs of haproxy,
-which is where a real HTTPS front end lives. Bulk is the one band zoxy is
+which is where a real HTTPS front end lives. Bulk is the one band zgix is
 behind on: 507–542 µs p50 against 383–385 µs at the same 100 MiB/s — a
 third to two-fifths slower however the ranges are paired, the record
 layer's per-byte cost showing where the keep-alive band's per-request cost
@@ -1889,12 +1889,12 @@ Steady state — keep-alive, the shape a real HTTPS front end runs in
 
 | | req/s | p50 | p90 | p99 |
 |---|---|---|---|---|
-| zoxy L7 + TLS | 19961–19970 | 110–122 µs | 137–174 µs | 784–1374 µs |
+| zgix L7 + TLS | 19961–19970 | 110–122 µs | 137–174 µs | 784–1374 µs |
 | haproxy https | 19960–19965 | 101–105 µs | 131–151 µs | 223–1043 µs |
 
 Parity on rate and p50. A terminated hop on one thread is not the
 bottleneck at 20k req/s, and nothing about that number wants another
-thread. zoxy's tail is the worse half of the band (p99 up to ~1.4 ms
+thread. zgix's tail is the worse half of the band (p99 up to ~1.4 ms
 against haproxy's ~0.3 ms, and a `max` that lands on ~41.8 ms in *every*
 run — see the stall below, which happens once per connection and so
 amortizes away here).
@@ -1903,7 +1903,7 @@ Handshake-bound — `Connection: close`, one full handshake per request,
 neither side resuming (zrk has no session resumption yet). Three runs,
 and the third one is what explains the first two:
 
-| offered | connections | zoxy L7 + TLS | haproxy https |
+| offered | connections | zgix L7 + TLS | haproxy https |
 |---|---|---|---|
 | 2000/s | 32 | 704 req/s | 1996 req/s |
 | 2000/s | 64 | 1427 req/s | 1996 req/s |
@@ -1912,7 +1912,7 @@ and the third one is what explains the first two:
 **The ceiling is per-connection, not per-core.** Doubling the connections
 doubled the throughput, and the implied per-connection handshake cycle is
 the same either way — 32 / 704 = 45.5 ms, 64 / 1427 = 44.8 ms. Below that
-floor (the 500/s run, 64 ms per connection cycle) zoxy keeps up
+floor (the 500/s run, 64 ms per connection cycle) zgix keeps up
 completely, and its post-handshake exchange is *faster* than haproxy's.
 So the shape is a fixed ~45 ms serialized stall per handshake connection,
 load-independent, capping each connection at ~22 handshakes/s — not a
@@ -1922,7 +1922,7 @@ Nagle/delayed-ACK interaction (§4 records the same 40 ms lesson from
 pooled upstream connections), and the recurring ~41.8 ms `max` in the
 keep-alive runs points the same way. It is that classic; the mechanism
 and the fix are the section below. The reasoning that dismissed it here —
-"zoxy sets `TCP_NODELAY` on its own sockets" — was the wrong half of the
+"zgix sets `TCP_NODELAY` on its own sockets" — was the wrong half of the
 pair, and is corrected there.
 
 Two readings to retire, both of them mine:
@@ -1950,7 +1950,7 @@ clients), and only then anything about parallelism.
 Measurement caveats worth carrying forward:
 
 - The handshake profile shares (`zig build profile --protocol https`:
-  X25519 ~25%, P-256 ECDSA ~12%, ML-KEM ~10% — zoxy and haproxy negotiate
+  X25519 ~25%, P-256 ECDSA ~12%, ML-KEM ~10% — zgix and haproxy negotiate
   the same X25519MLKEM768 group against this client, so both pay it —
   `memset` 11.2%, SHA-256 in Zig 2.4%) are **user-space shares only**:
   `perf_event_paranoid` is 2 on this box, so kernel samples never enter
@@ -1964,30 +1964,30 @@ Measurement caveats worth carrying forward:
 
 ## The ~45 ms stall, identified — nobody ACKs a silent server (2026-07-26)
 
-The stall above is a Nagle/delayed-ACK deadlock, and zoxy's half of it is
+The stall above is a Nagle/delayed-ACK deadlock, and zgix's half of it is
 **sending nothing between the client's `Finished` and the client's first
 request**.
 
 The sequence: the client writes `Finished`, which goes out immediately
 because nothing is outstanding. It then writes the encrypted request —
 and Nagle holds that second small write, because the first is still
-unacknowledged. zoxy has nothing to send back, so no ACK piggybacks, and
+unacknowledged. zgix has nothing to send back, so no ACK piggybacks, and
 the client waits out Linux's delayed-ACK timer. That timer caps at 40 ms.
 
 **The earlier dismissal was the wrong half of the pair.** `TCP_NODELAY`
-on zoxy's sockets governs what *zoxy* may send without waiting. What is
-held here is the *client's* send, waiting on *zoxy's* ACK. Our own
+on zgix's sockets governs what *zgix* may send without waiting. What is
+held here is the *client's* send, waiting on *zgix's* ACK. Our own
 NODELAY cannot touch it.
 
 Evidence, all against the same origin:
 
 | | first response byte |
 |---|---|
-| zoxy, curl (its default `TCP_NODELAY`) | 2.1 ms — faster than haproxy |
-| zoxy, curl `--no-tcp-nodelay` | **42–47 ms, every request** |
+| zgix, curl (its default `TCP_NODELAY`) | 2.1 ms — faster than haproxy |
+| zgix, curl `--no-tcp-nodelay` | **42–47 ms, every request** |
 | haproxy, curl `--no-tcp-nodelay` | 4.1–6.2 ms |
-| zoxy plaintext, curl `--no-tcp-nodelay` | 0.2–0.8 ms |
-| zoxy, `--no-tcp-nodelay`, 200 KB POST | **2.4 ms** |
+| zgix plaintext, curl `--no-tcp-nodelay` | 0.2–0.8 ms |
+| zgix, `--no-tcp-nodelay`, 200 KB POST | **2.4 ms** |
 
 The handshake phase stays at 2–5 ms in every stalling run: the gap is
 entirely *after* it. The 200 KB POST is the proof of mechanism rather
@@ -1995,8 +1995,8 @@ than correlation — a first write larger than the loopback MSS is exempt
 from Nagle, and the stall vanishes. And the load generator never sets
 `TCP_NODELAY`, which is why the bands saw it and curl did not.
 
-**It is not a zoxy bug, and not a TLS bug.** A two-small-writes probe
-issued mid-connection stalls ~41 ms against *everything* — zoxy L4, zoxy
+**It is not a zgix bug, and not a TLS bug.** A two-small-writes probe
+issued mid-connection stalls ~41 ms against *everything* — zgix L4, zgix
 L7, haproxy, and nginx spoken to directly. What differs is reachability:
 a connection's first data segment is covered by Linux's initial quickack
 window, so the shape needs a pathological client on plaintext. Under
@@ -2006,7 +2006,7 @@ request, always past that window.
 **What haproxy does differently is not an ACK policy.** It sends two
 NewSessionTickets the moment the handshake completes; that segment
 carries the ACK and the client's Nagle releases. Probed mid-connection,
-haproxy stalls exactly as hard as zoxy.
+haproxy stalls exactly as hard as zgix.
 
 So the fix is the message, not the socket: **emit the post-handshake
 flight after processing the client's `Finished`**, which is what every
@@ -2015,13 +2015,13 @@ permits sending it alongside the server flight — that would be legal and
 would *not* fix this, because the ACK must cover the `Finished`.
 
 `TCP_QUICKACK` was considered and rejected: it treats universal TCP
-behaviour as a zoxy bug, it is Linux-only on a seam that also serves
+behaviour as a zgix bug, it is Linux-only on a seam that also serves
 kqueue, and it decays — making it robust means re-arming per read, a
 syscall on the data path.
 
 ## Kernel socket buffers are outside the §5 budget (2026-07-26)
 
-The startup printout is a closed form over zoxy's pools and says nothing
+The startup printout is a closed form over zgix's pools and says nothing
 about the kernel memory each connection also costs. On this box the
 stock defaults are `tcp_rmem` 131072 and `tcp_wmem` 16384 — 144 KiB per
 socket, and an L7 connection holds two, client and upstream. Against the
@@ -2105,7 +2105,7 @@ orders of magnitude. Do not open it a third time.
 The paragraph above bounded structure-of-arrays at "~6% at 2000
 connections and nothing below ~500" and invited a revisit under c10k
 pressure. A cloud c10k run supplied the pressure: at 10,000 connections
-zoxy served 21,396 req/s at 0.758 CPU, against 44,000 req/s at 0.859 CPU
+zgix served 21,396 req/s at 0.758 CPU, against 44,000 req/s at 0.859 CPU
 with 500 connections on the same build. **19.5 µs → 35.4 µs of CPU per
 request, a 1.8× per-request penalty**, with nothing saturated anywhere —
 no CFS throttling, upstream pool at 74%, origin at 24%, zero packet
@@ -2148,8 +2148,8 @@ smallest swept point (64 connections) still reads slow despite being the
 most cache-friendly; it is left in the sweep and out of the conclusions,
 because a number nobody can explain is not a number to reason from.
 
-**So the c10k penalty is essentially all outside zoxy's data
-structures**, consistent with the 2026-07-12 finding that zoxy user code
+**So the c10k penalty is essentially all outside zgix's data
+structures**, consistent with the 2026-07-12 finding that zgix user code
 is a single-digit share of cycles. At 10,000 connections it is kernel
 work: TCP state for ~20,000 sockets, softirq, io_uring bookkeeping. No
 `Conn` layout change reaches it.
@@ -2166,7 +2166,7 @@ would have caught it.
 
 ## Profile share is not throughput headroom — bounding a wipe (2026-07-25)
 
-Same profile: `compiler_rt.memset` at 11.2% of zoxy's CPU, ~84% of it
+Same profile: `compiler_rt.memset` at 11.2% of zgix's CPU, ~84% of it
 traced to ztls's `secureZero` on teardown — dominated by `fin_frag`, a
 16 KiB buffer reserved against a client-auth flight we never request and
 wiped in full on every handshake (16386 of the 18269 bytes `deinit`
@@ -2293,7 +2293,7 @@ above (0.04%). 10k connections cost nothing per request.
 
 Nor was it the environment. At the c10k plateau the NIC carried 502
 Mbit/s where the 500-connection run had carried 914 Mbit/s through the
-same interface; zoxy held 78% of its 1-CPU quota with 0.17% of periods
+same interface; zgix held 78% of its 1-CPU quota with 0.17% of periods
 throttled; the origin idled 3.2 of 4 cores. Worth recording for anyone
 reading cloud numbers: the 2-core proxy VM showed **32% steal**, charged
 straight against that quota.
@@ -2341,13 +2341,13 @@ errors, and the stall that used to sit at t≈85s is gone.
 Past the knee it got worse, and the mechanism is the finding. The 503
 was a *fast, bounded, connection-keeping* answer. With nothing shedding,
 the same request instead queues until the client's own 1 s timeout kills
-it and reconnects — 3.3× the connection churn. The receipt: zoxy served
+it and reconnects — 3.3× the connection churn. The receipt: zgix served
 **5,001,502** responses while the loadgen counted **4,860,555**. The
 140,947 gap matches the 142,478 timeouts. That work was done for callers
 who had already left.
 
 So until this run, upstream-pool exhaustion was doing double duty as
-zoxy's capacity signal — and a second mechanism keyed off the same flag,
+zgix's capacity signal — and a second mechanism keyed off the same flag,
 `parkedTimeoutMs`'s pressure-shortened reap, went dormant with it
 (`upstream_pressure_engaged` = 2 across the whole run). Both were reading
 an accident. Removing the accident was right; what it left behind was a
@@ -2703,8 +2703,8 @@ does under it.
 
 ## Shipping ReleaseSafe (2026-08-04)
 
-`release.yml` and every build.zig target that compiles zoxy's own code
-for measurement (`release_zoxy`, the Tier-0 micro binaries) moved from
+`release.yml` and every build.zig target that compiles zgix's own code
+for measurement (`release_zgix`, the Tier-0 micro binaries) moved from
 ReleaseFast to ReleaseSafe. Motivation: a security review found that
 `std.debug.assert` — which several bounds/invariant guards rely on as
 their *only* enforcement (`mem/Pool.zig`'s double-release guard,
@@ -2721,8 +2721,8 @@ actual proxy, not by assuming the sim's 3.5× applied here. Procedure:
 `zig build bench -- --rate 20000 --connections 32 --seconds 5` alternated
 3 rounds each between that worktree and the ReleaseSafe tree (§9 band
 procedure). Steady-state (20k req/s, ~100k requests/run, the
-high-volume/low-noise scenario): hop p50 zoxy L4 baseline [24,25]µs vs
-ReleaseSafe [24,27]µs, zoxy L7 baseline [18,24]µs vs ReleaseSafe
+high-volume/low-noise scenario): hop p50 zgix L4 baseline [24,25]µs vs
+ReleaseSafe [24,27]µs, zgix L7 baseline [18,24]µs vs ReleaseSafe
 [22,25]µs — bands overlap, no separation. Overload/churn band (256 conns
 vs 64 slots): completed throughput baseline {5017,5009,5007} vs
 ReleaseSafe {5007,5030,5007} req/s — indistinguishable. The large-body
@@ -2731,7 +2731,7 @@ looked separated after 2 rounds (baseline max 314µs vs ReleaseSafe min
 362µs) and collapsed to full overlap by round 3 (baseline max 360µs,
 ReleaseSafe min 362µs) — a clean in-session demonstration of why one or
 two runs isn't enough, matching the "run-to-run variance" note below.
-Confirms the prior CPU profiling (zoxy is syscall-bound, 98.6% of cycles
+Confirms the prior CPU profiling (zgix is syscall-bound, 98.6% of cycles
 in `io_uring_enter`, user code 1.26%): ReleaseSafe's added checks land in
 that thin user-code slice and don't move the wall-clock number. One real,
 minor difference: RSS under the overload scenario sat ~1440 KiB higher
@@ -2806,12 +2806,12 @@ timeout) failed at 2.04%. The stall rate does not track the tail at all.
 
 What it tracks is the conn-slot wall. With `timeouts` at zero, zrk's
 `connect + write + read` is the whole of its `socketErrors()`, and on the
-four runs that captured zoxy's counters alongside, that total landed
+four runs that captured zgix's counters alongside, that total landed
 within 0.1% of `shed_conn_slots` — one socket error per RST'd connection.
 How it divides is pure race, and it moves run to run: across six runs the
 connect share ranged 28–54%, write 43–71%, read 1.3–3.3%. Which bucket a
 given connection lands in is only how far the generator got before the RST
-arrived. Meanwhile zoxy witnessed no relay fault at all on those runs:
+arrived. Meanwhile zgix witnessed no relay fault at all on those runs:
 `deadline_expired`, `upstream_connect_failed`, every `kernel_pressure_*`,
 `l7_bad_gateway` and `l7_gateway_timeout` all 0, with
 `accepted = admitted + shed_conn_slots` balancing exactly. Causally
@@ -3011,7 +3011,7 @@ and a future tightening should start here rather than from taste.
 
 **The finding worth keeping: filling the head buffer is not enough to
 produce a response excess.** The bulk target's 32 KiB body does fill
-zoxy's 8 KiB upstream head buffer, and `l7_response_excess_sent` still
+zgix's 8 KiB upstream head buffer, and `l7_response_excess_sent` still
 read **0**. The excess rides the head write whenever
 `rendered.len + excess <= head_buffer_bytes`, and the rendered head is
 the origin's head *minus* hop-by-hop headers — so head plus excess comes
@@ -3024,12 +3024,12 @@ both halves.
 
 ## Phase 0 baselines (2026-07-10/11)
 
-- Debug-build zoxy over loopback (`zig build bench`, nginx origin, rate
+- Debug-build zgix over loopback (`zig build bench`, nginx origin, rate
   20 k, c=32): 20 k req/s sustained, hop +259 µs p50 (426 µs proxied vs
   167 µs direct). RSS byte-identical across ~200 k requests — the
   process-level zero-alloc witness. Clean SIGTERM drain, exit 0.
 - haproxy 3.4.1 reference band in the same harness (mode tcp,
-  nbthread 1 to match the single loop): zoxy hop +214 µs p50 vs haproxy
+  nbthread 1 to match the single loop): zgix hop +214 µs p50 vs haproxy
   +199 µs, p90/p99 bands overlapping — parity with the state of the art
   on this setup. Another run's pair read +128 vs +123 µs: compare within
   one run, never across runs. haproxy never gates (§9).
@@ -3043,10 +3043,10 @@ both halves.
   the P-core then settles to ~117 k at identical CPU share. Only
   adjacent within-session A/B pairs are comparable; set the performance
   governor for A/Bs and restore powersave after.
-- **Stale proxies.** Killing `$ZOXY_PID` does not kill an
-  strace-wrapped zoxy (that pid is strace's) — stale instances stay in
+- **Stale proxies.** Killing `$ZGIX_PID` does not kill an
+  strace-wrapped zgix (that pid is strace's) — stale instances stay in
   the SO_REUSEPORT group and silently absorb load from later runs.
-  Before any bench: `pgrep -af zoxy` and `ss -tln` on the bench ports.
+  Before any bench: `pgrep -af zgix` and `ss -tln` on the bench ports.
   An afternoon of tail-latency forensics was lost to this.
 - **strace is unusable** for latency work (tracer writeback freezes
   tracees 8–12 ms and mangles timestamps); bpftrace on the io_uring
@@ -3055,7 +3055,7 @@ both halves.
 - **Generator limits.** zrk saturates at ~25–27 k req/s on this box
   regardless of cores — use h2load (`--h1 -m1`) above that. And
   closed-loop `-m1` measures *latency*: a proxy hop lowers its req/s by
-  construction; saturating zoxy's core needs high `-c` or real RTT.
+  construction; saturating zgix's core needs high `-c` or real RTT.
 - **Zig 0.16 `Child`.** `kill()` reaps; a `wait()` after it is UB
   (SEGV'd the ReleaseFast bench harness and leaked nginx onto a bench
   port — d3000f5).

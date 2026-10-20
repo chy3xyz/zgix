@@ -190,7 +190,7 @@ fn issuedBy(subject: std.crypto.Certificate.Parsed, issuer_der: []const u8, now_
 
 const fixture_cert_pem = @embedFile("testdata/cert.pem");
 
-/// Inside the fixture's 2026-07-25 .. 2036-07-22 validity window.
+/// Inside the fixture's 2026-10-20 .. 2036-10-17 validity window.
 const fixture_now: i64 = 1_800_000_000;
 
 test "trust store: a self-signed fixture verifies for its own name" {
@@ -206,11 +206,11 @@ test "trust store: a self-signed fixture verifies for its own name" {
     var chain_storage: [8192]u8 = undefined;
     const chain = CertificateList.init(try derList(&chain_storage, leaf_der));
 
-    try std.testing.expect(store.verify(chain, "spike.zoxy.test", fixture_now));
-    try std.testing.expect(store.verify(chain, "SPIKE.ZOXY.TEST", fixture_now));
+    try std.testing.expect(store.verify(chain, "spike.zgix.test", fixture_now));
+    try std.testing.expect(store.verify(chain, "SPIKE.ZGIX.TEST", fixture_now));
     try std.testing.expect(!store.verify(chain, "other.example", fixture_now));
     // Outside the fixture's validity window.
-    try std.testing.expect(!store.verify(chain, "spike.zoxy.test", 0));
+    try std.testing.expect(!store.verify(chain, "spike.zgix.test", 0));
 }
 
 test "trust store: a certificate outside the bundle is not trusted" {
@@ -227,7 +227,7 @@ test "trust store: a certificate outside the bundle is not trusted" {
     var chain_storage: [8192]u8 = undefined;
     const chain = CertificateList.init(try derList(&chain_storage, leaf_der));
 
-    try std.testing.expect(!store.verify(chain, "spike.zoxy.test", fixture_now));
+    try std.testing.expect(!store.verify(chain, "spike.zgix.test", fixture_now));
 }
 
 test "trust store: an empty bundle is refused" {

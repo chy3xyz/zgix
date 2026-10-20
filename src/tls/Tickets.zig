@@ -2,7 +2,7 @@
 //!
 //! A resumption ticket has to carry the session's PSK back to us. The
 //! obvious shape is a server-side table keyed by ticket id — and that is
-//! exactly what zoxy cannot have: a table sized for concurrent sessions
+//! exactly what zgix cannot have: a table sized for concurrent sessions
 //! is memory that grows with traffic, and looking one up on the handshake
 //! path is state the §5 budget would have to cover. So the ticket *is*
 //! the state: the PSK is sealed into the bytes handed to the client, and
@@ -42,7 +42,7 @@ const assert = std.debug.assert;
 const Tickets = @This();
 
 /// AES-256-GCM: a 32-byte key, 12-byte nonce, 16-byte tag. Chosen over
-/// ChaCha20-Poly1305 because every target that runs zoxy in production
+/// ChaCha20-Poly1305 because every target that runs zgix in production
 /// has AES-NI, and this is on the handshake path.
 const Aead = std.crypto.aead.aes_gcm.Aes256Gcm;
 pub const key_bytes = Aead.key_length;

@@ -1,12 +1,12 @@
-# zoxy
+# zgix
 
-[![CI](https://github.com/zoxy-io/zoxy/actions/workflows/ci.yml/badge.svg)](https://github.com/zoxy-io/zoxy/actions/workflows/ci.yml)
-[![Coverage Status](https://coveralls.io/repos/github/zoxy-io/zoxy/badge.svg?branch=main)](https://coveralls.io/github/zoxy-io/zoxy?branch=main)
+[![CI](https://github.com/chy3xyz/zgix/actions/workflows/ci.yml/badge.svg)](https://github.com/chy3xyz/zgix/actions/workflows/ci.yml)
+[![Coverage Status](https://coveralls.io/repos/github/chy3xyz/zgix/badge.svg?branch=main)](https://coveralls.io/github/chy3xyz/zgix?branch=main)
 [![Discord](https://img.shields.io/discord/1530882611159760956)](https://discord.gg/BGbb7VtYA)
 [![Project stage: Experimental][project-stage-badge: Experimental]][project-stage-page]
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-zoxy is built on the [TigerBeetle](https://tigerbeetle.com) I/O model — completion-based
+zgix is built on the [TigerBeetle](https://tigerbeetle.com) I/O model — completion-based
 with caller-owned completions — and follows [TigerStyle](docs/TIGER_STYLE.md):
 **all memory is reserved at startup, and the request-serving path allocates nothing.**
 
@@ -22,7 +22,7 @@ processes behind `SO_REUSEPORT`, never threads sharing memory.
 - **Observability** — a Prometheus endpoint and a JSON access log
 - **HTTP/3** — experimental QUIC listeners (`h3_listeners`) proxying through a
   plaintext-or-TLS HTTP/1.1 leg, observed like the TCP path: global
-  `zoxy_h3_*` counters (one verdict bucket per request, no-route
+  `zgix_h3_*` counters (one verdict bucket per request, no-route
   included) plus per-listener rows on the admin `/metrics` scrape;
   host+path-prefix route table to plaintext or TLS clusters, with the upstream
   leg keep-alive pooled (one parked connection per endpoint, reaped idle); an
@@ -37,8 +37,8 @@ processes behind `SO_REUSEPORT`, never threads sharing memory.
 The binary takes exactly one argument, the path to a JSON config:
 
 ```sh
-zoxy config.json           # start the proxy
-zoxy --check config.json   # validate and price it, without binding a port
+zgix config.json           # start the proxy
+zgix --check config.json   # validate and price it, without binding a port
 ```
 
 A minimal config — one L4 listener forwarding to one origin:
@@ -63,7 +63,7 @@ same listener with health checks and the access log turned on, and
 ## Documentation
 
 - [**docs/README.md**](docs/README.md) — the manual: running the binary,
-  every config block, what zoxy exposes while it runs, and how it behaves
+  every config block, what zgix exposes while it runs, and how it behaves
   when a resource runs out.
 - [docs/DESIGN.md](docs/DESIGN.md) — the settled design: what is shipped and
   how it works. The bare `§` references in the source and in commit messages
@@ -72,7 +72,7 @@ same listener with health checks and the access log turned on, and
   held to.
 - [docs/IMPLEMENTATION_NOTES.md](docs/IMPLEMENTATION_NOTES.md) — measured
   findings, shelved experiments and open technical questions.
-- [zoxy.io/config](https://zoxy.io/config/) — every configuration field,
+- [zgix.click/config](https://zgix.click/config/) — every configuration field,
   bound and default, rendered from the JSON Schema of the latest release.
 
 ## Benchmarks
@@ -80,7 +80,7 @@ same listener with health checks and the access log turned on, and
 [**zoxy-io/benchmark**](https://github.com/zoxy-io/benchmark) runs unattended
 every night and publishes to
 [zoxy-io.github.io/benchmark](https://zoxy-io.github.io/benchmark/). It
-compares zoxy against **HAProxy**, **Nginx**, **Pingora** and **Envoy** as HTTP/1.1
+compares zgix against **HAProxy**, **Nginx**, **Pingora** and **Envoy** as HTTP/1.1
 reverse proxies doing the identical job — parse each request, forward it over
 a pooled keep-alive upstream, stream the response back — currently under the
 `c1k` profile. That repository documents the fairness rules and the fleet
@@ -97,16 +97,16 @@ automatically on `cd`:
 
 ```sh
 devenv shell                    # zig 0.17, zls, kcov
-zig build                       # build zig-out/bin/zoxy
+zig build                       # build zig-out/bin/zgix
 zig build ci                    # the per-change gate: tests + lint + simulation + smoke
 zig build test                  # unit tests
 zig build sim -- 0 500          # deterministic simulator: [seed] [iterations]
 zig build smoke                 # live gate: the real binary against a real origin
 zig build schema                # emit zig-out/config.schema.json
 zig build run -- config/example.json
-zig build bench                 # loopback bands: direct vs zoxy vs haproxy
+zig build bench                 # loopback bands: direct vs zgix vs haproxy
 zig build h3-check              # experimental: compile/test the HTTP/3 stack
-zig build h3-serve              # standalone interop server (zoxy itself uses h3_listeners)
+zig build h3-serve              # standalone interop server (zgix itself uses h3_listeners)
 ```
 
 Correctness rests on a deterministic simulator: the serving path is written
@@ -124,7 +124,7 @@ catch a bug whose only symptom is a wrong *rate*.
 
 > [!NOTE]
 > The bench harness is always built ReleaseFast, but it measures the
-> `zig-out/bin/zoxy` you last built — and plain `zig build` produces a
+> `zig-out/bin/zgix` you last built — and plain `zig build` produces a
 > Debug binary. Run `zig build -Doptimize=ReleaseFast` first before
 > quoting numbers against haproxy.
 

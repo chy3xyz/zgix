@@ -1,6 +1,6 @@
 //! Programmatic load-test entry point: everything the `zrk` CLI does,
 //! minus argument parsing and the terminal dashboard. Embedders (for
-//! example zoxy's bench harness) call `run` with a `cli.Config` and get
+//! example zgix's bench harness) call `run` with a `cli.Config` and get
 //! a typed `Report` back; an optional progress callback receives the
 //! same periodic snapshots the dashboard renders.
 

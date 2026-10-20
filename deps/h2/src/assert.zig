@@ -30,13 +30,13 @@
 //! ## The option, and why it is an option
 //!
 //! docs/TIGER_STYLE.md records the one place the two consumers genuinely
-//! disagree. zoxy wants assertions on in production: it is the security
+//! disagree. zgix wants assertions on in production: it is the security
 //! boundary and it points this decoder at the open internet. zrk is a
 //! latency-measuring tool whose whole pitch is not injecting client-side noise
 //! into the measurement.
 //!
 //! A library cannot decide that for its consumers, so `-Dassertions` decides
-//! it, defaulting to on. zoxy inherits the default and states nothing; zrk opts
+//! it, defaulting to on. zgix inherits the default and states nothing; zrk opts
 //! out in a line a reviewer can see. A consumer depending on this package
 //! passes it the same way it passes any other option:
 //!

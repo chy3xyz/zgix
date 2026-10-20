@@ -398,6 +398,15 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
         /// the L7 path `routeRequest` overwrites it with the request
         /// path's cluster once the head parses (§7).
         cluster_index: u16,
+        /// The route the current exchange matched, as a global ordinal
+        /// into the config's route order — the order `route_info` labels
+        /// and `route_responses` cells are built in, so the one number
+        /// addresses both (§B2). Written beside `cluster_index` at
+        /// routing; read at `finishExchange`, the `l7_responses` witness,
+        /// so a completed exchange always names the route that admitted
+        /// it. Seeded to zero like `cluster_index`; L7-only, because the
+        /// h3 seam cannot reach the labeled tables this index serves.
+        route_index: u32,
         /// The leased upstream slot during an L7 exchange; released at
         /// teardown alongside the conn slot (§5). Null outside exchanges
         /// and on the whole L4 path.
@@ -723,6 +732,9 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             // resolves one (`finishAdmission`); on the L7 path `routeRequest`
             // overwrites it per request anyway (§7).
             stream.cluster_index = 0;
+            // Same seeding and same per-request overwrite as
+            // `cluster_index` — see the field's doc (§B2).
+            stream.route_index = 0;
             // The field defaults are `reset`'s values; a recycled slot
             // needs both the scalars and the (unread) capture arrays, and
             // this sets them in one write. The clock stays at zero: an L4

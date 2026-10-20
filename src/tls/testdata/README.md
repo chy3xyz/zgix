@@ -10,12 +10,12 @@ reused anywhere. Regenerate freely:
 
 ```sh
 openssl ecparam -name prime256v1 -genkey -noout -out key.pem
-openssl req -new -x509 -key key.pem -subj "/CN=spike.zoxy.test" \
-  -addext "subjectAltName=DNS:spike.zoxy.test" -days 3650 -out cert.pem
+openssl req -new -x509 -key key.pem -subj "/CN=spike.zgix.test" \
+  -addext "subjectAltName=DNS:spike.zgix.test" -days 3650 -out cert.pem
 ```
 
 `rsa2048-key.pem` is a throwaway RSA key with no certificate of its own,
-and it exists to be **refused**: zssl signs RSA-PSS, zoxy does not accept
+and it exists to be **refused**: zssl signs RSA-PSS, zgix does not accept
 an RSA leaf (an RSA sign is ~1-2 ms on the loop that is sized for a
 ~260 µs ECDSA handshake), and `Credentials.load` is what says no. It
 pairs with `cert.pem` in that test because nothing checks that a key

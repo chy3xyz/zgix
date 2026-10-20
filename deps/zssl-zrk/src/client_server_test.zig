@@ -1,6 +1,6 @@
 //! Slice 4's end-to-end: the production `ClientHandshake` against the
 //! production `ServerHandshake` — both real machines, no test client.
-//! Covers the full origination path zoxy needs for upstreams: SNI, ALPN,
+//! Covers the full origination path zgix needs for upstreams: SNI, ALPN,
 //! leaf verification, tickets captured through the client's event
 //! surface, resumption, §4.6.3 KeyUpdate in both directions with the
 //! kTLS export tracking generations, and the client's structural refusal
@@ -99,7 +99,7 @@ const Harness = struct {
             .client_random = @as([32]u8, @splat(0x1a)),
             .x25519_private = client_x25519_private,
             .session_id = &@as([32]u8, @splat(0x44)),
-            .server_name = "spike.zoxy.test",
+            .server_name = "spike.zgix.test",
             .alpn_protocols = options.client_alpn,
             .certificate_policy = options.certificate_policy,
             .chain_verifier = options.chain_verifier,

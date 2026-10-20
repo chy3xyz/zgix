@@ -1,8 +1,8 @@
 # zssl design
 
 A sans-I/O TLS 1.3 protocol layer in Zig over libcrypto primitives.
-Written to replace the audited `zoxy-io/ztls` fork as zoxy's TLS engine,
-on zoxy's terms from the first line: TIGER_STYLE throughout, kTLS as a
+Written to replace the audited `zoxy-io/ztls` fork as zgix's TLS engine,
+on zgix's terms from the first line: TIGER_STYLE throughout, kTLS as a
 design input rather than a bolt-on, and a scope cut to what a terminating
 proxy needs instead of what a general TLS library carries.
 
@@ -180,7 +180,7 @@ The protocol state machine — where TLS CVEs live — is Zig in this tree.
 Constant-time primitives — AEAD, X25519, ECDSA — are libcrypto's, the
 most-watched assembly on earth. HKDF, HMAC, and the transcript hash are
 pure Zig over `std.crypto`: hashing public-length data is not where the
-sharp edges are, and this is the same line ztls drew and zoxy audited.
+sharp edges are, and this is the same line ztls drew and zgix audited.
 So is verifying a peer's **RSA-PSS** — a public-length message against a
 public key is not where the constant-time argument bites either.
 ECDSA verification sat on the same side of the line until `bench/` priced
@@ -193,7 +193,7 @@ zero-allocation budget over a C library a checkable property instead of
 a hope (`src/crypto/mem_hooks.zig`). BoringSSL and AWS-LC removed the
 API, so a backend for them could never satisfy §3 — carrying their
 bindings anyway is how ztls spent ~660 lines saying "unsupported". The
-pin is `zoxy-io/openssl` 3.5.7 (LTS to 2030), the same commit zoxy
+pin is `zoxy-io/openssl` 3.5.7 (LTS to 2030), the same commit zgix
 links, because the embedder's binary must contain exactly one libcrypto.
 
 The C surface is two files: `src/crypto/c.zig` (the single `@cImport`)
@@ -207,7 +207,7 @@ Zero allocation, full stop — not "after startup", because zssl has no
 startup: every buffer is caller-owned and every struct is fixed-size.
 The embedder owns startup, installs the `mem_hooks` triple before first
 libcrypto use, and sizes the fixed heap that libcrypto's own internals
-(EVP contexts, PKEY objects) land in. zoxy's measured budget is ~4.9 KiB
+(EVP contexts, PKEY objects) land in. zgix's measured budget is ~4.9 KiB
 of libcrypto heap per session engine plus a 2 MiB base; zssl's job is to
 keep the per-record path free of *any* allocation: AEAD contexts are
 created once per traffic key (`AeadKey.init`) and reused per record; the
@@ -338,7 +338,7 @@ needed `ServerHandshake.Config.groups` — with x25519 in the list the
 server takes the share our client always sends and never retries, so
 until the preference could be narrowed that path rested on BoGo alone.
 
-Deliberately absent: a differential against ztls. It moves to zoxy's
+Deliberately absent: a differential against ztls. It moves to zgix's
 engine swap, where the two run side by side and a disagreement is
 diagnosable against a live proxy.
 

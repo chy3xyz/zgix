@@ -1,0 +1,67 @@
+# GitHub Pages: zgix.click official site + bilingual docs.
+#
+# Build matrix (three zdoc passes, merged into one artifact):
+#   1. `zdoc site`   — the landing page (zine.ziggy site mode)
+#   2. `zdoc docs`   — English docs tree  -> /docs
+#   3. `zdoc docs`   — Chinese docs tree  -> /docs/zh
+# Deploy via the official Pages actions (OIDC, no tokens in repo settings).
+
+name: site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "website/**"
+      - ".github/workflows/site.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: chy3xyz/zdoc
+          path: zdoc
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.17.0
+
+      - name: Build zdoc
+        run: zig build -Doptimize=ReleaseSafe
+        working-directory: zdoc
+
+      - name: Build landing + docs (en, zh)
+        working-directory: website
+        run: |
+          ZDOC=../zdoc/zig-out/bin/zdoc
+          "$ZDOC" site    -f
+          "$ZDOC" docs docs    --output public/docs    --url-prefix docs    --title zgix      --lang en     -f --strict
+          "$ZDOC" docs docs-zh --output public/docs/zh --url-prefix docs/zh --title "zgix 文档" --lang zh-CN -f --strict
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: website/public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

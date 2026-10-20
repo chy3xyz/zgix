@@ -91,7 +91,7 @@ fn handshake(credentials: *const Credentials) !void {
     var client: zssl.ClientHandshake = .init(&.{
         .client_random = @splat(0x52),
         .x25519_private = @splat(0x51),
-        .server_name = "spike.zoxy.test",
+        .server_name = "spike.zgix.test",
         .certificate_policy = .insecure_no_verification,
         .reassembly = &client_reassembly,
     });

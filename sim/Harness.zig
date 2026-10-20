@@ -15,19 +15,19 @@
 
 const std = @import("std");
 
-const zoxy = @import("zoxy");
+const zgix = @import("zgix");
 
 const l4 = @import("l4.zig");
 const l7 = @import("l7.zig");
 
-const Io = zoxy.Io;
-const SimIo = zoxy.Io.SimIo;
-const ServerSim = zoxy.Server(SimIo);
-const Origin = zoxy.testing.Origin(SimIo);
+const Io = zgix.Io;
+const SimIo = zgix.Io.SimIo;
+const ServerSim = zgix.Server(SimIo);
+const Origin = zgix.testing.Origin(SimIo);
 const HttpOrigin = l7.HttpOrigin(SimIo);
 const HttpClient = l7.Client(SimIo);
 const EchoClient = l4.Client(SimIo);
-const TlsClient = zoxy.tls.TestClient(SimIo);
+const TlsClient = zgix.tls.TestClient(SimIo);
 
 const assert = std.debug.assert;
 
@@ -81,7 +81,7 @@ const scenario_end_ns: u64 = 2_000_000_000;
 /// plus a second, so the key is unambiguously overdue rather than
 /// balanced on the boundary the directed tests already pin.
 const clock_jump_ns: u64 =
-    (@as(u64, zoxy.constants.tls_ticket_key_rotation_s) + 1) * std.time.ns_per_s;
+    (@as(u64, zgix.constants.tls_ticket_key_rotation_s) + 1) * std.time.ns_per_s;
 /// The slowest §7 probe pacing a non-outage seed may draw. Named so the
 /// origin-capacity bound below is derived from the same number the draw
 /// uses, not restated in prose.
@@ -116,35 +116,35 @@ comptime {
     assert(HttpOrigin.conns_max >= 32 + probe_sweeps_max);
     // The clean-seed margin, as a proof rather than a comment: the whole
     // population held at once still stops short of the watermark.
-    assert(zoxy.constants.poolPressureOn(clean_pool_capacity) > connections_max);
+    assert(zgix.constants.poolPressureOn(clean_pool_capacity) > connections_max);
 }
 
 io: SimIo,
 server: ServerSim,
-endpoints_l4: [1]zoxy.Io.Address,
+endpoints_l4: [1]zgix.Io.Address,
 /// The http cluster's endpoints: the origin at index 0 always, and on a
 /// #181 retry seed a second one nothing is listening on (`deriveRetries`).
 /// How many are configured is `endpoints_http_count`.
-endpoints_http: [2]zoxy.Io.Address,
+endpoints_http: [2]zgix.Io.Address,
 endpoints_http_count: u16,
 /// The #174 weight tables the clusters may reference, each as long as
 /// the endpoint list it parallels.
 weights_l4: [1]u16,
 weights_http: [2]u16,
-clusters: [2]zoxy.config.Config.Cluster,
-routes_l4: [1]zoxy.http.router.Route,
-routes_http: [1]zoxy.http.router.Route,
-request_filters_http: [7]zoxy.http.filter.Rule,
+clusters: [2]zgix.config.Config.Cluster,
+routes_l4: [1]zgix.http.router.Route,
+routes_http: [1]zgix.http.router.Route,
+request_filters_http: [7]zgix.http.filter.Rule,
 /// The #175 response rules beside them: the always-on stamp the client
 /// oracle requires on every proxied 200, and the 5xx rule whose edit
 /// must never appear (the scripted origin answers no 5xx).
-response_filters_http: [2]zoxy.http.filter.ResponseRule,
-routes_tls: [1]zoxy.http.router.Route,
-listener_configs: [3]zoxy.config.Config.Listener,
+response_filters_http: [2]zgix.http.filter.ResponseRule,
+routes_tls: [1]zgix.http.router.Route,
+listener_configs: [3]zgix.config.Config.Listener,
 /// How many of `listener_configs` this seed actually binds: two on a
 /// plaintext seed, three when it drew TLS clients (§4).
 listeners_count: u8,
-config: zoxy.config.Config,
+config: zgix.config.Config,
 origin: Origin,
 origin_http: HttpOrigin,
 clients: [clients_max]EchoClient,
@@ -169,7 +169,7 @@ tls_resume_seeds: [3][32]u8,
 /// stopped accepting.
 scenario_ended: bool,
 /// What the terminating listener speaks once the handshake hands over.
-tls_protocol: zoxy.config.Config.Listener.Protocol,
+tls_protocol: zgix.config.Config.Listener.Protocol,
 /// What each terminating client sends, distinct per client so the echo
 /// oracle can tell one session's bytes from another's. Read only by the
 /// l4 draw; an http terminator sends its script's request instead.
@@ -181,14 +181,14 @@ tls_tokens: [tls_client_slots][tls_token_bytes]u8,
 /// POST-then-GET pair, which exercised the response render's happy path
 /// and nothing else.
 tls_scripts: [tls_client_slots]l7.Script,
-tls_credentials: [3]?zoxy.tls.CredentialSet,
+tls_credentials: [3]?zgix.tls.CredentialSet,
 /// The #142 gate drawn for the l4 listener; `populateClients` reads it
 /// to decide whether its clients open with headers.
-proxy_protocol_l4: ?zoxy.config.Config.Listener.ProxyProtocol,
+proxy_protocol_l4: ?zgix.config.Config.Listener.ProxyProtocol,
 /// The #142 send half drawn for the l4 cluster; the origin double then
 /// expects and strips a header on every connection, and `verify` holds
 /// what it heard against what the clients were (`verifyUpstreamIdentities`).
-proxy_protocol_send_l4: ?zoxy.config.Config.Cluster.ProxyProtocolSend,
+proxy_protocol_send_l4: ?zgix.config.Config.Cluster.ProxyProtocolSend,
 /// Per-L4-client address its header announced (len 0 = none): distinct
 /// per client, so `verifyAccessLog` can demand the log states each one
 /// on clean seeds — presence is attribution.
@@ -589,8 +589,8 @@ fn deriveAdversary(random: std.Random, clean: bool) SimIo.Adversary {
     };
 }
 
-fn randomPick(random: std.Random) zoxy.config.Config.Cluster.Pick {
-    return random.enumValue(zoxy.config.Config.Cluster.Pick);
+fn randomPick(random: std.Random) zgix.config.Config.Cluster.Pick {
+    return random.enumValue(zgix.config.Config.Cluster.Pick);
 }
 
 /// The #181 draw: a third of seeds give the http cluster a retry budget
@@ -623,7 +623,7 @@ fn deriveRetries(harness: *Harness, random: std.Random) void {
     // Drawn either way, so a starved seed's stream position stays where
     // an unstarved one's is and the suppression costs no other coverage.
     const budget: u16 = if (random.uintLessThan(u8, 3) == 0)
-        1 + random.uintAtMost(u16, zoxy.constants.cluster_retries_max - 1)
+        1 + random.uintAtMost(u16, zgix.constants.cluster_retries_max - 1)
     else
         0;
     if (budget == 0 or harness.force_exhaustion) {
@@ -635,7 +635,7 @@ fn deriveRetries(harness: *Harness, random: std.Random) void {
     harness.endpoints_http_count = 2;
     harness.endpoints_http[1] = .{ .ip = refusingEndpointAddress() };
     assert(harness.retries_http >= 1);
-    assert(harness.retries_http <= zoxy.constants.cluster_retries_max);
+    assert(harness.retries_http <= zgix.constants.cluster_retries_max);
 }
 
 /// The #180 draw: a third of seeds allow the WebSocket token and size a
@@ -734,9 +734,9 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
 /// takes one argument for them rather than three positional ones that
 /// read alike at the call site.
 const ClusterPicks = struct {
-    l4: zoxy.config.Config.Cluster.Pick,
-    http: zoxy.config.Config.Cluster.Pick,
-    http_hash_key: zoxy.config.Config.Cluster.HashKey,
+    l4: zgix.config.Config.Cluster.Pick,
+    http: zgix.config.Config.Cluster.Pick,
+    http_hash_key: zgix.config.Config.Cluster.HashKey,
 };
 
 /// The two cluster records, split from `deriveTopology` for exactly the
@@ -878,7 +878,7 @@ fn deriveServerConfig(
         // is inert and drawing it would move every seed's stream position
         // for coverage that does not exist. The draw arrives with the
         // tunnels themselves (#180).
-        .tunnel_timeout_ms = zoxy.constants.tunnel_ms_default,
+        .tunnel_timeout_ms = zgix.constants.tunnel_ms_default,
         // The #237 cap is read off the config, where the loader puts it;
         // `deriveInitOptions` sizes the pools separately. Drawn only under
         // the adversary, for the reason `deriveMaxInflight` gives: a
@@ -920,11 +920,11 @@ fn deriveServerConfig(
 /// oracle demands must be what the running mint spells for the one http
 /// endpoint, so a hash change fails the sweep loudly instead of quietly
 /// re-homing cookie holders.
-fn deriveSticky(harness: *Harness, random: std.Random) zoxy.config.Config.Cluster.HashKey {
+fn deriveSticky(harness: *Harness, random: std.Random) zgix.config.Config.Cluster.HashKey {
     harness.sticky_http = random.uintLessThan(u8, 4) == 0;
-    var minted_tag: [zoxy.balancer.Balancer.endpoint_tag_len]u8 = undefined;
-    zoxy.balancer.Balancer.formatEndpointTag(
-        zoxy.balancer.Balancer.addressIdentity(&harness.endpoints_http[0]),
+    var minted_tag: [zgix.balancer.Balancer.endpoint_tag_len]u8 = undefined;
+    zgix.balancer.Balancer.formatEndpointTag(
+        zgix.balancer.Balancer.addressIdentity(&harness.endpoints_http[0]),
         &minted_tag,
     );
     assert(std.mem.eql(u8, &minted_tag, l7.canon.sticky_tag));
@@ -1083,8 +1083,8 @@ const HealthDraw = struct {
     http_origin_stop_at_ns: u64,
 };
 
-const Check = zoxy.config.Config.Cluster.Check;
-const PassiveEjection = zoxy.config.Config.Cluster.PassiveEjection;
+const Check = zgix.config.Config.Cluster.Check;
+const PassiveEjection = zgix.config.Config.Cluster.PassiveEjection;
 
 /// A cluster's #230 passive-ejection draw. A third of adversary seeds
 /// opt in, and never a clean one: the signals are a failed dial and an
@@ -1193,7 +1193,7 @@ fn deriveHealthChecks(clean: bool, random: std.Random, timeout_ms: u32) HealthDr
 /// inbound chain, so what separates them lives in the scripts:
 /// `forwarded_inbound` supplies one every mode must handle, and
 /// `forwarded_oversize` one that only `append` can drop.
-fn deriveForwarded(random: std.Random) ?zoxy.config.Config.Listener.Forwarded {
+fn deriveForwarded(random: std.Random) ?zgix.config.Config.Listener.Forwarded {
     return switch (random.uintLessThan(u8, 3)) {
         0 => null,
         1 => .replace,
@@ -1209,7 +1209,7 @@ fn deriveForwarded(random: std.Random) ?zoxy.config.Config.Listener.Forwarded {
 /// coverage: what the clients *send* decides which verdict fires, and
 /// `deriveProxyHeader` scripts that spread — including no header at all,
 /// which is the refusal `require` exists to make.
-fn deriveProxyProtocol(random: std.Random) ?zoxy.config.Config.Listener.ProxyProtocol {
+fn deriveProxyProtocol(random: std.Random) ?zgix.config.Config.Listener.ProxyProtocol {
     if (random.uintLessThan(u8, 3) == 0) {
         return .require;
     }
@@ -1224,7 +1224,7 @@ fn deriveProxyProtocol(random: std.Random) ?zoxy.config.Config.Listener.ProxyPro
 /// out. The prober needs no carve-out: `check_l4` is always the
 /// dial-only tcp check, which gives a stripping origin no bytes to
 /// judge.
-fn deriveProxyProtocolSend(random: std.Random) ?zoxy.config.Config.Cluster.ProxyProtocolSend {
+fn deriveProxyProtocolSend(random: std.Random) ?zgix.config.Config.Cluster.ProxyProtocolSend {
     return switch (random.uintLessThan(u8, 6)) {
         0 => .v1,
         1, 2 => .v2,
@@ -1245,7 +1245,7 @@ fn deriveProxyProtocolSend(random: std.Random) ?zoxy.config.Config.Cluster.Proxy
 /// a deployment nobody can configure.
 fn deriveTlsClients(
     random: std.Random,
-    send: ?zoxy.config.Config.Cluster.ProxyProtocolSend,
+    send: ?zgix.config.Config.Cluster.ProxyProtocolSend,
     force_exhaustion: bool,
 ) u8 {
     if (send != null) return 0;
@@ -1306,7 +1306,7 @@ const ErrorPage = SimPage(403, l7.canon.error_page_body);
 const RespondPage = SimPage(200, l7.canon.respond_body);
 const error_page = &ErrorPage.page;
 const respond_page = &RespondPage.page;
-const error_pages = [_]*const zoxy.config.Config.StaticPage{error_page};
+const error_pages = [_]*const zgix.config.Config.StaticPage{error_page};
 
 /// The #140 names every seed's config logs, already lowercased the way
 /// the loader would leave them (the simulator builds its `Config` by
@@ -1324,17 +1324,17 @@ fn SimPage(comptime status: u16, comptime body: []const u8) type {
         // being stood in for: a status a page may carry, and a body the
         // client oracle can demand.
         comptime {
-            assert(zoxy.shed.isPageStatus(status));
+            assert(zgix.shed.isPageStatus(status));
             assert(body.len >= 1);
         }
         const head = std.fmt.comptimePrint(
             "HTTP/1.1 {d} {s}\r\nContent-Length: {d}\r\nContent-Type: {s}\r\nDate: ",
-            .{ status, zoxy.shed.reasonPhrase(status), body.len, l7.canon.page_content_type },
+            .{ status, zgix.shed.reasonPhrase(status), body.len, l7.canon.page_content_type },
         );
-        const keep_template = head ++ zoxy.shed.date_placeholder ++ "\r\n" ++
-            zoxy.shed.server_line ++ "\r\n" ++ body;
-        const close_template = head ++ zoxy.shed.date_placeholder ++ "\r\n" ++
-            zoxy.shed.server_line ++ "Connection: close\r\n\r\n" ++ body;
+        const keep_template = head ++ zgix.shed.date_placeholder ++ "\r\n" ++
+            zgix.shed.server_line ++ "\r\n" ++ body;
+        const close_template = head ++ zgix.shed.date_placeholder ++ "\r\n" ++
+            zgix.shed.server_line ++ "Connection: close\r\n\r\n" ++ body;
         // `renderStaticPage`'s postcondition: the head is a real prefix, so
         // the HEAD slice the serve path takes is never the whole response.
         comptime {
@@ -1344,14 +1344,14 @@ fn SimPage(comptime status: u16, comptime body: []const u8) type {
 
         var keep: [keep_template.len]u8 = keep_template.*;
         var close: [close_template.len]u8 = close_template.*;
-        var page: zoxy.config.Config.StaticPage = .{
+        var page: zgix.config.Config.StaticPage = .{
             .status = status,
             .keep = &keep,
             .close = &close,
             .keep_head_len = keep_template.len - body.len,
             .close_head_len = close_template.len - body.len,
-            .keep_date = keep[head.len..][0..zoxy.shed.date_bytes],
-            .close_date = close[head.len..][0..zoxy.shed.date_bytes],
+            .keep_date = keep[head.len..][0..zgix.shed.date_bytes],
+            .close_date = close[head.len..][0..zgix.shed.date_bytes],
         };
     };
 }
@@ -1429,7 +1429,7 @@ fn wireFilters(harness: *Harness) void {
     };
 }
 
-fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forwarded) void {
+fn wireListeners(harness: *Harness, forwarded: ?zgix.config.Config.Listener.Forwarded) void {
     harness.wireFilters();
     // One binding for both filter fields: a tls listener either runs the
     // http listener's whole chain or none of it, and two spellings of the
@@ -1526,16 +1526,16 @@ fn deriveAccessLogBuffer(harness: *const Harness) u32 {
         return 0;
     }
     if (harness.clean) {
-        return zoxy.constants.access_log_buffer_bytes_default;
+        return zgix.constants.access_log_buffer_bytes_default;
     }
     const floor = @max(
-        zoxy.constants.access_log_buffer_bytes_min,
-        zoxy.constants.accessLogLineBytes(
+        zgix.constants.access_log_buffer_bytes_min,
+        zgix.constants.accessLogLineBytes(
             log_request_headers.len + log_response_headers.len,
         ),
     );
-    assert(floor >= zoxy.constants.access_log_buffer_bytes_min);
-    assert(floor <= zoxy.constants.access_log_buffer_bytes_max);
+    assert(floor >= zgix.constants.access_log_buffer_bytes_min);
+    assert(floor <= zgix.constants.access_log_buffer_bytes_max);
     return floor;
 }
 
@@ -1601,11 +1601,11 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
     harness.tls_credentials = .{ null, null, null };
     if (harness.tls_clients >= 1) {
         // Index 2: the terminating listener is the third.
-        harness.tls_credentials[2] = try zoxy.tls.CredentialSet.load(
+        harness.tls_credentials[2] = try zgix.tls.CredentialSet.load(
             arena,
             &.{.{
-                .cert_pem = zoxy.tls.testdata.cert_pem,
-                .key_pem = zoxy.tls.testdata.key_pem,
+                .cert_pem = zgix.tls.testdata.cert_pem,
+                .key_pem = zgix.tls.testdata.key_pem,
             }},
             // The deterministic nonce is not optional here: without it the
             // CertificateVerify signature varies run to run, and this
@@ -1875,7 +1875,7 @@ fn startTlsClient(
     harness: *Harness,
     index: u8,
     seeds: *const [3][32]u8,
-    resume_with: ?*const zoxy.tls.SessionTicket,
+    resume_with: ?*const zgix.tls.SessionTicket,
 ) void {
     assert(index < harness.tls_clients_live);
     const client = &harness.tls_clients_storage[index];
@@ -1888,7 +1888,7 @@ fn startTlsClient(
     const entry = l7.scripts.spec(harness.tls_scripts[index]);
     const pairs = harness.tls_protocol == .http and entry.routed_canonical;
     client.start(&harness.io, Harness.tlsBindAddress(), .{
-        .host_name = zoxy.tls.testdata.host_name,
+        .host_name = zgix.tls.testdata.host_name,
         .resume_with = resume_with,
         // An echo token for a relayed session, a real request for a
         // proxied one — the terminated stream has to be what the
@@ -2488,7 +2488,7 @@ pub fn verify(harness: *Harness) !void {
     if (!harness.io.sockets.isFullyReleased()) return error.SocketLeak;
     // §7: no malformed byte may ever reach an origin.
     if (harness.origin_http.violations != 0) return error.OriginSawMalformedBytes;
-    // #142 send: on any seed, garbage where a header belongs is zoxy's
+    // #142 send: on any seed, garbage where a header belongs is zgix's
     // bug — the writers are pure and the adversary splits deliveries but
     // never corrupts bytes, so a cut lands as EOF, not as a violation.
     if (harness.origin.proxy_header_violations != 0) {
@@ -2647,7 +2647,7 @@ fn verifyStickyCounters(harness: *const Harness) !void {
 /// legal schedules — but an identity heard that no client was is always
 /// a bug. Identities are per-client distinct (announced 203.0.113.N,
 /// synthetic ports climb), so a match is attribution, and a parsed
-/// header must always announce: zoxy's writers have no LOCAL/UNKNOWN
+/// header must always announce: zgix's writers have no LOCAL/UNKNOWN
 /// arm. The completeness direction lives in the directed tests, where
 /// the origin's mode is pinned to echo.
 fn verifyUpstreamIdentities(harness: *const Harness) !void {
@@ -2848,7 +2848,7 @@ fn tallyAccessLog(sink: []const u8) !LineTally {
 
 /// Every L7 outcome that answers a client, summed. Each one runs through
 /// `respond` or `finishExchange`, and both emit a line.
-fn l7OutcomeTotal(counters: *const zoxy.counters.Counters) u64 {
+fn l7OutcomeTotal(counters: *const zgix.counters.Counters) u64 {
     const answered = [_][]const u8{
         "l7_responses",
         "l7_bad_request",
@@ -2959,18 +2959,18 @@ fn verifyLoggedHeaders(line: []const u8, is_http: bool) !void {
 /// One logged name carries the canonical value or does not appear.
 fn verifyLoggedValue(line: []const u8, name: []const u8, value: []const u8) !void {
     assert(name.len >= 1);
-    assert(name.len <= zoxy.constants.access_log_header_name_bytes_max);
+    assert(name.len <= zgix.constants.access_log_header_name_bytes_max);
     assert(value.len >= 1);
-    assert(value.len <= zoxy.constants.access_log_header_bytes_max);
+    assert(value.len <= zgix.constants.access_log_header_bytes_max);
     // Sized from the caps the loader enforces, so this helper stays
     // sound for any name and value a config could legally hold — the
     // `catch unreachable`s below are what rest on that.
-    var needle_buffer: [zoxy.constants.access_log_header_name_bytes_max + 4]u8 = undefined;
+    var needle_buffer: [zgix.constants.access_log_header_name_bytes_max + 4]u8 = undefined;
     const needle = std.fmt.bufPrint(&needle_buffer, "\"{s}\":", .{name}) catch unreachable;
     const at = std.mem.indexOf(u8, line, needle) orelse return;
     var expected_buffer: [
-        zoxy.constants.access_log_header_name_bytes_max +
-            zoxy.constants.access_log_header_bytes_max + 8
+        zgix.constants.access_log_header_name_bytes_max +
+            zgix.constants.access_log_header_bytes_max + 8
     ]u8 = undefined;
     const expected = std.fmt.bufPrint(
         &expected_buffer,
@@ -2992,9 +2992,9 @@ fn clientEndedHook(context: ?*anyopaque) void {
 /// Per-accept origin behavior, drawn from the harness's scenario PRNG so
 /// each proxied connection meets a random misbehavior (echo / RST / mute /
 /// frozen) — the §9 adversarial-origin coverage.
-fn pickOriginMode(context: ?*anyopaque) zoxy.testing.Mode {
+fn pickOriginMode(context: ?*anyopaque) zgix.testing.Mode {
     const harness: *Harness = @ptrCast(@alignCast(context.?));
-    return harness.scenario_prng.random().enumValue(zoxy.testing.Mode);
+    return harness.scenario_prng.random().enumValue(zgix.testing.Mode);
 }
 
 /// Per-accept HTTP-origin misbehavior, drawn like the L4 origin's. Clean

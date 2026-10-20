@@ -1,15 +1,15 @@
-# zoxy — bullet-proof L4/L7 proxy
+# zgix — bullet-proof L4/L7 proxy
 
 An L4/L7 proxy in Zig 0.17 in the spirit of Cloudflare's Pingora, with two
 hard constraints: **nothing allocates on the hot path** and **exhaustion
 sheds load — it never crashes, never queues unboundedly, never allocates.**
 Steady-state operation issues zero heap allocations and zero allocating
-syscalls; zoxy's own memory is a startup-time function of the static
+syscalls; zgix's own memory is a startup-time function of the static
 limits (the kernel's per-socket buffers are outside that form — §5).
 
 Simplicity is prioritized over feature-richness. The coding rules live in
 [`docs/TIGER_STYLE.md`](TIGER_STYLE.md). The previous iteration of this
-project ([zoxy-io/zoxy@main](https://github.com/zoxy-io/zoxy)) shipped an
+project ([zoxy-io/zgix@main](https://github.com/zoxy-io/zgix)) shipped an
 L7-only, share-nothing, thread-per-core proxy directly on `io_uring`; its
 measured lessons — paid for with implementation time and simulator seeds —
 are folded into the relevant sections below as constraints, not
@@ -162,13 +162,13 @@ Non-goals (deliberate, recorded so they are decisions rather than drift):
   stashes one; and submitting Finished and the 1-RTT request in one
   batch lets the request overtake Finished at the server, so the client
   defers the request by a millisecond. A live aioquic 1.7 client against
-  `zoxy` with an `h3_listeners` entry — and against the standalone
+  `zgix` with an `h3_listeners` entry — and against the standalone
   `zig build h3-serve` binary — completes the handshake and receives a
   200 with the expected body, including a chunked origin response. That
   is the first interop evidence outside the in-process client. The path
   is observed like any other, counters first: every h3 request, relayed
   response, `502`/`504` verdict, `503` shed and opened or closed session
-  is witnessed into the shared process counter set (`zoxy_h3_*` in the
+  is witnessed into the shared process counter set (`zgix_h3_*` in the
   `/metrics` exposition and the exit tally — the h3 runtime borrows
   `Server.counters`; `Server` and the admin plane hold no h3 knowledge).
   The same runtime borrows `Server.access_log`: every h3 request earns
@@ -337,7 +337,7 @@ records the per-connection handshake stall that is *not* CPU — mechanism
 identified, fix pending). The loop absorbs it in steps between completions, and the
 worst single uninterruptible step — ~275 µs of P-256 sign — is what
 bounds tick inflation. **Horizontal
-scaling is N independent zoxy processes behind SO_REUSEPORT** —
+scaling is N independent zgix processes behind SO_REUSEPORT** —
 share-nothing at the process boundary, where the kernel actually
 isolates — not N loops, and not N worker threads, in one process.
 
@@ -356,7 +356,7 @@ wart), and — decisively for §9 — makes execution nondeterministic, demoting
 the simulator from replayable proof to stress test.
 
 **NUMA.** A single pinned loop deliberately does not scale across sockets —
-scale-out is **process-per-NUMA-node**: N independent zoxy processes, each
+scale-out is **process-per-NUMA-node**: N independent zgix processes, each
 pinned to a node with pools faulted node-local, sharing the port via
 SO_REUSEPORT (optionally eBPF/`SO_INCOMING_CPU` steering and NIC IRQ
 affinity to the same node). That is the *best-case* NUMA topology — zero
@@ -409,7 +409,7 @@ stays auditable Zig behind our own wrapper.
 
 The scope is strict. Primitives only, never a C *protocol* layer (libssl
 and picotls stay out). The C binding lives inside the dependency, so
-zoxy's own tree never names a C symbol and `@cImport` stays lint-forbidden
+zgix's own tree never names a C symbol and `@cImport` stays lint-forbidden
 (§9) — a second C surface opened here would not be behind anyone's audited
 Zig. libcrypto's internal allocations are routed to a fixed startup arena
 (`CRYPTO_set_mem_functions`) so §5's zero-allocation gate keeps its teeth.
@@ -579,7 +579,7 @@ primitives trusted institutionally.
 
 ## 5. Memory — shared pools, fixed at startup
 
-Every limit is a named constant in `src/constants.zig`; **zoxy's own**
+Every limit is a named constant in `src/constants.zig`; **zgix's own**
 memory is a closed-form function of those numbers, printed at startup.
 
 That qualifier is load-bearing. The closed form covers what this process
@@ -667,7 +667,7 @@ Defaults shape. **A working config is a listener and a cluster.** Every
 other block — `timeouts`, `limits`, `access_log` — is optional, and so is
 every field inside them, so tuning is what an operator opts into rather
 than what they must supply to start. The rule for whether a field gets a
-default is what zoxy can honestly answer: `connect_ms` and `idle_ms` have
+default is what zgix can honestly answer: `connect_ms` and `idle_ms` have
 conventional figures to borrow (nginx ships 60 s and 75 s for the same
 budgets), so they default; `request_ms` is a policy set against a
 particular origin's latency, so it defaults *off* rather than to a guess.
@@ -704,7 +704,7 @@ idle one, but the single lazy timer never moves *earlier* once armed
 shorten at the handoff: the idle window waits out the connect-phase
 timer still counting down and fires late, by up to
 `connect_ms - idle_ms`. Rejected at load, not clamped (the same choice
-the `limits` block makes): a clamp would answer a config zoxy cannot
+the `limits` block makes): a clamp would answer a config zgix cannot
 honor with a log line, and one this proxy will not honor should not
 start. The relation holds however a config was built — the loader
 rejects it, `Server.init` asserts it, and `constants` asserts it of the
@@ -1295,7 +1295,7 @@ accept → admit (slots? buffers?) → route by listener
   `"proxy_protocol": { "send": "v1"|"v2" }`, #142). The receive half's
   mirror, and its machinery pays for the whole thing: the header —
   composed by the same module's writers, pinned to the parser by
-  round-trip tests so a chained zoxy always accepts what another sends —
+  round-trip tests so a chained zgix always accepts what another sends —
   is prepended at the dial to the client→upstream direction's debt, and
   the relay's pre-owed-debt entry sends it before any relayed byte. No
   new state, no new op, no new memory beyond a stack buffer; the
@@ -1303,7 +1303,7 @@ accept → admit (slots? buffers?) → route by listener
   the seam (`localAddress`) at the one moment it is needed. Per
   *cluster* — HAProxy's `send-proxy` unit — because it states what the
   origin reads, not who connects; and the identity it names is whatever
-  zoxy believes, so behind a `require` listener the announced-in client
+  zgix believes, so behind a `require` listener the announced-in client
   is the announced-out client, one identity across the chain. The
   restriction is *reachability*, enforced at load: an http listener may
   not route to a sending cluster, because a pooled L7 upstream is shared
@@ -1365,7 +1365,7 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   414; oversize header field or total head → 431; never grow. hparse
   parses *syntax* only — framing semantics stay ours: the incremental
   chunked decoder and every strictness/smuggling
-  check in the next bullet are zoxy code (`src/http/parser.zig` wraps
+  check in the next bullet are zgix code (`src/http/parser.zig` wraps
   hparse and owns them), and hparse's output is fuzzed *through* that
   wrapper (§9), so the trust boundary sits at our validation, not the
   dependency's.
@@ -1636,7 +1636,7 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
 - **One client connection serves a bounded number of requests** (#237).
   An `http` listener's `keepalive_requests`, 1000 by default — nginx's
   figure, and one
-  zoxy can honestly borrow because unlike a body cap it bounds *this
+  zgix can honestly borrow because unlike a body cap it bounds *this
   proxy's* slot occupancy rather than stating anything about an origin.
   It is the only bound that reaches a **busy** connection: `idle_ms`
   reaps one that stopped speaking, `max_lifetime_ms` one open too long,
@@ -1694,7 +1694,7 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
 - **Telling the origin who the client is: `X-Forwarded-For`, and the
   trust rule is config.** A proxy is the last component that knows the
   client's address, so without this an origin's logs, allowlists and rate
-  limits all see zoxy. A per-listener `forwarded` block turns it on;
+  limits all see zgix. A per-listener `forwarded` block turns it on;
   absent, the header travels exactly as it arrived, which is what every
   config predating the feature keeps doing.
   **There is deliberately no default mode**, because the two answers are
@@ -2156,7 +2156,7 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   Set-Cookie rides beside it), on every exchange whose request did not
   already name the endpoint that served it — and *only* those, so a
   settled session is never re-stamped. `Secure` rides a terminated
-  connection and only that one (§4): where zoxy terminates it knows
+  connection and only that one (§4): where zgix terminates it knows
   the scheme is https, and a routing cookie without the attribute is
   one the browser hands back over plaintext to the same host. On a
   plaintext listener it is still absent, because there the original
@@ -2312,7 +2312,7 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
 
 ## 8. Load shedding — the exhaustion ladder
 
-The defining behavior: **when a resource is exhausted, zoxy degrades the
+The defining behavior: **when a resource is exhausted, zgix degrades the
 newest work, keeps serving admitted work, and never allocates, blocks, or
 dies.** Every ladder rung is a static decision at a single choke point on
 the loop thread.
@@ -2417,7 +2417,7 @@ origin, not one this proxy can pick for them.
   is ever the first user of an un-stamped one.
 - **A listener may make those responses name their cause** (#300, RFC
   9209). The ambiguity the point above settles with `Server` is only
-  half-settled by it: `Server: zoxy` says *who* answered, not *why*, and
+  half-settled by it: `Server: zgix` says *who* answered, not *why*, and
   an operator reading a `503` still cannot tell the shed ladder from a
   relayed origin failure without the access log. A `proxy_status`
   listener adds a `Proxy-Status` field naming the cause from 9209's
@@ -2426,7 +2426,7 @@ origin, not one this proxy can pick for them.
   origin was never asked), a §7 filter reject → `http_request_denied`
   (this proxy's policy, not the origin's answer), any rung of the ladder
   above → `connection_limit_reached` (they are one fact to a client:
-  zoxy is full), the request deadline → `http_response_timeout`.
+  zgix is full), the request deadline → `http_response_timeout`.
   The token is a function of the **rung, not the status**, and that is
   the load-bearing choice: `filter.reject_statuses` includes `404`, so a
   table indexed by status alone would have to answer a filter reject and
@@ -2582,7 +2582,7 @@ origin, not one this proxy can pick for them.
   survives both objections: once per process, after `run` has returned.
 - **The exposition answers Rate, Errors and Duration** (#299). Of the RED
   triad a scrape could answer Rate thoroughly and Errors only about
-  *zoxy* — every proxy-generated status had a counter and the origin's
+  *zgix* — every proxy-generated status had a counter and the origin's
   own had none, so a backend returning `500` to every request was
   invisible to metrics and visible only in the access log. Duration had
   no answer at all. `cluster_responses{class}` and a
@@ -2612,7 +2612,7 @@ origin, not one this proxy can pick for them.
   settled 2026-08-02). Beside the process totals, labeled families:
   per-endpoint counters for dial failures, responses served and health
   transitions
-  (`zoxy_endpoint_connect_failed{cluster="api",endpoint="10.0.0.1:8080"}`),
+  (`zgix_endpoint_connect_failed{cluster="api",endpoint="10.0.0.1:8080"}`),
   per-*cluster* counters for the two inflight sheds — those fire
   precisely because no endpoint could be picked, so an endpoint label
   would be an invention — and two gauges read off the owners' live
@@ -2654,7 +2654,7 @@ origin, not one this proxy can pick for them.
   problem, not a proxy one. A successful reopen also heals a `broken`
   sink: what broke was the fd the rotation just replaced. On a `stdout` sink — or
   no log at all — SIGHUP is a no-op, and that is the signal's *only*
-  meaning: zoxy does not reload config (§1 non-goal — the §5 pools are
+  meaning: zgix does not reload config (§1 non-goal — the §5 pools are
   startup-fixed, so a config change is a restart). Whichever sink, it
   writes one JSON object per line: one per HTTP exchange (including every
   reject, request-level shed and verdict) and one per L4 connection,
@@ -2671,11 +2671,11 @@ origin, not one this proxy can pick for them.
   recorded as soon as the response head is rendered (which the head
   buffer can defer past the parse), while `ok` means "the whole response
   reached the client" and is earned only when the last byte does. An exchange cut off mid-response logs its origin's status
-  with outcome `aborted`; exactly one `ok` line per `zoxy_l7_responses`
+  with outcome `aborted`; exactly one `ok` line per `zgix_l7_responses`
   is what the §9 oracle asserts.
   **A line can also carry headers the operator names** (#140, settled
   2026-08-03), and that is what joins this log to the origin's. Nothing
-  here mints an identifier: zoxy is usually not the outermost hop, a
+  here mints an identifier: zgix is usually not the outermost hop, a
   CDN or ingress in front almost always sets `X-Request-ID` or
   `traceparent`, and that header passes through untouched and reaches
   the backend — so logging it at both ends builds the join with nothing
@@ -2700,13 +2700,13 @@ origin, not one this proxy can pick for them.
   Four decisions worth stating. The fields are **nested** objects, one
   per direction: flattening would let a header called `status` shadow
   the real one, and the nesting keeps "what the client sent" visibly
-  apart from "what zoxy observed". A configured header that did not
+  apart from "what zgix observed". A configured header that did not
   arrive is **omitted** rather than emitted as null, so the object says
   what was there. Names are matched case-insensitively and logged
   **lowercased**, one spelling a downstream query need not guess at.
   And a repeated header logs its **first** value, because
   `parser.headerValue`'s does — what the line reports is then the value
-  zoxy itself read, which is the property worth having when the two
+  zgix itself read, which is the property worth having when the two
   disagree.
   The structural consequence is that `access_log_line_bytes_max` stops
   being a comptime sum over a fixed field set: the named headers are
@@ -2787,7 +2787,7 @@ stopwatch — systemd's `TimeoutStopSec`, Kubernetes'
 `terminationGracePeriodSeconds` — it is bounded in practice by the
 `SIGKILL` that follows. Under a bare init with no such timeout it is
 genuinely unbounded, and a deployment there should set a number. Setting
-one means zoxy gives up *before* its platform would, which is a narrower
+one means zgix gives up *before* its platform would, which is a narrower
 thing than being bounded at all.
 What still bounds a straggler either way is its own per-connection
 deadlines: `idle_ms` always, plus `request_ms` and `max_lifetime_ms` when
@@ -2894,7 +2894,7 @@ schedule has and still demand a diagnostic instead of a hang.
 ### The serving loop has the same backstop (#311)
 
 Everything above bounds a *drain*. The phase a process spends its life in
-had nothing: every deadline zoxy owns is an op the loop delivers, so a
+had nothing: every deadline zgix owns is an op the loop delivers, so a
 loop that stops delivering stops delivering the one that would have said
 so, and the observable result is a process that is alive, health-checked,
 holding its listeners and answering none of them. `SO_REUSEPORT` makes it
@@ -3055,7 +3055,7 @@ equalities a shared runner's noise cannot move.
    proxy's resident set must not move across two identical load passes,
    §5's promise witnessed from outside the process.
    One listener terminates TLS (§4), driven by `std.crypto.tls.Client` —
-   an implementation sharing no code with the one zoxy terminates on,
+   an implementation sharing no code with the one zgix terminates on,
    which is the only kind whose agreement is evidence. It handshakes,
    holds a keep-alive session across several requests, and ends it with a
    `close_notify`; its requests join the same line and accept equalities
@@ -3321,8 +3321,8 @@ the same question for #173 and arrives with it.
 
 ## 13. Embedding — the library seam
 
-zoxy is a Zig module before it is a binary, and that is not an
-aspiration: `build.zig` publishes `zoxy`, and the serving path takes a
+zgix is a Zig module before it is a binary, and that is not an
+aspiration: `build.zig` publishes `zgix`, and the serving path takes a
 `Config` **struct**, never a config *file*. `Server(Io).init` is handed
 `*const Config`, so JSON is one way to produce one and not the only way.
 

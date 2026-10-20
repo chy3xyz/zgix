@@ -39,7 +39,7 @@ ccs_seen: u8,
 session_echo_bytes: u8,
 session_echo: [32]u8,
 /// Whether this session came up on an accepted PSK — the fact behind
-/// zoxy's `tls_resumed` counter.
+/// zgix's `tls_resumed` counter.
 resumed: bool,
 
 const ServerHandshake = @This();
@@ -569,7 +569,7 @@ pub fn sendClose(self: *ServerHandshake, out: []u8) Error![]const u8 {
 
 /// §4.6.1: derive the PSK a ticket nonce will stand for. Separate from
 /// sending, because a stateless embedder needs the PSK *before* the
-/// ticket that seals it exists — zoxy's `Tickets.seal` order.
+/// ticket that seals it exists — zgix's `Tickets.seal` order.
 pub fn resumptionPsk(
     self: *const ServerHandshake,
     ticket_nonce: []const u8,

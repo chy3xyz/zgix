@@ -8,7 +8,7 @@ anywhere. CLAUDE.md says the same thing in one line, and this file is
 where the recipes live so a regenerated fixture matches the one it
 replaces.
 
-`cert.pem` / `key.pem` are shared with zoxy's `src/tls/testdata/` — the
+`cert.pem` / `key.pem` are shared with zgix's `src/tls/testdata/` — the
 same pair, kept in step by hand. The rest are zssl's own.
 
 | File | What it is | Who needs it |
@@ -19,31 +19,31 @@ same pair, kept in step by hand. The rest are zssl's own.
 | `rsa1024-key.pem` | RSA-1024 key, no certificate | proving `rsa_bits_min` is a load-time refusal |
 | `rsa512-leaf.der` | RSA-512 leaf, DER | proving the client refuses a modulus below the floor |
 
-Subject and SAN are `spike.zoxy.test` throughout, because the interop
-gate passes `-servername spike.zoxy.test` and openssl's X.509 verifies
+Subject and SAN are `spike.zgix.test` throughout, because the interop
+gate passes `-servername spike.zgix.test` and openssl's X.509 verifies
 the name.
 
 ## Regenerating
 
 ```sh
-# P-256 — keep zoxy's copy in step.
+# P-256 — keep zgix's copy in step.
 openssl ecparam -name prime256v1 -genkey -noout -out key.pem
-openssl req -new -x509 -key key.pem -subj "/CN=spike.zoxy.test" \
-  -addext "subjectAltName=DNS:spike.zoxy.test" -days 3650 -out cert.pem
+openssl req -new -x509 -key key.pem -subj "/CN=spike.zgix.test" \
+  -addext "subjectAltName=DNS:spike.zgix.test" -days 3650 -out cert.pem
 
 # P-384. -sha384 is not decoration: the self-signature should be the
 # digest the curve names, so the fixture does not quietly depend on
 # openssl's default.
 openssl ecparam -name secp384r1 -genkey -noout -out p384-key.pem
-openssl req -new -x509 -key p384-key.pem -subj "/CN=spike.zoxy.test" \
-  -addext "subjectAltName=DNS:spike.zoxy.test" -days 3650 -sha384 \
+openssl req -new -x509 -key p384-key.pem -subj "/CN=spike.zgix.test" \
+  -addext "subjectAltName=DNS:spike.zgix.test" -days 3650 -sha384 \
   -out p384-cert.pem
 
 # RSA-2048.
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
   -out rsa2048-key.pem
-openssl req -new -x509 -key rsa2048-key.pem -subj "/CN=spike.zoxy.test" \
-  -addext "subjectAltName=DNS:spike.zoxy.test" -days 3650 \
+openssl req -new -x509 -key rsa2048-key.pem -subj "/CN=spike.zgix.test" \
+  -addext "subjectAltName=DNS:spike.zgix.test" -days 3650 \
   -out rsa2048-cert.pem
 ```
 

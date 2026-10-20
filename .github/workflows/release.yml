@@ -23,7 +23,7 @@ jobs:
   # One runner per target, natively.
   #
   # These used to cross-compile from a single Linux runner, which stopped
-  # working the moment zoxy gained a C dependency: `linkSystemLibrary("crypto")`
+  # working the moment zgix gained a C dependency: `linkSystemLibrary("crypto")`
   # resolves libcrypto out of the *host's* nix store, so every target but the
   # host's own architecture fails to link ("libcrypto.so is incompatible with
   # aarch64linux"). It failed on the 0.2.0 tag, after TLS termination (#125)
@@ -138,8 +138,8 @@ jobs:
           # describe` fallback: this checkout is shallow and carries no
           # tags, so describe would fall back to a bare commit SHA and
           # stamp every release binary with one. Handing it the tag makes
-          # the identifier equal the version, which `zoxy --version`
-          # recognises and omits — a release says `zoxy 0.0.7` and
+          # the identifier equal the version, which `zgix --version`
+          # recognises and omits — a release says `zgix 0.0.7` and
           # nothing else, whatever the checkout depth happens to be.
           # No PKG_CONFIG_PATH: libcrypto is a Zig-built artifact linked
           # statically for the target on every build, so pkg-config decides
@@ -158,7 +158,7 @@ jobs:
           # Nothing from the build machine may follow the binary out.
           #
           # This is the check the 0.2.0 tag needed and did not have. TLS
-          # termination gave zoxy a C dependency, `linkSystemLibrary`
+          # termination gave zgix a C dependency, `linkSystemLibrary`
           # links it shared, and the Linux artifact silently became one
           # that wants a musl loader and a musl-ABI libcrypto.so.3 at
           # runtime — unrunnable on a stock box, and indistinguishable
@@ -169,15 +169,15 @@ jobs:
           # discovered by whoever downloads it.
           case "${{ runner.os }}" in
             Linux)
-              if readelf -d ./out/bin/zoxy 2>/dev/null | grep -q NEEDED; then
-                echo "::error::not static:"; readelf -d ./out/bin/zoxy | grep NEEDED
+              if readelf -d ./out/bin/zgix 2>/dev/null | grep -q NEEDED; then
+                echo "::error::not static:"; readelf -d ./out/bin/zgix | grep NEEDED
                 exit 1
               fi
               ;;
             macOS)
-              if otool -L ./out/bin/zoxy | grep -q /nix/store; then
+              if otool -L ./out/bin/zgix | grep -q /nix/store; then
                 echo "::error::links the build machine's nix store:"
-                otool -L ./out/bin/zoxy | grep /nix/store
+                otool -L ./out/bin/zgix | grep /nix/store
                 exit 1
               fi
               ;;
@@ -187,7 +187,7 @@ jobs:
           # the version being released. A release that reports the wrong
           # version is the failure the bump-before-tag rule exists to
           # prevent; this is where it shows.
-          reported="$(./out/bin/zoxy --version)"
+          reported="$(./out/bin/zgix --version)"
           echo "built: $reported"
           case "$reported" in
             *"$version"*) ;;
@@ -208,13 +208,13 @@ jobs:
           #
           # Before packaging rather than after, so a binary that cannot serve
           # never becomes a tarball.
-          bash scripts/release-tls-check.sh ./out/bin/zoxy
+          bash scripts/release-tls-check.sh ./out/bin/zgix
 
-          tar czf "dist/zoxy-$version-${{ matrix.label }}.tar.gz" -C out/bin zoxy
+          tar czf "dist/zgix-$version-${{ matrix.label }}.tar.gz" -C out/bin zgix
 
       - uses: actions/upload-artifact@v4
         with:
-          name: zoxy-${{ matrix.label }}
+          name: zgix-${{ matrix.label }}
           path: dist/*.tar.gz
           if-no-files-found: error
 
@@ -291,7 +291,7 @@ jobs:
           # `fail-fast: false` above means a single broken target no longer
           # cancels the others into looking like they were never tried.
           for label in x86_64-linux aarch64-linux x86_64-macos aarch64-macos; do
-            test -f "dist/zoxy-$version-$label.tar.gz" \
+            test -f "dist/zgix-$version-$label.tar.gz" \
               || { echo "::error::missing artifact for $label"; exit 1; }
           done
 
@@ -300,7 +300,7 @@ jobs:
           # committed; shipping it here as an asset keeps a single source of
           # truth.
           devenv shell -- zig build schema
-          cp zig-out/config.schema.json "dist/zoxy-$version-config.schema.json"
+          cp zig-out/config.schema.json "dist/zgix-$version-config.schema.json"
 
           ( cd dist && sha256sum * > SHA256SUMS.txt )
           ls -la dist
@@ -353,12 +353,12 @@ jobs:
           version="${{ steps.ver.outputs.version }}"
           gh release view "$tag" --json assets --jq '.assets[].name' | tee assets.txt
           for label in x86_64-linux aarch64-linux x86_64-macos aarch64-macos; do
-            grep -qx "zoxy-$version-$label.tar.gz" assets.txt \
+            grep -qx "zgix-$version-$label.tar.gz" assets.txt \
               || { echo "::error::$tag is missing the $label archive"; exit 1; }
           done
           grep -qx 'SHA256SUMS.txt' assets.txt \
             || { echo "::error::$tag has no SHA256SUMS.txt"; exit 1; }
-          grep -qx "zoxy-$version-config.schema.json" assets.txt \
+          grep -qx "zgix-$version-config.schema.json" assets.txt \
             || { echo "::error::$tag has no config schema"; exit 1; }
           echo "$tag published complete"
 
@@ -371,10 +371,10 @@ jobs:
           version="${{ steps.ver.outputs.version }}"
           tag="${{ steps.ver.outputs.tag }}"
 
-          sha_aarch64_macos=$(grep "zoxy-$version-aarch64-macos.tar.gz" dist/SHA256SUMS.txt | awk '{print $1}')
-          sha_x86_64_macos=$(grep  "zoxy-$version-x86_64-macos.tar.gz"  dist/SHA256SUMS.txt | awk '{print $1}')
-          sha_aarch64_linux=$(grep "zoxy-$version-aarch64-linux.tar.gz" dist/SHA256SUMS.txt | awk '{print $1}')
-          sha_x86_64_linux=$(grep  "zoxy-$version-x86_64-linux.tar.gz"  dist/SHA256SUMS.txt | awk '{print $1}')
+          sha_aarch64_macos=$(grep "zgix-$version-aarch64-macos.tar.gz" dist/SHA256SUMS.txt | awk '{print $1}')
+          sha_x86_64_macos=$(grep  "zgix-$version-x86_64-macos.tar.gz"  dist/SHA256SUMS.txt | awk '{print $1}')
+          sha_aarch64_linux=$(grep "zgix-$version-aarch64-linux.tar.gz" dist/SHA256SUMS.txt | awk '{print $1}')
+          sha_x86_64_linux=$(grep  "zgix-$version-x86_64-linux.tar.gz"  dist/SHA256SUMS.txt | awk '{print $1}')
 
           mkdir -p ~/.ssh
           echo "$HOMEBREW_TAP_DEPLOY_KEY" > ~/.ssh/deploy_key
@@ -385,14 +385,14 @@ jobs:
           git clone git@github.com:zoxy-io/homebrew-tap.git
           cd homebrew-tap
 
-          cat > Formula/zoxy.rb << FORMULA
-          class Zoxy < Formula
+          cat > Formula/zgix.rb << FORMULA
+          class Zgix < Formula
             desc "Zero-allocation L4/L7 edge proxy in Zig"
-            homepage "https://zoxy.io/"
+            homepage "https://zgix.click/"
             license "MIT"
 
             livecheck do
-              url "https://github.com/zoxy-io/zoxy"
+              url "https://github.com/chy3xyz/zgix"
               strategy :github_latest
             end
 
@@ -403,32 +403,32 @@ jobs:
             # cannot run, which is the failure worth having.
             on_macos do
               on_arm do
-                url "https://github.com/zoxy-io/zoxy/releases/download/$tag/zoxy-$version-aarch64-macos.tar.gz"
+                url "https://github.com/chy3xyz/zgix/releases/download/$tag/zgix-$version-aarch64-macos.tar.gz"
                 sha256 "$sha_aarch64_macos"
               end
               on_intel do
-                url "https://github.com/zoxy-io/zoxy/releases/download/$tag/zoxy-$version-x86_64-macos.tar.gz"
+                url "https://github.com/chy3xyz/zgix/releases/download/$tag/zgix-$version-x86_64-macos.tar.gz"
                 sha256 "$sha_x86_64_macos"
               end
             end
 
             on_linux do
               on_arm do
-                url "https://github.com/zoxy-io/zoxy/releases/download/$tag/zoxy-$version-aarch64-linux.tar.gz"
+                url "https://github.com/chy3xyz/zgix/releases/download/$tag/zgix-$version-aarch64-linux.tar.gz"
                 sha256 "$sha_aarch64_linux"
               end
               on_intel do
-                url "https://github.com/zoxy-io/zoxy/releases/download/$tag/zoxy-$version-x86_64-linux.tar.gz"
+                url "https://github.com/chy3xyz/zgix/releases/download/$tag/zgix-$version-x86_64-linux.tar.gz"
                 sha256 "$sha_x86_64_linux"
               end
             end
 
             def install
-              bin.install "zoxy"
+              bin.install "zgix"
             end
 
             test do
-              output = shell_output("#{bin}/zoxy #{testpath}/missing.json 2>&1", 1)
+              output = shell_output("#{bin}/zgix #{testpath}/missing.json 2>&1", 1)
               assert_match "cannot read config", output
             end
           end
@@ -436,12 +436,12 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -am "zoxy: update to $version"
+          git commit -am "zgix: update to $version"
           git push
 
-      # zoxy.io's /config page is generated from this release: the config JSON
+      # zgix.click's /config page is generated from this release: the config JSON
       # Schema asset published above, config/example.json at this tag, and the
-      # tarball sizes. Tell the site to pull them — it documents the zoxy people
+      # tarball sizes. Tell the site to pull them — it documents the zgix people
       # can install, so a release is the only event that changes the page.
       # SITE_DISPATCH_TOKEN is a fine-grained PAT with contents:write on
       # zoxy-io/site (its refresh-config.yml commits the refreshed files).
@@ -462,7 +462,7 @@ jobs:
           # is a nested object, and this leaves no question about how the key is
           # parsed or the tag typed
           jq -n --arg tag "$TAG" \
-            '{event_type: "zoxy-release", client_payload: {tag: $tag}}' |
+            '{event_type: "zgix-release", client_payload: {tag: $tag}}' |
             gh api repos/zoxy-io/site/dispatches --input -
 
       - name: Dry run summary

@@ -260,7 +260,7 @@ fn fuzzClientMachine(input: []const u8) !void {
     var client = ClientHandshake.init(&.{
         .client_random = @splat(0x1a),
         .x25519_private = @splat(0x31),
-        .server_name = "spike.zoxy.test",
+        .server_name = "spike.zgix.test",
         .alpn_protocols = &.{"http/1.1"},
         .certificate_policy = .leaf_signature,
         .reassembly = &reassembly,

@@ -7,14 +7,14 @@
 
 const std = @import("std");
 
-const zoxy = @import("zoxy");
+const zgix = @import("zgix");
 
 const Harness = @import("Harness.zig");
 
 const assert = std.debug.assert;
 
-const Counters = zoxy.counters.Counters;
-const SimIo = zoxy.Io.SimIo;
+const Counters = zgix.counters.Counters;
+const SimIo = zgix.Io.SimIo;
 
 /// The seed `checkSeed` is currently running, for the panic handler
 /// below. A plain global because that is what a panic handler can read:

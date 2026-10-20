@@ -38,10 +38,10 @@ const Io = std.Io;
 
 const assert = std.debug.assert;
 
-const work_directory = ".zig-cache/zoxy-smoke";
-const config_path = work_directory ++ "/zoxy.json";
+const work_directory = ".zig-cache/zgix-smoke";
+const config_path = work_directory ++ "/zgix.json";
 const access_log_path = work_directory ++ "/access.log";
-const zoxy_log_path = work_directory ++ "/zoxy.log";
+const zgix_log_path = work_directory ++ "/zgix.log";
 /// #311's leg runs a second proxy of its own, so it needs its own config
 /// and its own output: the point of that leg is a process that *dies*,
 /// and it must not be the one every other verdict here is reading.
@@ -128,7 +128,7 @@ const logged_origin_tag = "\"response_headers\":{\"" ++
     lowerAscii(origin_module.tag_header) ++ "\":\"" ++
     origin_module.tag_value ++ "\"}";
 
-/// Lowercase a comptime header name — the spelling zoxy logs a named
+/// Lowercase a comptime header name — the spelling zgix logs a named
 /// header under, whatever the config wrote.
 fn lowerAscii(comptime name: []const u8) *const [name.len]u8 {
     comptime {
@@ -155,7 +155,7 @@ const keep_alive_connections: u8 = 4;
 const requests_per_connection: u32 = 16;
 
 /// Requests per pass for the origin's bulk target, which arrives as one
-/// delivery large enough to overrun zoxy's head buffer — the §7 path
+/// delivery large enough to overrun zgix's head buffer — the §7 path
 /// where a response's coalesced body excess leaves in a second write
 /// (`l7_response_excess_sent`). The simulator's census exempts that
 /// counter for want of exactly this delivery.
@@ -168,7 +168,7 @@ const large_requests: u32 = 4;
 /// chunked POST, both echoed byte-for-byte. Nothing else in the tree
 /// covers `cluster.tls` end to end: the directed tests drive the client
 /// in isolation and the terminated-listener leg below only exercises
-/// zoxy as a TLS *server*.
+/// zgix as a TLS *server*.
 const upstream_tls_requests: u32 = 4;
 /// The one client connection those four exchanges ride. It is a
 /// data-listener accept like every other, so it enters
@@ -206,7 +206,7 @@ const tunnel_access_lines: u32 = 2;
 
 /// The load runs twice over the same connections, with the process's
 /// resident set read between the passes. The first pass is what makes the
-/// second measurable: zoxy's pools are lazily resident, so an unwarmed
+/// second measurable: zgix's pools are lazily resident, so an unwarmed
 /// reading would climb for reasons that are not allocation. Two identical
 /// passes mean any growth between the readings is work the second pass
 /// did that the first did not, which — under §5's zero-allocation-after-
@@ -280,14 +280,14 @@ const access_log_lines_expected: u32 = http_exchanges + sticky_exchanges +
 /// this size, which is the only thing it is looking for.
 const rss_growth_kb_max: u64 = 64;
 
-/// Every connection zoxy's data listeners accept in one run: the load's
+/// Every connection zgix's data listeners accept in one run: the load's
 /// own, plus the readiness probe that connects and asks nothing. Admin
 /// scrapes are not among them — the admin plane sits outside the
 /// accepted/admitted/shed accounting entirely (§8), which is what lets
 /// this be an equality rather than a floor.
 ///
 /// It is an equality on *ports the kernel just handed out*, so a stranger
-/// connecting to one between `reservePorts` and zoxy's bind would fail
+/// connecting to one between `reservePorts` and zgix's bind would fail
 /// the run. That window is microseconds wide on a port nothing advertises,
 /// and the alternative — a floor — is satisfied by a proxy accepting
 /// connections nobody made.
@@ -336,12 +336,12 @@ const drain_deadline_ms: u32 = 300;
 ///
 /// Eight seconds, well above anything this run legitimately pauses for
 /// and well under the harness's own wedge deadline. A tighter number
-/// would be measuring the runner's scheduler rather than zoxy: the
+/// would be measuring the runner's scheduler rather than zgix: the
 /// positive leg (`loopWatchdogPassed`) takes the floor instead, on a
 /// process it stops on purpose.
 const loop_watchdog_ms: u32 = 8_000;
 
-/// zoxy's pools, shrunk from the lean defaults (§5). Nothing here is a
+/// zgix's pools, shrunk from the lean defaults (§5). Nothing here is a
 /// scenario — the load is a handful of connections — so the smallest
 /// config that serves it starts fastest and keeps the process's resident
 /// set a number a human can read at a glance.
@@ -351,7 +351,7 @@ const loop_watchdog_ms: u32 = 8_000;
 /// magnitude more than a conn slot, so the default (one per slot) would
 /// price 32 sessions for a leg that opens one, and the §5 banner this
 /// gate prints would stop being a number a reader can sanity-check.
-const zoxy_limits = .{
+const zgix_limits = .{
     .conn_slots = 32,
     .relay_buffers = 16,
     .upstream_slots = 16,
@@ -361,14 +361,14 @@ const zoxy_limits = .{
     .tunnels = 2,
 };
 
-/// The head buffer zoxy binds for this run — `limits.head_buffer_bytes`
+/// The head buffer zgix binds for this run — `limits.head_buffer_bytes`
 /// is not set, so this is `constants.head_buffer_bytes_default`, spelled
 /// again rather than imported. Duplicating it is safe *here* in a way it
 /// would not be elsewhere: the only thing that reads it is the
 /// bulk-response premise below, and a default that moved past the bulk
 /// body would fail this gate's excess equality outright rather than
 /// quietly stop exercising the branch.
-const zoxy_head_buffer_bytes: u32 = 8 * 1024;
+const zgix_head_buffer_bytes: u32 = 8 * 1024;
 
 comptime {
     assert(keep_alive_connections >= 2);
@@ -381,7 +381,7 @@ comptime {
     assert(large_requests >= 1);
     // The bulk response's premise: its body has to overrun the head
     // buffer, or the excess the gate counts never exists (§7).
-    assert(origin_module.large_body_bytes > zoxy_head_buffer_bytes);
+    assert(origin_module.large_body_bytes > zgix_head_buffer_bytes);
     assert(connections_closed_early >= 1);
     assert(connections_closed_early < keep_alive_connections);
     assert(l4_connections >= 1);
@@ -389,19 +389,19 @@ comptime {
     // cover the peak with room for the wake-up connections `stop` sends.
     assert(origin_connections_peak < origin_module.serve_tasks);
     // Every client connection needs a slot and a relay buffer at once.
-    assert(zoxy_limits.relay_buffers >= keep_alive_connections + l4_connections);
-    assert(zoxy_limits.conn_slots >= zoxy_limits.relay_buffers);
+    assert(zgix_limits.relay_buffers >= keep_alive_connections + l4_connections);
+    assert(zgix_limits.conn_slots >= zgix_limits.relay_buffers);
     // And every connection this run opens must be admitted rather than
     // shed, or `accepted == connections_expected` would be measuring the
     // conn wall instead of the load.
-    assert(zoxy_limits.conn_slots >= connections_expected);
+    assert(zgix_limits.conn_slots >= connections_expected);
     // Same rule for the engine pool, which is its own admission rung
     // (§8): the https leg must be admitted rather than shed, or its
     // counter verdicts would be measuring the wall. The hop reuses one
     // parked TLS session across its four exchanges, so it does not stack
     // against this bound; the one below still covers the direct leg with
     // an engine to spare.
-    assert(zoxy_limits.tls_engines >= tls_connections);
+    assert(zgix_limits.tls_engines >= tls_connections);
     // Every exchange this leg makes has to be one the line arithmetic
     // below can name; the four shapes are fixed by the leg's body.
     assert(upstream_tls_requests == 4);
@@ -466,11 +466,11 @@ const loop_watchdog_leg_ms: u32 = 2_000;
 const loop_watchdog_stall_ns: u64 =
     (@as(u64, loop_watchdog_leg_ms) + 1_500) * std.time.ns_per_ms;
 
-/// What zoxy exits with when its serving watchdog fires (#311, §8), and
+/// What zgix exits with when its serving watchdog fires (#311, §8), and
 /// what this leg is really asserting: 4 is a drain that could not finish,
 /// 5 is a loop that stopped answering during one, 6 is a loop that
 /// stopped answering while serving. Spelled out here rather than imported
-/// because this harness links no zoxy at all (§9) — it runs the real
+/// because this harness links no zgix at all (§9) — it runs the real
 /// binary and reads what a supervisor would.
 const loop_watchdog_exit_code: u8 = 6;
 
@@ -488,7 +488,7 @@ var clients: [keep_alive_connections]client_module.Client = @splat(.{});
 /// is closed before the next is opened, and `connect` asserts it.
 var single_client: client_module.Client = .{};
 
-/// The proxy the watchdog kills if it fires, published by `spawnZoxy`.
+/// The proxy the watchdog kills if it fires, published by `spawnZgix`.
 /// Zero until then — the watchdog can outlive the spawn failing.
 var watchdog_child_pid = std.atomic.Value(i32).init(0);
 
@@ -561,17 +561,17 @@ fn enterStage(stage: Stage) void {
 }
 
 const Flags = struct {
-    zoxy_path: []const u8 = "zig-out/bin/zoxy",
+    zgix_path: []const u8 = "zig-out/bin/zgix",
 };
 
-/// The ports zoxy is told to bind. Kernel-assigned rather than fixed: a
+/// The ports zgix is told to bind. Kernel-assigned rather than fixed: a
 /// per-change gate must not fail because a developer's other terminal is
 /// already on 18080.
 const Ports = struct {
     http: u16,
     l4: u16,
     admin: u16,
-    /// The terminating TLS listener — zoxy as a TLS server, and the
+    /// The terminating TLS listener — zgix as a TLS server, and the
     /// upstream endpoint of the hop's cluster.
     tls: u16,
     /// A plaintext listener whose cluster dials `tls` over TLS: the
@@ -593,12 +593,12 @@ pub fn main(init: std.process.Init) !u8 {
 
     // A setup failure — a refused scrape, a proxy that never listened —
     // is reported the same way a failed verdict is, because to whoever is
-    // reading a red gate they are the same question: what did zoxy do?
+    // reading a red gate they are the same question: what did zgix do?
     // Answering it with a bare error trace and no log would be the one
     // reply that helps least.
     return run(arena, io, &flags) catch |err| {
         std.debug.print("FAIL: the smoke run could not finish ({t})\n", .{err});
-        printZoxyLog(io);
+        printZgixLog(io);
         return 1;
     };
 }
@@ -608,7 +608,7 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     try prepareWorkDirectory(io);
     try origin.start(io, origin_connections_peak);
     // Ordered against the child's own teardown below: defers unwind
-    // last-declared-first, so zoxy is always gone before this runs — which
+    // last-declared-first, so zgix is always gone before this runs — which
     // is what releases the origin tasks parked in `read` on its upstream
     // connections.
     defer origin.stop();
@@ -618,8 +618,8 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     // Before the spawn, because that ordering is the claim: the config
     // `--check` just passed is the one this run then serves.
     enterStage(.pre_flight);
-    const check_ok = try checkPassed(arena, io, flags.zoxy_path);
-    var child = try spawnZoxy(io, flags.zoxy_path);
+    const check_ok = try checkPassed(arena, io, flags.zgix_path);
+    var child = try spawnZgix(io, flags.zgix_path);
     var running = true;
     defer if (running) child.kill(io);
 
@@ -659,7 +659,7 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     // after every leg that needs the main child alive, and before the
     // drain that ends it.
     enterStage(.watchdog_leg);
-    const watchdog_ok = try loopWatchdogPassed(arena, io, flags.zoxy_path);
+    const watchdog_ok = try loopWatchdogPassed(arena, io, flags.zgix_path);
 
     enterStage(.drain);
     const drained_cleanly = try drain(io, &child, &running);
@@ -689,7 +689,7 @@ fn report(
 ) u8 {
     assert(lines.http_ok <= lines.http);
     if (!passed) {
-        printZoxyLog(io);
+        printZgixLog(io);
         return 1;
     }
     var memory_buffer: [64]u8 = undefined;
@@ -752,7 +752,7 @@ fn watchdogTask(io: Io) void {
         );
     }
     endWedgedProxy(io);
-    printZoxyLog(io);
+    printZgixLog(io);
     std.process.exit(3);
 }
 
@@ -943,7 +943,7 @@ fn loggedHeadersPassed(lines: *const LogCounts) bool {
 
 fn drainPassed(drained_cleanly: bool) bool {
     if (drained_cleanly) return true;
-    std.debug.print("FAIL: zoxy did not drain cleanly on SIGTERM\n", .{});
+    std.debug.print("FAIL: zgix did not drain cleanly on SIGTERM\n", .{});
     return false;
 }
 
@@ -1221,7 +1221,7 @@ fn runLoad(
         try client.connect(io, ports.http);
     }
     try runPass(io, ports.http, host, 0);
-    // Read between the passes, not before the first: zoxy's pools are
+    // Read between the passes, not before the first: zgix's pools are
     // lazily resident (§5), so a reading taken before any traffic would
     // climb for reasons that are not allocation.
     const before_kb = try readRssKb(arena, io, pid);
@@ -1263,7 +1263,7 @@ fn runPass(io: Io, port: u16, host: []const u8, pass: u32) !void {
     // The bulk requests announce close, on their own connections because
     // that is what announcing close means. Both halves are load-bearing:
     // the delivery fills the head buffer, and the injected
-    // `Connection: close` is what makes zoxy's rendered head longer than
+    // `Connection: close` is what makes zgix's rendered head longer than
     // the origin's — without which the excess fits beside it exactly and
     // the branch never runs (§7).
     var large: u32 = 0;
@@ -1330,11 +1330,11 @@ fn expectResponse(response: client_module.Response, body_bytes: u32, leg: Leg) !
     // presence means the relay stopped being a relay.
     switch (leg) {
         .http => if (!response.edited) {
-            std.debug.print("smoke: http response carried no X-Zoxy-Smoke stamp\n", .{});
+            std.debug.print("smoke: http response carried no X-Zgix-Smoke stamp\n", .{});
             return error.ResponseEditMissing;
         },
         .l4 => if (response.edited) {
-            std.debug.print("smoke: l4-relayed response gained the X-Zoxy-Smoke stamp\n", .{});
+            std.debug.print("smoke: l4-relayed response gained the X-Zgix-Smoke stamp\n", .{});
             return error.ResponseEditForged;
         },
     }
@@ -1369,7 +1369,7 @@ fn stickyPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
 
     // The echo: followed, and no re-stamp — idempotence on the wire.
     var cookie_buffer: [64]u8 = undefined;
-    const echo = try std.fmt.bufPrint(&cookie_buffer, "zoxy-smoke-srv={s}", .{&tag});
+    const echo = try std.fmt.bufPrint(&cookie_buffer, "zgix-smoke-srv={s}", .{&tag});
     const followed = try single_client.get(host, "/sticky", .keep_alive, echo);
     try expectStickyResponse(followed, "followed", false);
 
@@ -1380,7 +1380,7 @@ fn stickyPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         host,
         "/sticky",
         .close,
-        "zoxy-smoke-srv=ffffffffffffffff",
+        "zgix-smoke-srv=ffffffffffffffff",
     );
     try expectStickyResponse(repicked, "repicked", true);
     if (!std.mem.eql(u8, &repicked.sticky_tag.?, &tag)) {
@@ -1444,7 +1444,7 @@ fn bodiesPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
     var passed = expectBodyResponse(not_found, 404, not_found_body.len, "error page");
     if (!expectProxyDate(not_found, "error page")) passed = false;
 
-    // The respond action, off the file arm: the body zoxy read at
+    // The respond action, off the file arm: the body zgix read at
     // startup, byte count and all, on a request that never reached an
     // origin.
     const robots = try single_client.get(host, "/robots.txt", .close, null);
@@ -1552,7 +1552,7 @@ fn expectRefusedResponse(response: client_module.Response) bool {
     return passed;
 }
 
-/// The #234 stamp on a response zoxy answered itself, against this
+/// The #234 stamp on a response zgix answered itself, against this
 /// gate's own clock.
 ///
 /// The simulator proves the slot is patched and well-formed, but its
@@ -1728,7 +1728,7 @@ fn tunnelPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
 /// compared byte-for-byte, not by length, because a transform seam that
 /// loses or reorders bytes is exactly what a length-only check cannot
 /// see — and the bulk GET is the case where the origin's response
-/// crosses a TLS record boundary before zoxy forwards it.
+/// crosses a TLS record boundary before zgix forwards it.
 ///
 /// One keep-alive connection carries all four exchanges. Upstream TLS
 /// parks and reuses one session across the leg (Stage 1 now includes
@@ -1913,7 +1913,7 @@ fn expectUpstreamTlsResponse(
     }
     if (!response.edited) {
         std.debug.print(
-            "FAIL: the upstream-TLS {s} carried no X-Zoxy-Smoke stamp\n",
+            "FAIL: the upstream-TLS {s} carried no X-Zgix-Smoke stamp\n",
             .{role},
         );
         return false;
@@ -1933,7 +1933,7 @@ fn expectUpstreamTlsResponse(
 /// `close_notify` to end it — then the counters on the run's last scrape.
 ///
 /// The client is `std.crypto.tls`, an implementation that shares no code
-/// with the one zoxy terminates on. That is the whole point of running
+/// with the one zgix terminates on. That is the whole point of running
 /// this here: ztls agreeing with ztls proves interoperability with
 /// nobody, and the two things this tier can prove that no directed test
 /// can are that an outside implementation completes the handshake, and
@@ -2079,7 +2079,7 @@ fn expectStickyResponse(
     // The listener's #175 stamp applies to this leg like any other —
     // the two response-side mechanisms must coexist on one head.
     if (!response.edited) {
-        std.debug.print("smoke: sticky {s} response carried no X-Zoxy-Smoke stamp\n", .{role});
+        std.debug.print("smoke: sticky {s} response carried no X-Zgix-Smoke stamp\n", .{role});
         return error.ResponseEditMissing;
     }
     if (expect_tag and response.sticky_tag == null) {
@@ -2246,10 +2246,10 @@ fn readAccessLog(arena: std.mem.Allocator, io: Io, ports: *const Ports) !LogCoun
 /// A separate proxy with its own config, port and log, because the
 /// assertion is that it *dies* — running this against the main child
 /// would take every verdict after it.
-fn loopWatchdogPassed(arena: std.mem.Allocator, io: Io, zoxy_path: []const u8) !bool {
+fn loopWatchdogPassed(arena: std.mem.Allocator, io: Io, zgix_path: []const u8) !bool {
     const port = try reserveWatchdogPort(io);
     try writeWatchdogConfig(arena, io, port, origin.port);
-    var child = try spawnWatchdogZoxy(io, zoxy_path);
+    var child = try spawnWatchdogZgix(io, zgix_path);
     var running = true;
     // Every early return below leaves a stopped or dying process behind,
     // and an orphan holding a port is what the next run trips over.
@@ -2349,22 +2349,22 @@ const watchdog_config_template =
     \\}}
 ;
 
-/// `spawnZoxy` for the leg's own child: its own log, so the main proxy's
-/// output stays the thing `printZoxyLog` shows a failing run.
-fn spawnWatchdogZoxy(io: Io, zoxy_path: []const u8) !std.process.Child {
-    assert(zoxy_path.len >= 1);
+/// `spawnZgix` for the leg's own child: its own log, so the main proxy's
+/// output stays the thing `printZgixLog` shows a failing run.
+fn spawnWatchdogZgix(io: Io, zgix_path: []const u8) !std.process.Child {
+    assert(zgix_path.len >= 1);
     const log_file = try Io.Dir.cwd().createFile(io, watchdog_log_path, .{});
     defer log_file.close(io);
     return std.process.spawn(io, .{
-        .argv = &.{ zoxy_path, watchdog_config_path },
+        .argv = &.{ zgix_path, watchdog_config_path },
         .stdout = .{ .file = log_file },
         .stderr = .{ .file = log_file },
     });
 }
 
 /// Loopback ports the kernel is not using, held open together so it
-/// cannot hand out the same one twice, then released for zoxy to bind.
-/// There is a window between the release and zoxy's bind; nothing can
+/// cannot hand out the same one twice, then released for zgix to bind.
+/// There is a window between the release and zgix's bind; nothing can
 /// close it from out here, and it is far smaller than the collision a
 /// hard-coded set would carry on a shared runner.
 fn reservePorts(io: Io) !Ports {
@@ -2438,11 +2438,11 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         health_interval_ms,
         drain_deadline_ms,
         loop_watchdog_ms,
-        zoxy_limits.conn_slots,
-        zoxy_limits.relay_buffers,
-        zoxy_limits.upstream_slots,
-        zoxy_limits.tls_engines,
-        zoxy_limits.tunnels,
+        zgix_limits.conn_slots,
+        zgix_limits.relay_buffers,
+        zgix_limits.upstream_slots,
+        zgix_limits.tls_engines,
+        zgix_limits.tunnels,
     });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = config_json });
 }
@@ -2471,7 +2471,7 @@ const config_template =
     \\              {{ "match": {{ "path_prefix": "{s}" }}, "actions": [{{ "reject": 403 }}] }}
     \\          ],
     \\          "response_filters": [
-    \\              {{ "actions": [{{ "header_set": {{ "name": "X-Zoxy-Smoke", "value": "1" }} }}] }}
+    \\              {{ "actions": [{{ "header_set": {{ "name": "X-Zgix-Smoke", "value": "1" }} }}] }}
     \\          ] }} }},
     \\        {{ "bind": "127.0.0.1:{d}", "l4": {{ "cluster": "origin" }} }},
     \\        {{ "bind": "127.0.0.1:{d}",
@@ -2482,7 +2482,7 @@ const config_template =
     \\          "routes": [{{ "host": "127.0.0.1", "prefix": "/", "cluster": "upstream-tls" }}],
     \\          "upgrades": {{ "websocket": true }},
     \\          "response_filters": [
-    \\              {{ "actions": [{{ "header_set": {{ "name": "X-Zoxy-Smoke", "value": "1" }} }}] }}
+    \\              {{ "actions": [{{ "header_set": {{ "name": "X-Zgix-Smoke", "value": "1" }} }}] }}
     \\          ] }} }}
     \\    ],
     \\    "clusters": {{
@@ -2492,11 +2492,11 @@ const config_template =
     \\        }},
     \\        "sticky": {{
     \\            "endpoints": ["127.0.0.1:{d}"],
-    \\            "pick": {{ "policy": "hash", "key": "cookie", "name": "zoxy-smoke-srv" }}
+    \\            "pick": {{ "policy": "hash", "key": "cookie", "name": "zgix-smoke-srv" }}
     \\        }},
     \\        "upstream-tls": {{
     \\            "endpoints": ["127.0.0.1:{d}"],
-    \\            "tls": {{ "server_name": "spike.zoxy.test",
+    \\            "tls": {{ "server_name": "spike.zgix.test",
     \\                     "ca_file": "src/tls/testdata/cert.pem" }}
     \\        }}
     \\    }},
@@ -2535,7 +2535,7 @@ fn prepareWorkDirectory(io: Io) !void {
         error.FileNotFound => {},
         else => return err,
     };
-    // The #159 file arm's input, written before zoxy starts because it
+    // The #159 file arm's input, written before zgix starts because it
     // is read once at startup (parse-once, §1) — the one thing in this
     // config that comes off the filesystem rather than out of the JSON.
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = robots_path, .data = robots_body });
@@ -2572,10 +2572,10 @@ const CheckRun = struct {
 /// where the real binary then starts on the same file. The second pins
 /// the other half — that the mode refuses what the loader refuses, with
 /// the exit code a CI job branches on rather than a bare non-zero.
-fn checkPassed(arena: std.mem.Allocator, io: Io, zoxy_path: []const u8) !bool {
-    assert(zoxy_path.len >= 1);
-    const accepted = try runZoxyCheck(arena, io, zoxy_path, config_path);
-    const refused = try runZoxyCheck(arena, io, zoxy_path, invalid_config_path);
+fn checkPassed(arena: std.mem.Allocator, io: Io, zgix_path: []const u8) !bool {
+    assert(zgix_path.len >= 1);
+    const accepted = try runZgixCheck(arena, io, zgix_path, config_path);
+    const refused = try runZgixCheck(arena, io, zgix_path, invalid_config_path);
     var passed = true;
     if (accepted.exit_code != check_exit_ok) {
         std.debug.print(
@@ -2605,21 +2605,21 @@ fn checkPassed(arena: std.mem.Allocator, io: Io, zoxy_path: []const u8) !bool {
     return passed;
 }
 
-/// One `zoxy --check <config>`, with the two streams captured apart.
-fn runZoxyCheck(
+/// One `zgix --check <config>`, with the two streams captured apart.
+fn runZgixCheck(
     arena: std.mem.Allocator,
     io: Io,
-    zoxy_path: []const u8,
+    zgix_path: []const u8,
     config: []const u8,
 ) !CheckRun {
-    assert(zoxy_path.len >= 1);
+    assert(zgix_path.len >= 1);
     assert(config.len >= 1);
     const out_file = try Io.Dir.cwd().createFile(io, check_stdout_path, .{});
     defer out_file.close(io);
     const log_file = try Io.Dir.cwd().createFile(io, check_log_path, .{});
     defer log_file.close(io);
     var child = try std.process.spawn(io, .{
-        .argv = &.{ zoxy_path, "--check", config },
+        .argv = &.{ zgix_path, "--check", config },
         .stdout = .{ .file = out_file },
         .stderr = .{ .file = log_file },
     });
@@ -2641,22 +2641,22 @@ fn runZoxyCheck(
     };
 }
 
-/// zoxy's own output goes to a file rather than this process's stderr:
+/// zgix's own output goes to a file rather than this process's stderr:
 /// the banner and the drain-time counter dump are a hundred lines of
 /// post-mortem that a green per-change gate should not print. A red one
-/// prints its tail (`printZoxyLog`).
-fn spawnZoxy(io: Io, zoxy_path: []const u8) !std.process.Child {
-    assert(zoxy_path.len >= 1);
-    const log_file = try Io.Dir.cwd().createFile(io, zoxy_log_path, .{});
+/// prints its tail (`printZgixLog`).
+fn spawnZgix(io: Io, zgix_path: []const u8) !std.process.Child {
+    assert(zgix_path.len >= 1);
+    const log_file = try Io.Dir.cwd().createFile(io, zgix_log_path, .{});
     defer log_file.close(io);
     const child = std.process.spawn(io, .{
-        .argv = &.{ zoxy_path, config_path },
+        .argv = &.{ zgix_path, config_path },
         .stdout = .{ .file = log_file },
         .stderr = .{ .file = log_file },
     }) catch |err| {
         std.debug.print(
             "smoke: could not spawn {s} ({t}); run `zig build` first\n",
-            .{ zoxy_path, err },
+            .{ zgix_path, err },
         );
         return err;
     };
@@ -2690,40 +2690,40 @@ fn awaitListening(io: Io, port: u16) !void {
         return;
     }
     assert(attempt == attempts_max);
-    std.debug.print("smoke: zoxy never listened on port {d}\n", .{port});
-    printZoxyLog(io);
-    return error.ZoxyNeverListened;
+    std.debug.print("smoke: zgix never listened on port {d}\n", .{port});
+    printZgixLog(io);
+    return error.ZgixNeverListened;
 }
 
-/// The head of zoxy's captured output, for a failing run — the banner and
+/// The head of zgix's captured output, for a failing run — the banner and
 /// whatever it said before giving up. Best-effort: this runs when
 /// something has already gone wrong, so an unreadable log must not
 /// replace the failure that is being reported.
-fn printZoxyLog(io: Io) void {
+fn printZgixLog(io: Io) void {
     var buffer: [16 * 1024]u8 = undefined;
-    const file = Io.Dir.cwd().openFile(io, zoxy_log_path, .{}) catch return;
+    const file = Io.Dir.cwd().openFile(io, zgix_log_path, .{}) catch return;
     defer file.close(io);
     var read_buffer: [4096]u8 = undefined;
     var file_reader = file.reader(io, &read_buffer);
     const read = file_reader.interface.readSliceShort(&buffer) catch return;
     assert(read <= buffer.len);
     if (read == 0) return;
-    std.debug.print("-- {s} --\n{s}\n", .{ zoxy_log_path, buffer[0..read] });
+    std.debug.print("-- {s} --\n{s}\n", .{ zgix_log_path, buffer[0..read] });
 }
 
 fn parseFlags(args: []const [:0]const u8) !Flags {
     var flags: Flags = .{};
     var index: usize = 1;
     while (index < args.len) : (index += 1) {
-        if (std.mem.eql(u8, args[index], "--zoxy")) {
+        if (std.mem.eql(u8, args[index], "--zgix")) {
             index += 1;
             if (index == args.len) return error.InvalidArguments;
-            flags.zoxy_path = args[index];
+            flags.zgix_path = args[index];
         } else {
-            std.debug.print("usage: smoke [--zoxy path]\n", .{});
+            std.debug.print("usage: smoke [--zgix path]\n", .{});
             return error.InvalidArguments;
         }
     }
-    assert(flags.zoxy_path.len >= 1);
+    assert(flags.zgix_path.len >= 1);
     return flags;
 }

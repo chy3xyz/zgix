@@ -1,0 +1,648 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zgix panel</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --edge: #262d37; --fg: #d7dee7;
+    --dim: #7d8790; --ok: #4cc38a; --warn: #e5a13a; --bad: #ef5f67;
+    --accent: #58a6ff; --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 13px/1.5 var(--mono); display: flex; flex-direction: column;
+         min-height: 100vh; }
+  /* ── top bar ── */
+  header { display: flex; gap: 12px; align-items: center; padding: 10px 16px;
+           border-bottom: 1px solid var(--edge); background: var(--panel); }
+  header b { color: var(--accent); letter-spacing: 1px; }
+  header label { color: var(--dim); }
+  header input, header select { background: var(--bg); color: var(--fg);
+    border: 1px solid var(--edge); border-radius: 4px; padding: 3px 8px;
+    font: inherit; width: 210px; }
+  header select { width: auto; }
+  #dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); flex: none; }
+  #dot.ok { background: var(--ok); } #dot.err { background: var(--bad); }
+  #msg { color: var(--dim); margin-left: auto; }
+  /* ── body: sidebar + content ── */
+  .shell { display: flex; flex: 1; min-height: 0; }
+  nav { width: 150px; flex: none; border-right: 1px solid var(--edge);
+        background: var(--panel); padding: 12px 0; }
+  nav a { display: block; padding: 7px 16px; color: var(--dim); cursor: pointer;
+          border-left: 2px solid transparent; user-select: none; }
+  nav a:hover { color: var(--fg); }
+  nav a.on { color: var(--fg); border-left-color: var(--accent);
+             background: rgba(88,166,255,.06); }
+  nav a.soon { opacity: .35; cursor: not-allowed; }
+  main { padding: 16px 20px; flex: 1; max-width: 1060px; min-width: 0; }
+  h2 { font-size: 12px; color: var(--dim); text-transform: uppercase;
+       letter-spacing: 2px; margin: 22px 0 8px; border-left: 2px solid var(--accent);
+       padding-left: 8px; }
+  h2:first-child { margin-top: 0; }
+  /* hero summary strip */
+  .hero { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+          gap: 8px; margin-bottom: 4px; }
+  .hero .tile { background: linear-gradient(180deg, #1a212b, var(--panel));
+                border: 1px solid var(--edge); border-radius: 8px;
+                padding: 14px 14px 12px; }
+  .hero .k { color: var(--dim); font-size: 10px; text-transform: uppercase;
+             letter-spacing: 1.5px; }
+  .hero .v { font-size: 28px; margin-top: 4px; }
+  .hero .d { color: var(--dim); font-size: 11px; min-height: 14px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+           gap: 8px; }
+  .card { background: var(--panel); border: 1px solid var(--edge);
+          border-radius: 6px; padding: 10px 12px; }
+  .card .k { color: var(--dim); font-size: 11px; }
+  .card .v { font-size: 20px; margin-top: 2px; }
+  .card .d { color: var(--dim); font-size: 11px; min-height: 14px; }
+  .v.warn { color: var(--warn); } .v.bad { color: var(--bad); } .v.ok { color: var(--ok); }
+  table { width: 100%; border-collapse: collapse; background: var(--panel);
+          border: 1px solid var(--edge); border-radius: 6px; overflow: hidden; }
+  th, td { text-align: right; padding: 6px 12px; border-bottom: 1px solid var(--edge); }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--dim); font-weight: normal; font-size: 11px;
+       text-transform: uppercase; letter-spacing: 1px; }
+  tr:last-child td { border-bottom: none; }
+  .hdot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+          margin-right: 6px; background: var(--dim); }
+  .hdot.up { background: var(--ok); } .hdot.down { background: var(--bad); }
+  .dist { display: flex; height: 6px; border-radius: 3px; overflow: hidden;
+          background: var(--edge); margin: 4px 0 10px; }
+  .dist i { display: block; height: 100%; }
+  .rates { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+           gap: 8px; }
+  .rate { background: var(--panel); border: 1px solid var(--edge);
+          border-radius: 6px; padding: 10px 12px; }
+  .rate .k { color: var(--dim); font-size: 11px; }
+  .rate .v { font-size: 18px; margin: 2px 0 4px; }
+  .rate svg { width: 100%; height: 44px; display: block; }
+  /* compact verdict chips */
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .chip { background: var(--panel); border: 1px solid var(--edge); border-radius: 20px;
+          padding: 3px 12px; font-size: 11px; color: var(--dim); }
+  .chip b { color: var(--fg); font-weight: normal; margin-left: 6px; }
+  .chip b.ok { color: var(--ok); } .chip b.warn { color: var(--warn); } .chip b.bad { color: var(--bad); }
+  /* card hover, subtle */
+  .card:hover, .rate:hover, .site:hover, .hero .tile:hover { border-color: #3a4552; }
+
+  /* ── phones: sidebar becomes a fixed bottom navbar ── */
+  @media (max-width: 720px) {
+    header { padding: 8px 10px; gap: 8px; flex-wrap: wrap; }
+    header input { width: 150px; }
+    #msg { display: none; }
+    .shell { flex-direction: column; }
+    main { order: 1; padding: 12px 12px 64px; max-width: none; } /* room for the fixed bar */
+    nav { order: 2; position: fixed; bottom: 0; left: 0; right: 0; width: 100%;
+          display: flex; padding: 0; border-right: none; border-top: 1px solid var(--edge);
+          background: var(--panel); z-index: 2; }
+    nav a { flex: 1; text-align: center; padding: 10px 2px 12px; font-size: 12px;
+            border-left: none !important; border-top: 2px solid transparent; }
+    nav a.on { border-top-color: var(--accent); background: none; }
+    .hero .v { font-size: 22px; }
+    th, td { padding: 5px 8px; font-size: 12px; }
+    .twrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .twrap table { min-width: 560px; }
+  }
+  /* site / app cards */
+  .site { background: var(--panel); border: 1px solid var(--edge);
+          border-radius: 6px; margin-bottom: 10px; overflow: hidden; }
+  .site .head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+                padding: 10px 12px; border-bottom: 1px solid var(--edge); }
+  .site .name { color: var(--accent); font-weight: bold; }
+  .site .meta { color: var(--dim); font-size: 11px; }
+  .site table { border: none; border-radius: 0; }
+  .kind { font-size: 10px; padding: 1px 7px; border-radius: 8px; flex: none;
+          border: 1px solid var(--edge); color: var(--dim); }
+  .kind.h3 { color: var(--accent); border-color: var(--accent); }
+  .kind.l4 { color: var(--warn); border-color: var(--warn); }
+  .cbar { display: flex; height: 6px; border-radius: 3px; overflow: hidden;
+          flex: 1 1 120px; min-width: 120px; background: var(--edge); }
+  .cbar i { display: block; height: 100%; }
+  .lat { color: var(--dim); font-size: 11px; }
+  .lat b { color: var(--fg); font-weight: normal; }
+  .hint { color: var(--dim); background: var(--panel); border: 1px dashed var(--edge);
+          border-radius: 6px; padding: 14px; }
+  details { margin-top: 16px; }
+  summary { cursor: pointer; color: var(--dim); }
+  pre { background: var(--panel); border: 1px solid var(--edge); border-radius: 6px;
+        padding: 12px; overflow: auto; max-height: 400px; font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <b>ZGIX</b>
+  <span id="dot"></span>
+  <label>admin <input id="target" placeholder="http://127.0.0.1:9100"></label>
+  <label>every <select id="interval">
+    <option value="1000">1s</option><option value="2000" selected>2s</option>
+    <option value="5000">5s</option><option value="0">off</option>
+  </select></label>
+  <span id="msg"></span>
+</header>
+<div class="shell">
+  <nav id="nav">
+    <a data-v="overview" class="on">Overview</a>
+    <a data-v="sites">Sites</a>
+    <a data-v="apps">Apps</a>
+    <a data-v="certs" title="Certificate inventory (cert_info)">Certs</a>
+    <a data-v="logs" title="admin access-log ring">Logs</a>
+    <a data-v="about">About</a>
+  </nav>
+  <main id="content"></main>
+</div>
+
+<script type="module">
+import { createSignal, createEffect, onCleanup } from "./vendor/solid.js";
+
+// ---- DOM helpers ----------------------------------------------------------
+function h(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs ?? {}))
+    if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else if (k === "html") e.innerHTML = v;
+    else e.setAttribute(k, v);
+  e.append(...kids.flat());
+  return e;
+}
+const fmt = n => n >= 1e9 ? (n / 1e9).toFixed(1) + "G"
+              : n >= 1e6 ? (n / 1e6).toFixed(1) + "M"
+              : n >= 1e3 ? (n / 1e3).toFixed(1) + "k"
+              : String(n);
+const fmtMs = s => {
+  if (s == null) return "–";
+  const ms = s * 1000;
+  return ms < 0.1 ? Math.round(s * 1e6) + " µs" : ms.toFixed(1) + " ms";
+};
+
+// ---- state -----------------------------------------------------------------
+const [data, setData] = createSignal(null);
+const [prev, setPrev] = createSignal(null);
+const [err, setErr] = createSignal(null);
+const [at, setAt] = createSignal(null);
+const [view, setView] = createSignal("overview");
+const [rawText, setRaw] = createSignal("");
+
+const target = document.getElementById("target");
+target.value = localStorage.getItem("zgix-panel-target") ?? "http://127.0.0.1:9100";
+const intervalSel = document.getElementById("interval");
+
+const hist = { h3: [], l7: [], conns: [] };
+const HIST_MAX = 150;
+
+// nav
+document.getElementById("nav").addEventListener("click", e => {
+  const a = e.target.closest("a");
+  if (!a || a.classList.contains("soon")) return;
+  setView(a.dataset.v);
+});
+
+// ---- prometheus parsing -----------------------------------------------------
+function parse(text) {
+  const m = new Map();
+  let inLog = false;
+  const logs = [];
+  for (const line of text.split("\n")) {
+    if (!line) continue;
+    if (line.startsWith("#")) {
+      // `# zgix_access_log` opens the access-log tail section: every
+      // following `# {...}` line is one JSON access-log record.
+      if (line === "# zgix_access_log") { inLog = true; continue; }
+      if (inLog && line.startsWith("# ")) {
+        try { logs.push(JSON.parse(line.slice(2))); } catch {}
+      }
+      continue;
+    }
+    const mm = line.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+([0-9.eE+-]+)$/);
+    if (!mm) continue;
+    const labels = {};
+    if (mm[2]) for (const lm of mm[2].slice(1, -1).matchAll(/([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"/g))
+      labels[lm[1]] = lm[2];
+    const value = Number(mm[3]);
+    if (!m.has(mm[1])) m.set(mm[1], []);
+    m.get(mm[1]).push({ labels, value });
+  }
+  m.__logs = logs;
+  return m;
+}
+const sum = (m, name) => (m.get(name) ?? []).reduce((a, s) => a + s.value, 0);
+const rate = (m, p, name) => {
+  if (!p) return "";
+  const d = sum(m, name) - sum(p, name);
+  return d >= 0 ? "+" + fmt(d) + "/tick" : "";
+};
+function quantile(rows, q) {
+  const total = rows.length ? rows[rows.length - 1].cum : 0;
+  if (!total) return null;
+  const target = q * total;
+  let prevLe = 0, prevCum = 0;
+  for (const r of rows) {
+    if (r.le === Infinity) break;
+    if (r.cum >= target) {
+      const span = r.le - prevLe, count = r.cum - prevCum;
+      return count > 0 ? prevLe + span * (target - prevCum) / count : r.le;
+    }
+    prevLe = r.le; prevCum = r.cum;
+  }
+  return null;
+}
+function sparkline(points) {
+  const w = 220, hh = 44;
+  if (points.length < 2)
+    return `<svg viewBox="0 0 ${w} ${hh}" preserveAspectRatio="none"></svg>`;
+  const max = Math.max(...points, 1);
+  const step = w / (points.length - 1);
+  const pts = points.map((v, i) =>
+    `${(i * step).toFixed(1)},${(hh - 2 - (v / max) * (hh - 8)).toFixed(1)}`);
+  const line = pts.join(" ");
+  const area = `0,${hh} ` + line + ` ${w},${hh}`;
+  const last = points[points.length - 1];
+  return `<svg viewBox="0 0 ${w} ${hh}" preserveAspectRatio="none">` +
+    `<polygon points="${area}" fill="var(--accent)" opacity="0.10"/>` +
+    `<polyline points="${line}" fill="none" stroke="var(--accent)" stroke-width="1.5"/>` +
+    `<text x="${w - 4}" y="10" fill="var(--dim)" font-size="9" text-anchor="end">+${fmt(last)}/tick</text></svg>`;
+}
+
+// ---- shared aggregations ----------------------------------------------------
+function card(map, prevMap, name, key, cls = "") {
+  return h("div", { class: "card" },
+    h("div", { class: "k" }, key),
+    h("div", { class: "v " + cls }, fmt(sum(map, name))),
+    h("div", { class: "d" }, rate(map, prevMap, name)));
+}
+
+// per-cluster aggregation: latency percentiles + status classes + endpoints
+function aggregateClusters(m) {
+  const clusters = new Map();
+  const touch = n => { if (!clusters.has(n)) clusters.set(n, { classes: {}, sum_s: 0, count: 0, buckets: [] }); return clusters.get(n); };
+  for (const s of m.get("zgix_cluster_responses") ?? [])
+    touch(s.labels.cluster).classes[s.labels.class] = s.value;
+  for (const s of m.get("zgix_cluster_duration_seconds_sum") ?? [])
+    if (s.labels.cluster) touch(s.labels.cluster).sum_s = s.value;
+  for (const s of m.get("zgix_cluster_duration_seconds_count") ?? [])
+    if (s.labels.cluster) touch(s.labels.cluster).count = s.value;
+  for (const s of m.get("zgix_cluster_duration_seconds_bucket") ?? [])
+    if (s.labels.cluster) touch(s.labels.cluster).buckets.push(
+      { le: s.labels.le === "+Inf" ? Infinity : Number(s.labels.le), cum: s.value });
+  for (const c of clusters.values()) c.buckets.sort((a, b) => a.le - b.le);
+
+  const eps = new Map();
+  for (const [name, fam] of [["zgix_endpoint_healthy", "healthy"],
+      ["zgix_endpoint_responses", "responses"],
+      ["zgix_endpoint_connect_failed", "failed"],
+      ["zgix_endpoint_inflight", "inflight"]])
+    for (const s of m.get(name) ?? []) {
+      const key = (s.labels.cluster ?? "?") + "|" + (s.labels.endpoint ?? "?");
+      eps.set(key, { ...(eps.get(key) ?? {}), [fam]: s.value });
+    }
+  return { clusters, eps };
+}
+const classColors = { "1xx": "#8b949e", "2xx": "var(--ok)", "3xx": "var(--accent)",
+                      "4xx": "var(--warn)", "5xx": "var(--bad)" };
+function classBar(c, total) {
+  const bar = h("div", { class: "cbar" });
+  for (const cls of ["1xx", "2xx", "3xx", "4xx", "5xx"]) {
+    const v = c.classes[cls] ?? 0;
+    if (total > 0 && v > 0)
+      bar.append(h("i", { style: `width:${(v / total) * 100}%;background:${classColors[cls]}` }));
+  }
+  return bar;
+}
+function endpointTable(name, eps) {
+  const rows = [...eps.entries()].filter(([k]) => k.startsWith(name + "|"));
+  if (!rows.length) return h("div", { class: "lat", style: "padding:8px 12px" }, "no endpoint metrics");
+  return h("table", {},
+    h("tr", {}, h("th", {}, "endpoint"), h("th", {}, "health"),
+      h("th", {}, "responses"), h("th", {}, "connect failed"), h("th", {}, "inflight")),
+    ...rows.map(([k, r]) => {
+      const addr = k.split("|")[1];
+      const healthy = r.healthy;
+      return h("tr", {},
+        h("td", {}, addr),
+        h("td", {}, h("span", { class: "hdot " + (healthy === undefined ? "" : healthy ? "up" : "down") }),
+          healthy === undefined ? "–" : healthy ? "up" : "down"),
+        h("td", {}, fmt(r.responses ?? 0)),
+        h("td", { class: (r.failed ?? 0) > 0 ? "v bad" : "" }, fmt(r.failed ?? 0)),
+        h("td", {}, fmt(r.inflight ?? 0)));
+    }));
+}
+
+// ---- views -------------------------------------------------------------------
+function viewOverview(m, p) {
+  const box = h("div", {});
+
+  // hero summary strip
+  const h3req = sum(m, "zgix_h3_requests");
+  const l7 = sum(m, "zgix_l7_responses");
+  const errs = sum(m, "zgix_h3_bad_gateway") + sum(m, "zgix_h3_gateway_timeout") +
+               sum(m, "zgix_h3_no_route") + sum(m, "zgix_h3_shed_busy");
+  const eps = m.get("zgix_endpoint_healthy") ?? [];
+  const epsUp = eps.filter(s => s.value === 1).length;
+  const hero = h("div", { class: "hero" },
+    h("div", { class: "tile" }, h("div", { class: "k" }, "requests"),
+      h("div", { class: "v" }, fmt(h3req + l7)),
+      h("div", { class: "d" }, `h3 ${fmt(h3req)} · l7 ${fmt(l7)}`)),
+    h("div", { class: "tile" }, h("div", { class: "k" }, "errors"),
+      h("div", { class: "v " + (errs > 0 ? "bad" : "ok") }, fmt(errs)),
+      h("div", { class: "d" }, h3req > 0 ? ((errs / h3req) * 100).toFixed(1) + "% of h3" : "no h3 traffic")),
+    h("div", { class: "tile" }, h("div", { class: "k" }, "connections"),
+      h("div", { class: "v" }, fmt(sum(m, "zgix_conn_slots_in_use") + sum(m, "zgix_h3_connections"))),
+      h("div", { class: "d" }, `slots ${fmt(sum(m, "zgix_conn_slots_in_use"))} · h3 ${fmt(sum(m, "zgix_h3_connections"))}`)),
+    h("div", { class: "tile" }, h("div", { class: "k" }, "endpoints up"),
+      h("div", { class: "v " + (eps.length && epsUp < eps.length ? "warn" : "ok") }, `${epsUp}/${eps.length}`),
+      h("div", { class: "d" }, `connect failed ${fmt(sum(m, "zgix_endpoint_connect_failed"))}`)));
+  box.append(hero);
+
+  // rates
+  box.append(h("h2", {}, "Rates"));
+  const rates = h("div", { class: "rates" });
+  for (const [key, name, counter] of [
+    ["h3", "h3 requests", "zgix_h3_requests"],
+    ["l7", "l7 responses", "zgix_l7_responses"],
+    ["conns", "accepted conns", "zgix_accepted"],
+  ]) {
+    const el = h("div", { class: "rate" },
+      h("div", { class: "k" }, name),
+      h("div", { class: "v" }, fmt(sum(m, counter))),
+      h("div", { class: "d" }, rate(m, p, counter)));
+    el.insertAdjacentHTML("beforeend", sparkline(hist[key]));
+    rates.append(el);
+  }
+  box.append(rates);
+
+  // verdicts: distribution bar + compact chips
+  box.append(h("h2", {}, "Verdicts"));
+  const segs = [
+    ["zgix_h3_responses", "var(--ok)"], ["zgix_h3_no_route", "var(--warn)"],
+    ["zgix_h3_bad_gateway", "var(--bad)"], ["zgix_h3_gateway_timeout", "#b15ddb"],
+    ["zgix_h3_shed_busy", "var(--accent)"],
+  ];
+  const total = sum(m, "zgix_h3_requests");
+  const bar = h("div", { class: "dist", style: "height:8px" });
+  for (const [name, color] of segs) {
+    const v = sum(m, name), w = total > 0 ? (v / total) * 100 : 0;
+    if (w > 0) bar.append(h("i", { style: `width:${w}%;background:${color}` }));
+  }
+  box.append(bar);
+  const chips = h("div", { class: "chips" });
+  for (const [name, key, cls] of [
+    ["zgix_h3_responses", "ok", "ok"], ["zgix_h3_no_route", "no route", "warn"],
+    ["zgix_h3_bad_gateway", "bad gateway", "bad"], ["zgix_h3_gateway_timeout", "timeout", "bad"],
+    ["zgix_h3_shed_busy", "shed", "warn"], ["zgix_h3_connections", "h3 conns", ""]])
+    chips.append(h("span", { class: "chip" }, key, h("b", { class: cls }, fmt(sum(m, name)))));
+  box.append(chips);
+
+  // h3 listeners
+  box.append(h("h2", {}, "HTTP/3 listeners"));
+  const fams = ["connections", "requests", "responses", "parked"];
+  const rows = new Map();
+  for (const fam of fams)
+    for (const s of m.get("zgix_h3_listener_" + fam) ?? [])
+      rows.set(s.labels.bind ?? "?", { ...(rows.get(s.labels.bind ?? "?") ?? {}), [fam]: s.value });
+  if (rows.size === 0)
+    box.append(h("div", { class: "hint" }, "no h3 listeners configured"));
+  else
+    box.append(h("table", {},
+      h("tr", {}, h("th", {}, "bind"), ...fams.map(f => h("th", {}, f))),
+      ...[...rows.entries()].map(([bind, r]) =>
+        h("tr", {}, h("td", {}, bind), ...fams.map(f => h("td", {}, fmt(r[f] ?? 0)))))));
+
+  // pools
+  box.append(h("h2", {}, "Pools"));
+  const tc = h("div", { class: "cards" });
+  for (const [name, key, cls] of [
+    ["zgix_completed", "completed", ""], ["zgix_conn_slots_in_use", "slots in use", ""],
+    ["zgix_upstream_slots_leased", "leased", ""], ["zgix_upstream_slots_parked", "parked", "ok"],
+    ["zgix_endpoint_connect_failed", "conn failed", "warn"]])
+    tc.append(card(m, p, name, key, cls));
+  box.append(tc);
+
+  box.append(h("details", {},
+    h("summary", {}, "raw scrape"),
+    h("pre", {}, rawText())));
+  return box;
+}
+
+function viewSites(m) {
+  const box = h("div", {});
+  box.append(h("h2", {}, "Listeners & routes"));
+  const listeners = m.get("zgix_listener_info") ?? [];
+  const routes = m.get("zgix_route_info") ?? [];
+  // route_responses counts, keyed by the same labels route_info carries
+  const rkey = l => JSON.stringify([l.listener, l.host ?? "", l.prefix ?? "", l.header ?? "", l.cluster ?? ""]);
+  const rcounts = new Map();
+  for (const s of m.get("zgix_route_responses") ?? [])
+    rcounts.set(rkey(s.labels), s.value);
+  if (!listeners.length) {
+    box.append(h("div", { class: "hint" },
+      "no zgix_listener_info in this scrape — the zgix build is older than the inventory metrics; upgrade zgix to populate this view."));
+    return box;
+  }
+  const byListener = new Map();
+  for (const s of routes) {
+    const k = s.labels.listener ?? "?";
+    if (!byListener.has(k)) byListener.set(k, []);
+    byListener.get(k).push(s.labels);
+  }
+  for (const s of listeners) {
+    const l = s.labels;
+    const rs = byListener.get(l.bind ?? "?") ?? [];
+    const kind = l.kind ?? "?";
+    box.append(h("div", { class: "site" },
+      h("div", { class: "head" },
+        h("span", { class: "kind " + kind }, kind),
+        h("span", { class: "name" }, l.bind ?? "?"),
+        h("span", { class: "meta" }, `${rs.length} route${rs.length === 1 ? "" : "s"}`)),
+      rs.length ? h("table", {},
+        h("tr", {}, h("th", {}, "host"), h("th", {}, "header"),
+          h("th", {}, "prefix"), h("th", {}, "cluster"), h("th", {}, "responses")),
+        ...rs.map(r => h("tr", {},
+          h("td", {}, r.host ?? "–"),
+          h("td", {}, r.header ?? "–"),
+          h("td", {}, r.prefix ?? "–"),
+          h("td", {}, h("span", { style: "color:var(--accent)" }, r.cluster ?? "?")),
+          h("td", {}, fmt(rcounts.get(rkey(r)) ?? 0)))))
+        : h("div", { class: "lat", style: "padding:8px 12px" }, "no routes")));
+  }
+  return box;
+}
+
+function viewApps(m, p) {
+  const box = h("div", {});
+  box.append(h("h2", {}, "Clusters & endpoints"));
+  const { clusters, eps } = aggregateClusters(m);
+  const inventory = m.get("zgix_endpoint_info") ?? [];
+  if (!clusters.size && !inventory.length) {
+    box.append(h("div", { class: "hint" }, "no cluster or endpoint metrics in this scrape"));
+    return box;
+  }
+  // clusters present in metrics but maybe not in histograms (no traffic yet) —
+  // seed from endpoint_info so a fresh deploy shows up with zeroes.
+  const names = new Set(clusters.keys());
+  for (const s of inventory) names.add(s.labels.cluster ?? "?");
+  for (const name of names) {
+    const c = clusters.get(name) ?? { classes: {}, sum_s: 0, count: 0, buckets: [] };
+    const avg = c.count ? c.sum_s / c.count : null;
+    const lat = (label, q) => h("span", { class: "lat" }, label + " ",
+      h("b", {}, fmtMs(q === "avg" ? avg : quantile(c.buckets, q))));
+    box.append(h("div", { class: "site" },
+      h("div", { class: "head" },
+        h("span", { class: "name" }, name),
+        lat("avg", "avg"), h("span", { class: "lat" }, "·"),
+        lat("p50", .5), h("span", { class: "lat" }, "·"),
+        lat("p90", .9), h("span", { class: "lat" }, "·"),
+        lat("p99", .99),
+        classBar(c, c.count)),
+      endpointTable(name, eps)));
+  }
+  return box;
+}
+
+function viewLogs(m) {
+  const logs = m.__logs ?? [];
+  const box = h("div", {});
+  box.append(h("h2", {}, "Access log tail"));
+  if (!logs.length) {
+    box.append(h("div", { class: "hint" },
+      "no zgix_access_log section in this scrape — the zgix build does not emit an admin log ring yet (phase-2 backend slice)."));
+    return box;
+  }
+  const outcomeColor = { ok: "var(--ok)", rejected: "var(--warn)",
+    upstream_failed: "var(--bad)", shed: "var(--accent)" };
+  const rows = [...logs].reverse().slice(0, 50);
+  box.append(h("table", {},
+    h("tr", {}, ...["time", "outcome", "method", "host", "path", "status", "cluster", "upstream", "dur"]
+      .map(x => h("th", {}, x))),
+    ...rows.map(r => h("tr", {},
+      h("td", {}, (r.time ?? r.t ?? "").slice(11, 23)),
+      h("td", {}, h("span", { style: `color:${outcomeColor[r.outcome] ?? "var(--dim)"}` }, r.outcome ?? "?")),
+      h("td", {}, r.method ?? "?"),
+      h("td", {}, r.host ?? "–"),
+      h("td", {}, r.path ?? "?"),
+      h("td", {}, String(r.status ?? "?")),
+      h("td", {}, r.cluster ?? "–"),
+      h("td", {}, r.upstream ?? "–"),
+      h("td", {}, (r.duration_us != null ? (r.duration_us / 1000).toFixed(1) + " ms" : "–"))))));
+  return box;
+}
+
+function viewCerts(m) {
+  const certs = m.get("zgix_cert_info") ?? [];
+  const box = h("div", {});
+  box.append(h("h2", {}, "Certificates"));
+  if (!certs.length) {
+    box.append(h("div", { class: "hint" },
+      "no zgix_cert_info in this scrape — this zgix build does not emit certificate inventory, or no TLS listener is configured."));
+    return box;
+  }
+  const rows = certs.map(s => ({ ...s.labels, days: Number(s.labels.days_left ?? NaN) }))
+    .sort((a, b) => (isNaN(a.days) ? 1e9 : a.days) - (isNaN(b.days) ? 1e9 : b.days));
+  box.append(h("table", {},
+    h("tr", {}, ...["name", "listener", "not after", "days left"].map(x => h("th", {}, x))),
+    ...rows.map(r => h("tr", {},
+      h("td", {}, r.name ?? "?"),
+      h("td", {}, r.listener ?? "–"),
+      h("td", {}, r.not_after ?? "–"),
+      h("td", { class: "v " + (r.days < 14 ? "bad" : r.days < 45 ? "warn" : "ok") },
+        String(r.days))))));
+  return box;
+}
+
+function viewAbout(m) {
+  const v = (m.get("zgix_info") ?? [])[0]?.labels.version ?? "unknown";
+  return h("div", {},
+    h("h2", {}, "About"),
+    h("table", {},
+      h("tr", {}, h("td", {}, "zgix version"), h("td", {}, v)),
+      h("tr", {}, h("td", {}, "admin target"), h("td", {}, target.value)),
+      h("tr", {}, h("td", {}, "panel"), h("td", {}, "static single page · SolidJS vendored"))),
+    h("p", { style: "color:var(--dim)" },
+      "Scrapes the admin endpoint (Prometheus text) on a timer. Inventory views need the zgix build that emits the zgix_*_info families."));
+}
+
+// ---- render -------------------------------------------------------------------
+function bumpHist(m, p) {
+  const push = (key, name) => {
+    const d = p ? Math.max(0, sum(m, name) - sum(p, name)) : 0;
+    hist[key].push(d);
+    if (hist[key].length > HIST_MAX) hist[key].shift();
+  };
+  push("h3", "zgix_h3_requests");
+  push("l7", "zgix_l7_responses");
+  push("conns", "zgix_accepted");
+}
+
+function render() {
+  // nav active state
+  document.querySelectorAll("#nav a").forEach(a =>
+    a.classList.toggle("on", a.dataset.v === view()));
+  const m = data();
+  const c = document.getElementById("content");
+  c.textContent = "";
+  if (!m) { c.append(h("div", { class: "hint" }, "waiting for first scrape…")); return; }
+  const p = prev();
+  let node;
+  switch (view()) {
+    case "sites": node = viewSites(m); break;
+    case "apps": node = viewApps(m, p); break;
+    case "logs": node = viewLogs(m); break;
+    case "certs": node = viewCerts(m); break;
+    case "about": node = viewAbout(m); break;
+    default: node = viewOverview(m, p);
+  }
+  // phones: wide tables scroll sideways instead of overflowing the page
+  node.querySelectorAll("table").forEach(t => {
+    if (!t.parentElement.classList.contains("twrap")) {
+      const w = h("div", { class: "twrap" });
+      t.parentElement.insertBefore(w, t);
+      w.appendChild(t);
+    }
+  });
+  c.append(node);
+}
+
+// ---- polling ---------------------------------------------------------------------
+let timer = null, etag = 0;
+async function poll() {
+  const url = target.value.replace(/\/$/, "");
+  const my = ++etag;
+  try {
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const text = await res.text();
+    if (my !== etag) return;
+    setPrev(data()); setData(parse(text)); setRaw(text);
+    setErr(null); setAt(new Date());
+  } catch (e) { if (my === etag) setErr(String(e.message ?? e)); }
+}
+function schedule() {
+  if (timer) clearInterval(timer);
+  const ms = Number(intervalSel.value);
+  if (ms > 0) { timer = setInterval(poll, ms); poll(); }
+}
+createEffect(() => {
+  const m = data(); if (!m) { render(); return; }
+  bumpHist(m, prev());
+  render();
+});
+createEffect(() => {
+  view(); render();
+});
+createEffect(() => {
+  const e = err(), when = at();
+  const dot = document.getElementById("dot"), msg = document.getElementById("msg");
+  dot.className = e ? "err" : when ? "ok" : "";
+  msg.textContent = e ? e : when ? "scraped " + when.toLocaleTimeString() : "";
+});
+target.addEventListener("change", () => {
+  localStorage.setItem("zgix-panel-target", target.value);
+  setData(null); setPrev(null); poll();
+});
+intervalSel.addEventListener("change", schedule);
+onCleanup(() => clearInterval(timer));
+schedule();
+</script>
+</body>
+</html>

@@ -1,7 +1,7 @@
 //! zurl — an experimental std.Io-native HTTP/1.1 client.
 //!
 //! Start with docs/DESIGN.md: eight rules, each traceable to an incident that
-//! cost the zoxy benchmark a real run. The short version:
+//! cost the zgix benchmark a real run. The short version:
 //!
 //!   * bodies go to a `Sink`; there is no way to forget one
 //!   * framing (content-length / chunked / close-delimited, bodyless

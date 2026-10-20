@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) void {
 
     // Assertions in release builds: the one place docs/TIGER_STYLE.md records
     // that the two consumers genuinely disagree, so it is a knob rather than a
-    // decision this package makes for them. On by default — zoxy inherits it
+    // decision this package makes for them. On by default — zgix inherits it
     // and says nothing; zrk passes `.assertions = false` through
     // `b.dependency` in a line a reviewer can see.
     //

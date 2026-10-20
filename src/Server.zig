@@ -553,9 +553,16 @@ pub fn Server(comptime IoType: type) type {
             assert(config.clusters.len >= 1);
             const keys = endpointKeysFor(config);
             const tables = counters_module.Labeled.tableBytes(config, keys);
-            const labeled_render = counters_module.Labeled.renderBytesMaxFor(config);
+            // The inventory families' config terms plus the version row
+            // at its bound: the instance bound is exact (the tightness
+            // test pins it), and the §5 closed form over-covers by at
+            // most the slack between the real tag and a 32-byte worst
+            // spelling — a budget's one safe direction to be loose in.
+            const labeled_render = counters_module.Labeled.renderBytesMaxFor(config) +
+                counters_module.Labeled.infoVersionBytesForBound();
             const admin_response = admin_module.response_head.len +
-                counters_module.Counters.render_bytes_max + labeled_render;
+                counters_module.Counters.render_bytes_max + labeled_render +
+                access_log_module.AdminRing.sectionBytesMax();
             const dump_staging =
                 counters_module.Counters.render_bytes_max + labeled_render;
             const total = tables + admin_response + dump_staging;
@@ -986,7 +993,7 @@ pub fn Server(comptime IoType: type) type {
         ) error{OutOfMemory}!void {
             assert(keys.count >= 1);
             server.counters = .{};
-            try server.labeled.init(arena, config, keys);
+            try server.labeled.init(arena, config, keys, counters_module.Labeled.build.version);
             server.dump_buffer = try arena.alloc(
                 u8,
                 counters_module.Counters.render_bytes_max + server.labeled.render_bytes_max,
@@ -1671,7 +1678,7 @@ pub fn Server(comptime IoType: type) type {
         ) void {
             assert(!(conns_done and admin_done and log_done and health_done));
             std.debug.print(
-                "zoxy: drain did not finish {d}s after its deadline (#203). " ++
+                "zgix: drain did not finish {d}s after its deadline (#203). " ++
                     "conns={s} admin={s} access_log={s} health={s}\n",
                 .{
                     drain_stuck_grace_ns / std.time.ns_per_s,
@@ -2609,7 +2616,7 @@ pub fn Server(comptime IoType: type) type {
         /// "omit this key".
         ///
         /// First occurrence wins, because `parser.headerValue`'s does:
-        /// what the line reports is then the same value zoxy itself read,
+        /// what the line reports is then the same value zgix itself read,
         /// which is the property that makes a logged header worth
         /// anything when the two disagree.
         fn captureLogHeaders(

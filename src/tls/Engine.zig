@@ -1,4 +1,4 @@
-//! The TLS engine (DESIGN.md §4): zoxy's seam over zssl's sans-I/O TLS
+//! The TLS engine (DESIGN.md §4): zgix's seam over zssl's sans-I/O TLS
 //! 1.3 server. Static caller-owned buffers, key material injected as
 //! plain data (so the simulator's seeded stream drives it, §9), zero
 //! allocation in the wrapper — libcrypto's own allocations ride the fixed
@@ -143,7 +143,7 @@ pub const Sink = struct {
 };
 
 /// The largest record zssl can put on the wire — what a *peer* may send.
-/// Not what zoxy emits (see `emitted_record_bytes_max`).
+/// Not what zgix emits (see `emitted_record_bytes_max`).
 pub const record_bytes_max = zssl.record.wire_record_bytes_max;
 
 /// The most plaintext one record may yield. With the read cap, what
@@ -214,7 +214,7 @@ const control_record_bytes_max: usize = 256;
 const key_update_burst_bytes_max: usize =
     @as(usize, zssl.flood.key_updates_max) * control_record_bytes_max;
 
-/// The largest record zoxy itself emits.
+/// The largest record zgix itself emits.
 ///
 /// The distinction from `record_bytes_max` is what keeps the engine a
 /// fixed size. Inbound buffers must cover a full record, because a client
@@ -329,7 +329,7 @@ pub fn bindPlaintext(engine: *Engine, buffer: []u8, body: []u8, head_bytes: u32)
 
 /// In-place init via out-pointer: `records` borrows `record_storage` and
 /// `hs` borrows `reassembly`, so an Engine must never be copied after
-/// init (the zoxy pool-slot rule).
+/// init (the zgix pool-slot rule).
 pub fn init(engine: *Engine, config: *const Config) !void {
     assert(config.credentials.chain.len >= 1);
     assert(engine.plaintext.len >= plaintext_bytes_min); // bindPlaintext ran.
@@ -525,7 +525,7 @@ comptime {
 /// *after* the client's Finished is processed, not alongside the server
 /// flight — TLS 1.3 permits either, but only the later one carries an
 /// ACK covering that Finished. Without it the client's next small write
-/// sits in its own Nagle queue waiting for an ACK zoxy has no reason to
+/// sits in its own Nagle queue waiting for an ACK zgix has no reason to
 /// send, which is the ~45 ms stall (IMPLEMENTATION_NOTES).
 ///
 /// The randomness is passed in rather than drawn: the engine has no I/O,
@@ -684,7 +684,7 @@ fn pump(engine: *Engine, sink: *const Sink) !void {
                 },
                 .application_data => |bytes| {
                     // The one place a peer chooses how many bytes land
-                    // in a zoxy buffer, so it is checked rather than
+                    // in a zgix buffer, so it is checked rather than
                     // assumed — §5's sizing for `plaintext` is exactly
                     // this bound. zssl enforces it too (`protect.open`
                     // refuses a longer record), so this is the second of

@@ -3,7 +3,7 @@
 //! The parser owns framing entirely (docs/DESIGN.md rule 2). The caller never
 //! sees an undecoded byte: content-length bodies, chunked bodies (including
 //! trailers) and close-delimited bodies all arrive at the sink as the same
-//! logical byte stream. This is the property whose absence cost the zoxy
+//! logical byte stream. This is the property whose absence cost the zgix
 //! benchmark months of silently corrupted cAdvisor scrapes.
 //!
 //! Zero allocation, by construction rather than effort: nothing here takes an

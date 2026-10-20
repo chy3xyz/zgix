@@ -47,7 +47,7 @@ BoGo before the ztls differential. A differential against ztls proves
 we agree with one other implementation that shares our *assumptions*;
 BoGo proves we refuse what the protocol says to refuse, which is the
 question a proxy's TLS terminator actually gets asked by the internet.
-The ztls differential belongs with zoxy's engine swap anyway — that is
+The ztls differential belongs with zgix's engine swap anyway — that is
 where the two run side by side and disagreement is diagnosable against
 a live proxy.
 

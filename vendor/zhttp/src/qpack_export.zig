@@ -3,7 +3,7 @@
 //! `h3/native/qpack.zig` imports `../../h2/huffman.zig`, which is outside
 //! that file's own directory. Zig permits the import only when the module
 //! root sits at `src/`, so this file is the module root and re-exports the
-//! names zoxy uses.
+//! names zgix uses.
 
 const inner = @import("h3/native/qpack.zig");
 

@@ -3,7 +3,7 @@
 //! Pure Zig over `std.crypto` HMAC — the primitives policy draws its line
 //! at constant-time *asymmetric* and AEAD work (those go to libcrypto);
 //! HMAC-SHA2 over public-length inputs is not where the sharp edges are,
-//! and this is the choice ztls made and zoxy audited.
+//! and this is the choice ztls made and zgix audited.
 //!
 //! Every RFC 8446 use of Expand-Label asks for at most one hash block of
 //! output (keys are 16 or 32 bytes, IVs 12, derived secrets and finished

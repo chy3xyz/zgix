@@ -18,7 +18,7 @@ const assert = std.debug.assert;
 /// The value proves libxev accepts our ring size, not just its default.
 const ring_entries: u16 = 4096;
 
-const echo_token = "zoxy-smoke-token";
+const echo_token = "zgix-smoke-token";
 
 test "loop: init at ring_entries and run empty" {
     var loop = try xev.Loop.init(.{ .entries = ring_entries });
@@ -137,7 +137,7 @@ test "unix listener: the socket file's lifecycle (#303)" {
     try io.init(arena_state.allocator(), 0, 2, 2, 512, XevIo.log_sink_stdout, null);
     defer io.deinit();
 
-    const path = "/tmp/zoxy-xev-listener.sock";
+    const path = "/tmp/zgix-xev-listener.sock";
     _ = std.posix.system.unlink(path);
     defer _ = std.posix.system.unlink(path);
 
@@ -199,7 +199,7 @@ test "unix listener: a mode lands on the file (#303)" {
     try io.init(arena_state.allocator(), 0, 1, 2, 512, XevIo.log_sink_stdout, null);
     defer io.deinit();
 
-    const path = "/tmp/zoxy-xev-listener-mode.sock";
+    const path = "/tmp/zgix-xev-listener-mode.sock";
     _ = std.posix.system.unlink(path);
     defer _ = std.posix.system.unlink(path);
 
@@ -255,7 +255,7 @@ test "unix: the same echo over a socket path (#303)" {
     // socket file is `EADDRINUSE`, which is the whole of the stale-file
     // problem the listener half will have to answer, and a crashed
     // previous run must not wedge every later one.
-    const path = "/tmp/zoxy-xev-unix-smoke.sock";
+    const path = "/tmp/zgix-xev-unix-smoke.sock";
     _ = std.posix.system.unlink(path);
     defer _ = std.posix.system.unlink(path);
 

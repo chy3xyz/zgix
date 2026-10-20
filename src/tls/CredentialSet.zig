@@ -226,9 +226,9 @@ test "credential set: the leaf's SAN becomes the name list" {
 
     try std.testing.expectEqual(@as(usize, 1), set.entries.len);
     try std.testing.expectEqual(@as(usize, 1), set.entries[0].names.len);
-    try std.testing.expectEqualStrings("spike.zoxy.test", set.entries[0].names[0]);
-    try std.testing.expect(select(&set, "spike.zoxy.test") == defaultCredentials(&set));
-    try std.testing.expect(select(&set, "SPIKE.ZOXY.TEST") == defaultCredentials(&set));
+    try std.testing.expectEqualStrings("spike.zgix.test", set.entries[0].names[0]);
+    try std.testing.expect(select(&set, "spike.zgix.test") == defaultCredentials(&set));
+    try std.testing.expect(select(&set, "SPIKE.ZGIX.TEST") == defaultCredentials(&set));
     try std.testing.expect(select(&set, "other.example") == defaultCredentials(&set));
     try std.testing.expect(select(&set, null) == defaultCredentials(&set));
 }

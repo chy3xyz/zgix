@@ -6,7 +6,7 @@
     //
     // It is redundant to include "zig" in this name because it is already
     // within the Zig package namespace.
-    .name = .zoxy,
+    .name = .zgix,
     // This is a [Semantic Version](https://semver.org/).
     // In a future version of Zig it will be used for package deduplication.
     .version = "0.9.0",
@@ -22,7 +22,7 @@
     // original project's identity. Thus it is recommended to leave the comment
     // on the following line intact, so that it shows up in code reviews that
     // modify the field.
-    .fingerprint = 0xa872299f36b5e445, // Changing this has security and trust implications.
+    .fingerprint = 0x82bf6ba13b37232e, // Changing this has security and trust implications.
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
     .minimum_zig_version = "0.17.0",
@@ -37,7 +37,7 @@
     // carries the Zig 0.17 compatibility delta says so. The audit histories
     // below still describe what moved and why.
     .dependencies = .{
-        // Audited fork: zoxy-io/libxev branch zoxy-buffer-group = upstream
+        // Audited fork: zoxy-io/libxev branch zgix-buffer-group = upstream
         // 9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf (the audited snapshot)
         // plus six commits, each its own stacked PR:
         //   c369817 expose io_uring setup flags through Options
@@ -81,7 +81,7 @@
         // the address from one contiguous location that must outlive the
         // submission, and the completion is the only storage the op has, so
         // the path is inline and `Completion` grows 128 -> 152 bytes
-        // (io_uring) and 184 -> 208 (epoll). zoxy holds two per conn and
+        // (io_uring) and 184 -> 208 (epoll). zgix holds two per conn and
         // four per stream, so the effective config's arena grows by
         // 144 B x conn slots — 0.4% of the banner's total at the shipped
         // shape, against relay buffers that dominate it. Upstream's two
@@ -167,21 +167,21 @@
         // It moved anyway because the alternative was worse. zrk swapped
         // ztls and its own `openssl` pin for zssl (zoxy-io/zrk 3183923),
         // and pins the *same* zssl commit this file does. Held at v2.1.0
-        // instead, `zoxy-profile-harness` would link zrk's ztls over the
-        // pre-split openssl beside zoxy's zssl over the split one — two
+        // instead, `zgix-profile-harness` would link zrk's ztls over the
+        // pre-split openssl beside zgix's zssl over the split one — two
         // pins of the same C library, with different artifact names, in
         // the one binary whose job is producing trustworthy measurements.
         // That is the hazard v2.1.0 was itself chosen to close, in the
         // BoringSSL form; this is the same trap wearing the next mask.
         //
         // Both sides resolved to one zssl and one libcrypto when this
-        // line was written. **Half of that is no longer true**: zoxy's
+        // line was written. **Half of that is no longer true**: zgix's
         // zssl moved to 91a985a and this zrk pin still carries 992ee9d,
         // so the two are one zssl apart until zrk repins. What keeps it
-        // harmless is that neither binary holds both — `zoxy-bench` and
-        // `zoxy-profile-harness` name zrk's zssl, the proxy under test
+        // harmless is that neither binary holds both — `zgix-bench` and
+        // `zgix-profile-harness` name zrk's zssl, the proxy under test
         // is a separate process, and the harness imports
-        // `src/constants.zig` as a leaf rather than the `zoxy` module
+        // `src/constants.zig` as a leaf rather than the `zgix` module
         // (see build.zig, where the reason is squarely the optimize-mode
         // module collision). One libcrypto still holds outright: both
         // zssl commits pin the same zoxy-io/openssl this file does.
@@ -242,7 +242,7 @@
         // src/ delta. No table changed: checked by filtering the diff for map,
         // table and hex-byte lines, which is the standing check this pin's
         // history says to run, and the only arithmetic line it turns up keeps
-        // its constants. So no verdict moves, and zoxy parses exactly the bytes
+        // its constants. So no verdict moves, and zgix parses exactly the bytes
         // it parsed before. What moves is scan speed.
         //
         // The one rewrite that could have changed a verdict is
@@ -318,7 +318,7 @@
         // It also records that `status_msg_map` rejects HTAB, which RFC
         // 9112 §4 permits in a reason-phrase: a deliberate deviation in the
         // strict direction, previously silent. Documentation, not a change
-        // — the table is byte-identical. zoxy never reads a reason-phrase's
+        // — the table is byte-identical. zgix never reads a reason-phrase's
         // bytes, so nothing here depends on it either way.
         //
         // Two commits on from 554d9fb, and only one of them is product:
@@ -334,7 +334,7 @@
         //
         // The one that makes this a security fix rather than a conformance
         // one is `\`. IIS, .NET and browser URL parsing normalize a
-        // backslash to `/`, so zoxy routing on `/public\..\admin` and an
+        // backslash to `/`, so zgix routing on `/public\..\admin` and an
         // origin resolving `/admin` have read two different paths out of
         // one target — and §7 routes on paths, which is the fact that
         // scoped the fix. Verified against this tree before taking the pin:
@@ -374,7 +374,7 @@
         // from 87fd39d. Seven of them are harness — an llhttp differential
         // and its imported corpus, a picohttpparser differential, a
         // disagreement ledger, a copyright line, a contributor guide — and
-        // touch no file that links into zoxy. Two reach `src/root.zig`, the
+        // touch no file that links into zgix. Two reach `src/root.zig`, the
         // parser itself, and only one of those changes a verdict.
         //
         // b65ea98 is the correctness fix and the reason to take this pin.
@@ -407,7 +407,7 @@
         // constants into `?bool` / `?u16` build options, so the fork can
         // fuzz a forced-scalar build against the vector one. This build
         // passes neither, and unset they compute exactly what the constants
-        // computed, so the scan tier zoxy ships is unchanged. Its one
+        // computed, so the scan tier zgix ships is unchanged. Its one
         // visible consequence is that hparse's root now imports
         // `build_options`, which its own build.zig supplies — nothing to
         // wire on this side.
@@ -458,7 +458,7 @@
         // delta against a pre-alpha upstream was the cost of borrowing;
         // owning the protocol layer removes it.
         //
-        // What zoxy gains beyond parity: kTLS key export as first-class
+        // What zgix gains beyond parity: kTLS key export as first-class
         // state (the §4 follow-up that ztls had no seam for), RFC 8446
         // §5's length caps enforced at header parse rather than
         // compensated for in `Engine.pump`, and a client handshake for
@@ -481,7 +481,7 @@
         // fails the build rather than reading as a pass.
         //
         // The reason to take the pin is what those three found, and the
-        // parts of it that land on the path zoxy actually serves:
+        // parts of it that land on the path zgix actually serves:
         //
         //   - `flood.zig`: 32 consecutive empty records, 32 KeyUpdates,
         //     4 warning alerts, then the connection ends. All three are
@@ -501,7 +501,7 @@
         //     there unchecked, so seven bytes of hostile DER *panic*
         //     rather than erroring — a remote abort in ReleaseSafe,
         //     which is the build release.yml ships (#283). A framing
-        //     pre-pass now runs first. Not on zoxy's serving path today
+        //     pre-pass now runs first. Not on zgix's serving path today
         //     (no client certificates are asked for), but it is on the
         //     client handshake §7's cluster `tls` block will use.
         //
@@ -519,19 +519,19 @@
         //      guard exists.
         //   2. `x25519_private` became `key_share_private`, sized for
         //      secp384r1, beside a `groups` list defaulting to all three
-        //      groups zssl can now complete server-side. zoxy pins
+        //      groups zssl can now complete server-side. zgix pins
         //      x25519 alone: `acquireTlsEngine` draws 32 bytes of seed,
         //      a P-384 scalar is 48, and widening the offer is an
         //      entropy-draw decision of its own rather than a
         //      consequence of a bump.
         //   3. `PskLookup` answers a `Psk` — length, kind, optional
-        //      issuance and early-data terms — not a length. zoxy
+        //      issuance and early-data terms — not a length. zgix
         //      answers `.resumption` with both optionals null: RFC 8446
         //      §4.6.1's lifetime stays enforced against the sealed stamp
         //      the client cannot move, and a ticket that permits no
         //      early data is one of the three opt-ins 0-RTT needs.
         //   4. `Event` gained `.early_data`, deliberately as its own arm
-        //      so an embedder has to answer for it. zoxy refuses it: no
+        //      so an embedder has to answer for it. zgix refuses it: no
         //      clock, no strike register, no ticket terms, so accepted
         //      0-RTT cannot arrive, and if a later pin makes it possible
         //      the connection dies rather than the proxy relaying bytes
@@ -539,7 +539,7 @@
         //   5. **The one that changes behaviour without changing a call
         //      site.** `backend.Signer` learned RSA-PSS, so
         //      `error.UnsupportedKey` no longer refuses an RSA leaf —
-        //      and zoxy's ECDSA-only promise (an RSA sign is ~1-2 ms
+        //      and zgix's ECDSA-only promise (an RSA sign is ~1-2 ms
         //      against the ~260 µs handshake the single loop is sized
         //      for) would have left with this bump. It is
         //      `tls/Credentials.zig`'s own rule now, with its own test

@@ -1,6 +1,6 @@
 //! Slice 4's end-to-end: the production `ClientHandshake` against the
 //! production `ServerHandshake` — both real machines, no test client.
-//! Covers the full origination path zoxy needs for upstreams: SNI, ALPN,
+//! Covers the full origination path zgix needs for upstreams: SNI, ALPN,
 //! leaf verification, tickets captured through the client's event
 //! surface, resumption, §4.6.3 KeyUpdate in both directions with the
 //! kTLS export tracking generations, and the client's HelloRetryRequest
@@ -109,8 +109,8 @@ const Harness = struct {
         client_credentials: ?*const Credentials = null,
         /// The name the client asks for. The default is the fixture
         /// leaf's SAN; a test that exercises SNI selection changes it.
-        client_server_name: []const u8 = "spike.zoxy.test",
-        /// Load a second leaf and route `p384.zoxy.test` to it through
+        client_server_name: []const u8 = "spike.zgix.test",
+        /// Load a second leaf and route `p384.zgix.test` to it through
         /// the credential selector. The client does not verify, so the
         /// name need not match either fixture.
         sni_second_leaf: bool = false,
@@ -199,7 +199,7 @@ const Harness = struct {
         const harness: *Harness = @ptrCast(@alignCast(context));
         const second = if (harness.second_credentials) |*credentials| credentials else return null;
         const name = server_name orelse return null;
-        if (std.mem.eql(u8, name, "p384.zoxy.test")) return second;
+        if (std.mem.eql(u8, name, "p384.zgix.test")) return second;
         return null;
     }
 
@@ -371,7 +371,7 @@ test "SNI: the selector's answer is the credentials the flight uses" {
     var harness: Harness = undefined;
     try harness.init(.{
         .sni_second_leaf = true,
-        .client_server_name = "p384.zoxy.test",
+        .client_server_name = "p384.zgix.test",
         .certificate_policy = .insecure_no_verification,
     });
     defer harness.deinit();
@@ -385,7 +385,7 @@ test "SNI: the selector's answer is the credentials the flight uses" {
     var fallback: Harness = undefined;
     try fallback.init(.{
         .sni_second_leaf = true,
-        .client_server_name = "other.zoxy.test",
+        .client_server_name = "other.zgix.test",
         .certificate_policy = .insecure_no_verification,
     });
     defer fallback.deinit();

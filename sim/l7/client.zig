@@ -17,13 +17,13 @@
 
 const std = @import("std");
 
-const zoxy = @import("zoxy");
+const zgix = @import("zgix");
 
 const canon = @import("canon.zig");
 const scripts = @import("scripts.zig");
 
-const Io = zoxy.Io;
-const parser = zoxy.http.parser;
+const Io = zgix.Io;
+const parser = zgix.http.parser;
 const Script = scripts.Script;
 const Spec = scripts.Spec;
 
@@ -589,7 +589,7 @@ pub fn Client(comptime IoType: type) type {
         /// process, under every schedule the adversary produces.
         fn responseEditViolation(entry: Spec, response: *const parser.ResponseHead) ?ClientError {
             assert(response.status >= 100);
-            assert(response.headers.len <= zoxy.constants.headers_max);
+            assert(response.headers.len <= zgix.constants.headers_max);
             const stamped = headerEquals(
                 response.headers,
                 canon.response_edit_name,
@@ -634,7 +634,7 @@ pub fn Client(comptime IoType: type) type {
         /// purpose, which is §7's one hop-by-hop exemption (#180).
         fn hopByHopViolation(response: *const parser.ResponseHead) ?ClientError {
             assert(response.status >= 100);
-            assert(response.headers.len <= zoxy.constants.headers_max);
+            assert(response.headers.len <= zgix.constants.headers_max);
             if (response.status == 101) return null;
             if (headerPresent(response.headers, "Keep-Alive")) {
                 return ClientError.ResponseHopByHopLeaked;
@@ -678,7 +678,7 @@ pub fn Client(comptime IoType: type) type {
                 (response.status == 200 and entry.answered_here);
             const forwarded = !from_memory and
                 (response.status == 200 or response.status == 101);
-            const stamped_server = headerEquals(response.headers, "Server", "zoxy");
+            const stamped_server = headerEquals(response.headers, "Server", "zgix");
             const date = parser.headerValue(response.headers, "Date");
             if (forwarded) {
                 if (stamped_server or date != null) {
@@ -690,10 +690,10 @@ pub fn Client(comptime IoType: type) type {
                 return ClientError.ProxyDateMissing;
             }
             const value = date orelse return ClientError.ProxyDateMissing;
-            if (std.mem.eql(u8, value, zoxy.shed.date_placeholder)) {
+            if (std.mem.eql(u8, value, zgix.shed.date_placeholder)) {
                 return ClientError.ProxyDateMissing; // The slot was never patched.
             }
-            if (value.len != zoxy.shed.date_bytes) {
+            if (value.len != zgix.shed.date_bytes) {
                 return ClientError.ProxyDateMalformed;
             }
             if (!std.mem.endsWith(u8, value, " GMT")) {
@@ -722,7 +722,7 @@ pub fn Client(comptime IoType: type) type {
             response: *const parser.ResponseHead,
         ) ?ClientError {
             assert(response.status >= 100);
-            assert(response.headers.len <= zoxy.constants.headers_max);
+            assert(response.headers.len <= zgix.constants.headers_max);
             const named = stickyNamePresent(response.headers);
             if (!connection.sticky) {
                 if (named) return ClientError.StickyStampForged;
@@ -743,7 +743,7 @@ pub fn Client(comptime IoType: type) type {
                 return null;
             }
             // The one place the two populations differ, and the reason
-            // this oracle needs to know which it is serving: where zoxy
+            // this oracle needs to know which it is serving: where zgix
             // terminated, the render knows the client-facing scheme is
             // https and the stamp carries `Secure` (#125).
             const expected = if (connection.terminated)
@@ -761,7 +761,7 @@ pub fn Client(comptime IoType: type) type {
         /// the exact-value demand so a wrong-tag stamp cannot pass as
         /// absent.
         fn stickyNamePresent(headers: []const parser.Header) bool {
-            assert(headers.len <= zoxy.constants.headers_max);
+            assert(headers.len <= zgix.constants.headers_max);
             const prefix = canon.sticky_cookie_name ++ "=";
             for (headers) |header| {
                 if (!std.ascii.eqlIgnoreCase(header.name, "set-cookie")) continue;
@@ -772,7 +772,7 @@ pub fn Client(comptime IoType: type) type {
 
         fn headerEquals(headers: []const parser.Header, name: []const u8, value: []const u8) bool {
             assert(name.len >= 1);
-            assert(headers.len <= zoxy.constants.headers_max);
+            assert(headers.len <= zgix.constants.headers_max);
             for (headers) |header| {
                 if (!std.ascii.eqlIgnoreCase(header.name, name)) continue;
                 if (std.mem.eql(u8, header.value, value)) return true;
@@ -782,7 +782,7 @@ pub fn Client(comptime IoType: type) type {
 
         fn headerPresent(headers: []const parser.Header, name: []const u8) bool {
             assert(name.len >= 1);
-            assert(headers.len <= zoxy.constants.headers_max);
+            assert(headers.len <= zgix.constants.headers_max);
             for (headers) |header| {
                 if (std.ascii.eqlIgnoreCase(header.name, name)) return true;
             }

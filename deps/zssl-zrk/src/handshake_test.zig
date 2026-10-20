@@ -75,7 +75,7 @@ test "full 1-RTT: ALPN, app data both ways, kTLS export, clean close" {
     var client = Client.init(&client_x25519_private, &.{
         .session_id = &@as([32]u8, @splat(0xab)),
         .alpn = "http/1.1",
-        .server_name = "spike.zoxy.test",
+        .server_name = "spike.zgix.test",
     });
     defer client.deinit();
     var client_out: [2 * record.wire_record_bytes_max]u8 = undefined;

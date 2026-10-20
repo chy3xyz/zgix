@@ -319,7 +319,7 @@ fn initBufferGroup(io: *XevIo, arena: std.mem.Allocator, count: u32, bytes: u32)
     }
 }
 
-/// Build the event loop with zoxy's ring discipline (§3, §4, §8). Split
+/// Build the event loop with zgix's ring discipline (§3, §4, §8). Split
 /// from `init` so the setup — the fast-ring flags, the deep CQ, and the
 /// old-kernel degrade — stays under the function-length limit.
 fn initLoop(cq_entries: u32, thread_pool: ?*xev_root.ThreadPool) !xev.Loop {
@@ -537,14 +537,14 @@ fn bindErrorOf(rc: anytype) Io.ListenError {
 fn listenIp(io: *XevIo, address: std.Io.net.IpAddress) Io.ListenError!Listener {
     const tcp = xev.TCP.init(address) catch return error.Unexpected;
     // SO_REUSEPORT before bind is what makes horizontal scale-out real
-    // (§1, §3): N independent zoxy processes bind the same port and the
+    // (§1, §3): N independent zgix processes bind the same port and the
     // kernel load-balances new connections across them, with share-nothing
     // isolation at the process boundary. The intra-process accept imbalance
     // that made SO_REUSEPORT a liability in the previous iteration (§3)
     // cannot arise here — each process still has exactly one accepting loop,
     // so the kernel balances between processes, never between contending
     // loops. Must precede bind; libxev sets SO_REUSEADDR inside bind, so the
-    // two options compose. On the io_uring kernels zoxy targets REUSEPORT is
+    // two options compose. On the io_uring kernels zgix targets REUSEPORT is
     // always available, so a failure here is genuinely unexpected.
     const reuse: i32 = 1;
     posix.setsockopt(
@@ -1597,9 +1597,9 @@ pub fn alarmHandlerInstalled() void {
 /// are syscalls and those live here (§4); `main` owns only the sigaction
 /// that points at it.
 pub fn onAlarmFromHandler() noreturn {
-    const drain_message = "zoxy: drain watchdog fired, the event loop stopped " ++
+    const drain_message = "zgix: drain watchdog fired, the event loop stopped " ++
         "delivering (DESIGN.md §8, #226)\n";
-    const loop_message = "zoxy: loop watchdog fired, the event loop stopped " ++
+    const loop_message = "zgix: loop watchdog fired, the event loop stopped " ++
         "delivering while serving (DESIGN.md §8, #311)\n";
     // Both are string literals, so both live in the binary's constant
     // data for the whole process: nothing here dereferences anything a

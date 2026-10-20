@@ -34,7 +34,7 @@ stay in the consumer.
   removes them for a consumer that has made that argument — see
   [`src/assert.zig`](src/assert.zig) for why this is not `std.debug.assert`.
 * Bytes in, frames and header fields out — no reader, writer or `std.Io` in the
-  seam. Its two consumers, [zoxy](https://github.com/zoxy-io/zoxy) (reverse
+  seam. Its two consumers, [zgix](https://github.com/zoxy-io/zgix) (reverse
   proxy, libxev completion callbacks) and
   [zrk](https://github.com/zoxy-io/zrk) (load generator, zio green threads
   through `std.Io`), do not share a runtime, so a reader in a signature would
@@ -91,7 +91,7 @@ the bound on a field block, which is what stops the CONTINUATION flood.
 
 ```sh
 zig build ci      # format check, tests, fuzz corpus, interop corpus, boundary lint
-zig build ci -Doptimize=ReleaseFast                     # zoxy's build
+zig build ci -Doptimize=ReleaseFast                     # zgix's build
 zig build ci -Doptimize=ReleaseFast -Dassertions=false  # zrk's build
 zig build bench   # decode/encode microbenchmarks (ReleaseFast)
 zig build fuzz    # replay the fuzz corpus; --fuzz to actually fuzz
@@ -109,11 +109,11 @@ guarded by a removed assertion becomes.
 
 ## Style
 
-[`docs/TIGER_STYLE.md`](docs/TIGER_STYLE.md) — zoxy's TigerStyle, plus the
+[`docs/TIGER_STYLE.md`](docs/TIGER_STYLE.md) — zgix's TigerStyle, plus the
 deltas a shared library forces. [`CLAUDE.md`](CLAUDE.md) carries the same rules
 as working instructions, including the review and benchmark gates.
 
 ## Context
 
-* zoxy-io/zoxy#173 — HTTP/2 support in the proxy (slices #272 HPACK, #273 frame codec).
+* zoxy-io/zgix#173 — HTTP/2 support in the proxy (slices #272 HPACK, #273 frame codec).
 * zoxy-io/zrk#21 — HTTP/2 support in the load generator.

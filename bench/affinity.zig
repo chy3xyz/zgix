@@ -2,7 +2,7 @@
 //! dedicate one core to the process under test and pin the load
 //! generator and origin off it, so the latency bands and the hardware
 //! PMU measure the proxy — not contention with the generator — and match
-//! zoxy's one-loop-per-core deployment (§3). Pure Zig, Linux-only; every
+//! zgix's one-loop-per-core deployment (§3). Pure Zig, Linux-only; every
 //! entry point is a no-op on other targets so the harnesses still build
 //! and run (unpinned) on a macOS dev box.
 

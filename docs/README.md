@@ -1,37 +1,37 @@
-# zoxy documentation
+# zgix documentation
 
-How to run, configure and operate zoxy: starting and replacing the process,
+How to run, configure and operate zgix: starting and replacing the process,
 every block a config can carry, what the proxy exposes while it runs, and
 what it does when a resource runs out.
 
 The authoritative list of fields, enums and numeric bounds is the JSON
 Schema shipped as a release asset and emitted locally by `zig build schema`.
-It is generated from the parser, and [zoxy.io/config](https://zoxy.io/config/)
+It is generated from the parser, and [zgix.io/config](https://zgix.io/config/)
 renders it for the latest release. This document is the tour. The reasoning
 behind each behaviour is in [DESIGN.md](DESIGN.md); a bare `§` reference
 points there.
 
-## Running zoxy
+## Running zgix
 
 ### The command line
 
 The binary takes one argument, the path to a JSON config:
 
 ```sh
-zoxy config.json           # start the proxy
-zoxy --check config.json   # validate and price it, bind nothing (-c)
-zoxy --help                # usage summary (-h)
-zoxy --version             # print the version (-V)
+zgix config.json           # start the proxy
+zgix --check config.json   # validate and price it, bind nothing (-c)
+zgix --help                # usage summary (-h)
+zgix --version             # print the version (-V)
 ```
 
-A release build prints its bare version, `zoxy 0.8.2`. A build from source
-after a release adds what distinguishes it, `zoxy 0.8.2 (v0.8.2-5-gabc1234)`,
+A release build prints its bare version, `zgix 0.8.2`. A build from source
+after a release adds what distinguishes it, `zgix 0.8.2 (v0.8.2-5-gabc1234)`,
 and `-dirty` when the tree had uncommitted changes, so the version in a bug
 report identifies the exact build. Packagers can name a build with
 `zig build -Dbuild-id=…`. The same line opens the startup banner.
 
-A config zoxy will not accept is refused before anything is bound: the
-process prints `zoxy: invalid config '<path>': <reason>` and exits `1`. A
+A config zgix will not accept is refused before anything is bound: the
+process prints `zgix: invalid config '<path>': <reason>` and exits `1`. A
 valid config whose fd budget is above this machine's `RLIMIT_NOFILE` hard
 limit is refused the same way, after the startup banner, so the numbers that
 refused it are on screen with the reason.
@@ -43,8 +43,8 @@ measures the fd demand against `RLIMIT_NOFILE`, which is everything a start
 does up to the banner, then exits without binding a port:
 
 ```console
-$ zoxy --check config.json
-zoxy 0.8.2
+$ zgix --check config.json
+zgix 0.8.2
 budgets (DESIGN.md §5/§8; closed-form except where marked):
   memory  total 47297 KiB = conn slots 1386 x 512 B + stream slots 1386 x 1552 B
           + relay buffers 1386 x 32808 B
@@ -138,12 +138,12 @@ this order:
 <!-- figure: reuseport-handoff -->
 
 ```sh
-zoxy --check new-config.json || exit 1   # refuse to proceed on a bad config
-zoxy new-config.json &   # the replacement binds the same port and starts serving
+zgix --check new-config.json || exit 1   # refuse to proceed on a bad config
+zgix new-config.json &   # the replacement binds the same port and starts serving
 kill -TERM "$old_pid"    # the old process drains its work, then exits 0
 ```
 
-Start the replacement first. A config zoxy refuses never reaches a
+Start the replacement first. A config zgix refuses never reaches a
 listener: the new process exits `1` with its reason and the old one, which
 was never signalled, keeps serving. Signalling first would put the port out
 of service for as long as the replacement took to fail. The `--check` line
@@ -161,7 +161,7 @@ starting the new one and accept the gap.
 > accepted but not yet served are reset when it closes its listener. Linux
 > 5.14 added `net.ipv4.tcp_migrate_req`, off by default, which migrates
 > them to another socket in the group; turn it on where the handoff has to
-> be clean. zoxy keeps the backlog drained because accept never pauses
+> be clean. zgix keeps the backlog drained because accept never pauses
 > (§8), which narrows the window but cannot close it.
 
 Both processes must run as the same effective user. The kernel will not add
@@ -174,7 +174,7 @@ final counters.
 [Tunnels](#tunnelled-upgrades-websocket) are the exception. A WebSocket has
 no message boundary to finish at, so a draining process refuses new
 upgrades with `503` and cuts the live ones at `drain_deadline_ms`, or five
-seconds in when none is set. `zoxy_tunnels_drained` counts the ones cut.
+seconds in when none is set. `zgix_tunnels_drained` counts the ones cut.
 
 The same two commands add capacity: start N processes on the same port and
 signal none of them. That is the supported way to use more than one core.
@@ -186,7 +186,7 @@ restart. Unknown fields are rejected.
 
 The sections below follow a request: what a **listener** accepts, including
 whether it terminates TLS, which **cluster** it routes to, how that cluster
-picks an endpoint and protects it, who zoxy believes the client is, the
+picks an endpoint and protects it, who zgix believes the client is, the
 edits and canned bodies applied at the edge, and last the process-wide
 `timeouts` and `limits`. The two remaining process-wide blocks, `admin` and
 `access_log`, are documented under [Observability](#observability).
@@ -223,7 +223,7 @@ delayed ACK costs a reused keep-alive connection a 40 ms stall.
 #### Routing an `l4` listener by TLS name (SNI)
 
 One `:443` can front several TLS services without terminating any of them.
-Give the `l4` body a route table keyed on the server name, and zoxy reads
+Give the `l4` body a route table keyed on the server name, and zgix reads
 that name out of the ClientHello and relays every byte onward unchanged:
 
 ```json
@@ -239,9 +239,9 @@ that name out of the ClientHello and relays every byte onward unchanged:
 }
 ```
 
-zoxy holds no key material and runs no handshake. The backend completes the
+zgix holds no key material and runs no handshake. The backend completes the
 TLS session with the client exactly as it would without a proxy in the
-path, and zoxy never sees a plaintext byte. This is how to front a service
+path, and zgix never sees a plaintext byte. This is how to front a service
 whose certificate the proxy must not be able to present.
 
 A route with no `sni` is the catch-all. It answers any connection,
@@ -259,16 +259,16 @@ Two combinations are refused at load:
 | `routes` beside this listener's own `tls` | terminating consumes the hello this reads; the two are different proxies |
 | `limits.relay_buffer_bytes` below 16 KiB | the hello is staged in the relay buffer, and a modern one with post-quantum key shares runs past 2 KiB — a narrow buffer would route short hellos and drop long ones from the same config |
 
-Four counters report what the table did: `zoxy_l4_sni_routed`,
-`zoxy_l4_sni_absent` (the client named nothing), `zoxy_l4_sni_no_route`
-(named something no route claims) and `zoxy_l4_sni_invalid` (the opening
+Four counters report what the table did: `zgix_l4_sni_routed`,
+`zgix_l4_sni_absent` (the client named nothing), `zgix_l4_sni_no_route`
+(named something no route claims) and `zgix_l4_sni_invalid` (the opening
 bytes were not a ClientHello: a plaintext client, or a handshake this proxy
 could not read).
 
 The hello must arrive in one TLS record. Every client sends it that way; a
 fragmented first flight is legal but does not occur in practice, and
 reassembling one would mean buffering inside a parser that reads
-attacker-controlled bytes. Such a connection counts `zoxy_l4_sni_invalid`
+attacker-controlled bytes. Such a connection counts `zgix_l4_sni_invalid`
 and is closed.
 
 #### Terminating TLS
@@ -279,7 +279,7 @@ routes, cluster and filters are unchanged.
 ```json
 "listeners": [
     { "bind": "0.0.0.0:443", "http": { "cluster": "web" },
-      "tls": { "cert": "/etc/zoxy/site.crt", "key": "/etc/zoxy/site.key" } }
+      "tls": { "cert": "/etc/zgix/site.crt", "key": "/etc/zgix/site.key" } }
 ]
 ```
 
@@ -296,9 +296,9 @@ client with no SNI, or a name no entry claims, receives.
 ```json
 "tls": {
     "certificates": [
-        { "cert": "/etc/zoxy/api.crt", "key": "/etc/zoxy/api.key",
+        { "cert": "/etc/zgix/api.crt", "key": "/etc/zgix/api.key",
           "names": ["api.example.com"] },
-        { "cert": "/etc/zoxy/www.crt", "key": "/etc/zoxy/www.key" }
+        { "cert": "/etc/zgix/www.crt", "key": "/etc/zgix/www.key" }
     ]
 }
 ```
@@ -354,7 +354,7 @@ It is the largest single line in the startup banner's memory budget; see
 Session resumption is on and has no settings. Every completed handshake
 hands the client two session tickets, and a client that offers one back
 resumes without a signature. Tickets are stateless, each sealed under a key
-zoxy keeps in memory, so resumption costs no per-session memory and the
+zgix keeps in memory, so resumption costs no per-session memory and the
 banner's budget does not move. Two consequences follow. A restart
 invalidates every outstanding ticket, because the sealing keys are never
 written anywhere, so returning clients pay one full handshake each and
@@ -369,7 +369,7 @@ write held by its own Nagle for about 45 ms.
 Measured on a `Connection: close` workload, a fresh handshake per request:
 a terminated hop runs at a p50 of 158–161 µs against HAProxy's 429–607 µs.
 On steady keep-alive traffic the two are at parity, about 20k req/s at a
-p50 within a few µs of each other. Bulk transfer is the one band zoxy
+p50 within a few µs of each other. Bulk transfer is the one band zgix
 trails on, by a third to two-fifths: 507–542 µs against 383–385 µs at the
 same 100 MiB/s.
 
@@ -391,7 +391,7 @@ in the schema and an editor rejects `"h2c"` before the loader does.
 Omitting the block, writing `{}`, or setting every flag `false` all mean
 allow none and reserve nothing.
 
-zoxy does not speak WebSocket. It forwards the handshake, recognises the
+zgix does not speak WebSocket. It forwards the handshake, recognises the
 origin's `101 Switching Protocols`, and from that point relays bytes both
 ways until one side closes, the same byte relay an `l4` listener runs.
 Routing, filters and health checks apply to the handshake exactly as they
@@ -400,11 +400,11 @@ do to any request.
 After `101` the connection is opaque. Filters, routes, header rules and
 canonicalisation stop applying, because there are no more HTTP messages to
 apply them to. That is why the block is an allowlist and not a switch:
-`websocket` is the only token zoxy accepts, and `h2c`, which would carry
-HTTP/2 to an origin zoxy cannot parse, is refused by name at load.
+`websocket` is the only token zgix accepts, and `h2c`, which would carry
+HTTP/2 to an origin zgix cannot parse, is refused by name at load.
 
 `limits.tunnels` is required and has no default. How many long-lived
-sessions the origins should carry is a capacity decision zoxy cannot infer
+sessions the origins should carry is a capacity decision zgix cannot infer
 from a connection count, so a listener that allows an upgrade without it is
 refused at startup. It may not exceed `conn_slots`.
 
@@ -417,13 +417,13 @@ cluster widens both halves — printed in the startup banner.
 
 When the pool is full the upgrade is refused with `503` before the
 handshake reaches the origin, so a refusal costs no backend connection.
-`zoxy_l7_shed_tunnels` counts those; `zoxy_tunnels_established` counts the
+`zgix_l7_shed_tunnels` counts those; `zgix_tunnels_established` counts the
 ones that became sessions.
 
 - `timeouts.tunnel_ms` replaces the other deadlines once a connection
   becomes a tunnel. `idle_ms` defaults to 60 s and a WebSocket is
   legitimately idle for hours, its keepalive being application-level
-  ping/pong zoxy cannot see through opaque bytes. Default one hour, floor
+  ping/pong zgix cannot see through opaque bytes. Default one hour, floor
   one second, ceiling one day. Unlike `request_ms` there is no `0` for no
   cap, because a tunnel holds a pool slot for its whole life.
 - The upgraded upstream connection leaves the keep-alive pool and is never
@@ -448,7 +448,7 @@ is 1 MiB, nginx's `client_max_body_size`; `0` accepts any size:
   "max_body_bytes": 5242880 } }
 ```
 
-zoxy itself is unharmed by a large upload: the recv → send → recv relay
+zgix itself is unharmed by a large upload: the recv → send → recv relay
 keeps per-connection memory constant whatever the stream size, so an
 unbounded body costs one relay buffer and no more. The cap protects the
 origin, which most application stacks assume the proxy in front will do.
@@ -462,8 +462,8 @@ origin is dialed, and the connection closes with the body still unread in
 the socket. A chunked body announces no size, so it is measured as it
 arrives: caught before the response leg is armed it gets the same `413`,
 and caught later it can only be a teardown, since by then no status can be
-sent. `zoxy_l7_body_over_limit` counts the first, a client told why, and
-`zoxy_l7_body_cut_mid_stream` the second, a client that lost its
+sent. `zgix_l7_body_over_limit` counts the first, a client told why, and
+`zgix_l7_body_cut_mid_stream` the second, a client that lost its
 connection.
 
 > [!IMPORTANT]
@@ -486,8 +486,8 @@ table selects:
             { "prefix": "/", "cluster": "origin" }
         ],
         "tls": {
-            "cert": "/etc/zoxy/fullchain.pem",
-            "key": "/etc/zoxy/key.pem"
+            "cert": "/etc/zgix/fullchain.pem",
+            "key": "/etc/zgix/key.pem"
         },
         "max_connections": 64,
         "max_response_bytes": 65536
@@ -515,7 +515,7 @@ The answers the listener writes itself can wear configured pages:
     {
         "bind": "0.0.0.0:443",
         "routes": [ { "prefix": "/", "cluster": "origin" } ],
-        "tls": { "cert": "/etc/zoxy/fullchain.pem", "key": "/etc/zoxy/key.pem" },
+        "tls": { "cert": "/etc/zgix/fullchain.pem", "key": "/etc/zgix/key.pem" },
         "error_pages": {
             "no_route": "friendly-404",
             "bad_gateway": "origin-down",
@@ -627,7 +627,7 @@ bytes where the TCP line counts wire bytes, and naming no configured
 headers yet — and its requests, responses, `502`/`504` verdicts, `503`
 sheds and opened/closed sessions land in the same process counters as
 the HTTP/1.1 traffic, rendering through `/metrics` and the exit tally
-as the `zoxy_h3_*` family: every h3 request lands in exactly one verdict
+as the `zgix_h3_*` family: every h3 request lands in exactly one verdict
 bucket — `h3_responses`, `h3_bad_gateway`, `h3_gateway_timeout`,
 `h3_shed_busy`, or `h3_no_route` — the sum a deployment's h3 traffic
 answers to, with `h3_no_route` the operational signal a mistyped-host
@@ -747,8 +747,8 @@ the request.
 forward-proxy behaviour. `TRACE` echoes a request back, which is the
 Cross-Site Tracing vector.
 
-`OPTIONS` honours `Max-Forwards`. At `0` zoxy answers it with `200` and an
-`Allow` describing zoxy itself, and never dials a backend. Above `0` the
+`OPTIONS` honours `Max-Forwards`. At `0` zgix answers it with `200` and an
+`Allow` describing zgix itself, and never dials a backend. Above `0` the
 request is forwarded with the value decremented. The field is read only
 for `OPTIONS`, and CORS preflights carry no `Max-Forwards`, so ordinary
 traffic is unaffected.
@@ -809,9 +809,9 @@ originates, there it terminates.
         "endpoints": ["10.0.0.1:8443"],
         "tls": {
             "server_name": "api.internal.example",
-            "ca_file": "/etc/zoxy/origin-ca.pem",
-            "client_cert": "/etc/zoxy/zoxy.pem",
-            "client_key": "/etc/zoxy/zoxy.key"
+            "ca_file": "/etc/zgix/origin-ca.pem",
+            "client_cert": "/etc/zgix/zgix.pem",
+            "client_key": "/etc/zgix/zgix.key"
         }
     }
 }
@@ -892,7 +892,7 @@ config is rejected.
 
 #### Reaching a local app over a Unix socket
 
-When zoxy runs on the same host as the application it fronts, an endpoint
+When zgix runs on the same host as the application it fronts, an endpoint
 can be a socket file instead of a loopback address:
 
 ```json
@@ -947,12 +947,12 @@ filesystem permissions.
 
 #### Accepting on a socket file
 
-`bind` takes the same `unix:` grammar, so a local process reaches zoxy
+`bind` takes the same `unix:` grammar, so a local process reaches zgix
 through a file rather than a port:
 
 ```json
 {
-    "bind": "unix:/run/zoxy.sock",
+    "bind": "unix:/run/zgix.sock",
     "mode": "0660",
     "http": { "cluster": "app" }
 }
@@ -964,7 +964,7 @@ duplicate, as two on one `IP:port` are.
 
 The socket file's lifecycle:
 
-| at startup, the path… | zoxy |
+| at startup, the path… | zgix |
 |---|---|
 | does not exist | creates it |
 | is a socket | removes it, then creates it — a killed process must not wedge every later start |
@@ -1024,7 +1024,7 @@ names what "one client" means:
 ```
 
 It keeps **no table**. The kernel spreads one client's connections across
-zoxy processes by hashing the 4-tuple, so a per-process table would be
+zgix processes by hashing the 4-tuple, so a per-process table would be
 consulted by processes that never saw that client. Being a pure function
 of the key and the healthy set, every process agrees without sharing
 anything.
@@ -1067,7 +1067,7 @@ listener never parses a request.
 ```
 
 The named cookie carries the assignment itself: a 16-hex **endpoint tag**
-zoxy mints from the endpoint's address, stable across restarts, processes
+zgix mints from the endpoint's address, stable across restarts, processes
 and config reordering. A request with no cookie is placed on the calmest
 backend and the response sets one (`Set-Cookie: srv_id=<tag>; Path=/;
 HttpOnly`, a session cookie with no expiry, plus `; Secure` when the
@@ -1077,13 +1077,13 @@ an ejected, drained or removed backend is re-placed and the response
 re-announces. Every user behind one NAT address carries their own
 assignment.
 
-Pick a cookie name the application does not use; zoxy adds its
+Pick a cookie name the application does not use; zgix adds its
 `Set-Cookie` beside the origin's, never in place of them. The tag is not
 signed: a forged cookie can only choose which of *your* backends serves
 that client.
 
 Three counters partition a cookie cluster's responses:
-`zoxy_l7_sticky_followed`, `..._assigned` and `..._repicked`. A rising
+`zgix_l7_sticky_followed`, `..._assigned` and `..._repicked`. A rising
 repick rate means backends are flapping under a sticky population.
 
 ### Health checks
@@ -1112,7 +1112,7 @@ data traffic; if every engine is serving a request, that probe is skipped
 rather than recorded as a failure, so saturation cannot eject a healthy
 endpoint.
 
-If *every* endpoint in a cluster is ejected, zoxy fails open and uses them
+If *every* endpoint in a cluster is ejected, zgix fails open and uses them
 all. Routing nowhere would turn a probe verdict into an outage.
 
 ### Passive ejection
@@ -1162,7 +1162,7 @@ endpoint is drained with `"weight": 0`.
 
 ### Per-endpoint in-flight cap
 
-`max_inflight` caps the concurrent work zoxy will ask of **one endpoint**.
+`max_inflight` caps the concurrent work zgix will ask of **one endpoint**.
 It is per server, so a three-endpoint cluster with a cap of 100 admits up
 to 300, the same shape as HAProxy's `server ... maxconn`.
 
@@ -1174,19 +1174,19 @@ to 300, the same shape as HAProxy's `server ... maxconn`.
 ```
 
 An endpoint at its cap is skipped, so requests keep flowing while any
-endpoint has room. When *every* endpoint is full zoxy refuses: an HTTP
+endpoint has room. When *every* endpoint is full zgix refuses: an HTTP
 request is answered `503` and an L4 connection is closed, since a byte
 relay has no way to say "try later". Absent, a cluster is uncapped.
 
-This is the one limit that fails **closed**. An ejected cluster means zoxy
+This is the one limit that fails **closed**. An ejected cluster means zgix
 does not know whether the endpoints work, so trying is better than
-refusing; a capped one means zoxy knows they are full.
+refusing; a capped one means zgix knows they are full.
 
 Both protocols count against the same figure: an in-flight HTTP request
 and a live L4 connection are each one unit of work.
-`zoxy_l7_shed_endpoint_inflight` and `zoxy_l4_shed_endpoint_inflight`
-count refusals, kept apart from `zoxy_l7_shed_upstream_slots`, which means
-zoxy ran out of its own slots and wants a wider pool rather than a busier
+`zgix_l7_shed_endpoint_inflight` and `zgix_l4_shed_endpoint_inflight`
+count refusals, kept apart from `zgix_l7_shed_upstream_slots`, which means
+zgix ran out of its own slots and wants a wider pool rather than a busier
 backend.
 
 ### Rate limiting
@@ -1216,8 +1216,8 @@ The table is fixed at load and probed at most eight slots deep: no
 allocation per request and no unbounded scan. Keying is per address, not
 per listener, so one client hitting two listeners shares a bucket. A
 table with no free slot within the probe **fails open** and increments
-`zoxy_l7_rate_limit_full` — a rising count is the signal to widen
-`rate_limit_entries`, not an outage. `zoxy_l7_rate_limited` counts the
+`zgix_l7_rate_limit_full` — a rising count is the signal to widen
+`rate_limit_entries`, not an outage. `zgix_l7_rate_limited` counts the
 `429`s. A `unix:`-bound listener has no client address and is inert.
 
 Limit the head only: malformed or oversized requests are answered before
@@ -1253,7 +1253,7 @@ still be unread.
 
 One request that fits but whose identity the table cannot place (no free
 slot within eight probes) **fails open** and increments
-`zoxy_l7_conn_limit_full`; `zoxy_l7_conn_limited` counts the `503`s. As
+`zgix_l7_conn_limit_full`; `zgix_l7_conn_limited` counts the `503`s. As
 with rate limiting, a rising `conn_limit_full` is the signal to widen
 `limits.conn_limit_entries`, not an outage. Connections that never send a
 request are bounded by the global `conn_slots` pool instead.
@@ -1268,7 +1268,7 @@ the address first, then pass it on in whichever form the origin can read.
 
 #### Receiving PROXY protocol
 
-Behind a load balancer, zoxy sees only the balancer. That breaks more than
+Behind a load balancer, zgix sees only the balancer. That breaks more than
 logging: a `source_ip`-keyed hash pick reads the client address, so every
 connection hashes alike and the whole fleet lands on one endpoint. An `l4`
 listener can instead require each connection to open with a PROXY protocol
@@ -1293,21 +1293,21 @@ that does not open with a valid header, so it is unusable by anything
 except the proxy in front of it. Turn it on only where the listener is
 reachable exclusively through that proxy.
 
-What the header announces is what zoxy believes everywhere the client
+What the header announces is what zgix believes everywhere the client
 address is used. A header that announces nothing (v1 `UNKNOWN`, v2
 `LOCAL`, the shapes a balancer's own health checks arrive in) is accepted
 and keeps the observed peer. Headers are capped at 512 bytes: v2 TLVs
 within the cap are skipped, and a declared length past it is refused at
 once. Header bytes never count toward the log's `bytes_in`.
 
-`zoxy_l4_proxy_header_accepted` and `zoxy_l4_proxy_header_invalid` count
+`zgix_l4_proxy_header_accepted` and `zgix_l4_proxy_header_invalid` count
 the verdicts. A rising `invalid` means something other than the configured
 proxy is reaching the listener. `http` listeners reject the block: the L7
 receive phase does not exist yet.
 
 #### X-Forwarded-For
 
-Without this, everything *behind* zoxy sees zoxy: origin logs, IP
+Without this, everything *behind* zgix sees zgix: origin logs, IP
 allowlists, per-client rate limits. An `http` listener can add
 `X-Forwarded-For`:
 
@@ -1322,11 +1322,11 @@ allowlists, per-client rate limits. An `http` listener can add
 ```
 
 There is no default mode. Each answer is a security bug in the other's
-position, and zoxy cannot tell from the inside which position it is in.
+position, and zgix cannot tell from the inside which position it is in.
 
 | mode | behaviour | use when |
 |---|---|---|
-| `replace` | state the peer zoxy observed, discard any inbound chain | **at the edge** — an inbound chain is client-controlled there, so honouring it lets a caller pick the address your allowlists then trust |
+| `replace` | state the peer zgix observed, discard any inbound chain | **at the edge** — an inbound chain is client-controlled there, so honouring it lets a caller pick the address your allowlists then trust |
 | `append` | extend the inbound chain with the observed peer | **only behind proxies you own** — anywhere else this is the forgery above, appended to |
 
 Omit the block and the header is passed through untouched.
@@ -1354,7 +1354,7 @@ them.
 The carried chain is bounded. A chain grows by an address per hop and
 nothing in HTTP caps it, so past `forwarded_chain_bytes_max` (512) it is
 dropped *whole*, leaving the line stating only the observed peer. A
-truncated chain would read as complete. `zoxy_forwarded_chain_dropped`
+truncated chain would read as complete. `zgix_forwarded_chain_dropped`
 counts that.
 
 #### Sending PROXY protocol
@@ -1374,7 +1374,7 @@ what its origins expect, the same unit as HAProxy's `send-proxy`:
 ```
 
 `send` is `v1` (text, readable in a tcpdump) or `v2` (binary, what cloud
-load balancers speak). The header names the client zoxy believes, which
+load balancers speak). The header names the client zgix believes, which
 behind a `require` listener is the client the *fronting* proxy announced,
 so a chain of proxies carries one identity end to end.
 
@@ -1389,7 +1389,7 @@ The header is per *connection*, with two consequences:
   against a sending cluster probes bare. If the origin strictly requires
   the header, use `tcp` checks there.
 
-`zoxy_l4_proxy_header_sent` counts headers staged, one per dialed
+`zgix_l4_proxy_header_sent` counts headers staged, one per dialed
 connection to a sending cluster.
 
 ### Filters
@@ -1465,7 +1465,7 @@ routed or dialed; a filter `allow` cannot exempt it.
   header **value**.
 - `status` is `403` by default and may be `400`, `403`, `404` or `429`
   (the static reject set).
-- `zoxy_l7_waf_blocked` counts hits.
+- `zgix_l7_waf_blocked` counts hits.
 
 It is deliberately head-only: no body inspection, no percent-decoding, no
 regex, no Unicode folding, and no provenance for a substring. Those are
@@ -1517,13 +1517,13 @@ everyone else does. `true` is the only value it takes.
 > ]
 > ```
 
-The address matched is the one zoxy believes: the TCP peer, or the
+The address matched is the one zgix believes: the TCP peer, or the
 [PROXY-protocol-announced client](#receiving-proxy-protocol) on a
 listener that requires the header. Never an `X-Forwarded-For` chain,
 which any client can write. Prefixes run to `/32` for IPv4 and `/64` for
 IPv6 (the same rule sticky hashing uses), the `/len` is mandatory, and
 host bits past the prefix are rejected: `10.0.0.1/8` is a typo for one of
-two different ranges, and zoxy will not guess which.
+two different ranges, and zgix will not guess which.
 
 #### Redirects
 
@@ -1549,10 +1549,10 @@ nothing else. It still needs a `cluster` or `routes` the loader can check,
 but filters run before routing, so nothing is ever dialed.
 
 A composed target replaces the scheme, which is required because behind a
-TLS terminator every hop zoxy sees is plaintext, and optionally the host.
+TLS terminator every hop zgix sees is plaintext, and optionally the host.
 The request's own path and query are carried through. A fixed `location`
 is the other form, sent verbatim. Statuses are `301`, `302`, `307`, `308`.
-Redirects count as `zoxy_l7_redirected` and log as `redirected`, separate
+Redirects count as `zgix_l7_redirected` and log as `redirected`, separate
 from rejects, so refused traffic and relocated traffic never blur.
 
 #### Response filters
@@ -1579,22 +1579,22 @@ header verbs only. `reject`, `allow` and `rewrite_prefix` are request-side
 ideas, and the loader says so by name if you reach for them here.
 
 The same guardrails hold in both directions: filters may not touch the
-headers zoxy owns (`Content-Length`, `Transfer-Encoding`, `Connection` and
+headers zgix owns (`Content-Length`, `Transfer-Encoding`, `Connection` and
 the hop-by-hop set, `X-Forwarded-For`), and a response head that no
-longer fits after edits is answered `502`. Responses zoxy generates itself
+longer fits after edits is answered `502`. Responses zgix generates itself
 (`404`, `503`, filter rejects, a `respond` action's body) are not origin
 responses and carry no edits.
 
 ### Response bodies
 
-Every status zoxy sends itself is empty by default. `bodies` names content
+Every status zgix sends itself is empty by default. `bodies` names content
 once, from a file read at startup or inline for one-liners, and anything
 that serves content references it by name:
 
 ```json
 "bodies": {
-    "maintenance": { "file": "/etc/zoxy/503.html", "content_type": "text/html; charset=utf-8" },
-    "not-found":   { "file": "/etc/zoxy/404.html", "content_type": "text/html; charset=utf-8" },
+    "maintenance": { "file": "/etc/zgix/503.html", "content_type": "text/html; charset=utf-8" },
+    "not-found":   { "file": "/etc/zgix/404.html", "content_type": "text/html; charset=utf-8" },
     "robots":      { "inline": "User-agent: *\nDisallow: /private\n",
                      "content_type": "text/plain" }
 },
@@ -1607,14 +1607,14 @@ one buffer. A name that does not exist is a startup error. `content_type`
 is required; nothing is guessed from a filename. Files are read at
 startup like the rest of the config, so **changing one needs a restart**.
 
-`error_pages` accepts only the statuses zoxy actually sends: `400`,
+`error_pages` accepts only the statuses zgix actually sends: `400`,
 `403`, `404`, `408`, `413`, `414`, `429`, `431`, `501`, `502`, `503`,
 `504`. A page for anything else is refused at load.
 
-Every response zoxy answers *itself* (those pages, the empty defaults, the
-redirects) carries a `Date` and `Server: zoxy`. Responses from an origin
+Every response zgix answers *itself* (those pages, the empty defaults, the
+redirects) carries a `Date` and `Server: zgix`. Responses from an origin
 are forwarded with the origin's own headers and gain neither, so
-`Server: zoxy` on a `503` tells you the proxy raised it and the backend
+`Server: zgix` on a `503` tells you the proxy raised it and the backend
 was never asked.
 
 Bodies live in memory. A `503` is raised because something ran out, so an
@@ -1640,7 +1640,7 @@ served. There is no second switch.
 `respond` answers from a body instead of forwarding: a `robots.txt`, a
 maintenance window, a health target the balancer serves itself. It stops
 the request like `reject` and `redirect` do, but counts as
-`zoxy_l7_responded` and logs as `responded`, since refusing traffic and
+`zgix_l7_responded` and logs as `responded`, since refusing traffic and
 serving it are different facts. Statuses are `200` plus the error set.
 
 #### Precompressed static answers
@@ -1686,7 +1686,7 @@ banner, so there is no per-request allocation.
 This is not full streaming compression: Zig's `std.compress.flate`
 exposes no flush, so a pump that reads and writes one chunk at a time
 cannot emit a valid gzip stream incrementally. Streaming responses (SSE,
-large bodies, chunked) therefore pass through uncompressed — front zoxy
+large bodies, chunked) therefore pass through uncompressed — front zgix
 with a CDN, or compress at the origin, when those need it.
 
 ### Timeouts
@@ -1712,7 +1712,7 @@ idle budget is a mistake rather than a policy.
 
 > [!WARNING]
 > `connect_ms` must be **strictly below** `head_ms`, which must be at or
-> below `idle_ms`, or the config is rejected at load. zoxy keeps one timer
+> below `idle_ms`, or the config is rejected at load. zgix keeps one timer
 > per connection and never moves it earlier once armed. The first deadline
 > is the dial budget and the dial's completion re-arms it to the idle one,
 > so an idle budget that does not exceed the dial budget would reap late
@@ -1757,7 +1757,7 @@ group down with it.
 Caddy all wait forever by default, Traefik picks 10 s and Envoy 600 s.
 Whatever sent the signal already owns the upper bound (systemd's
 `TimeoutStopSec`, Kubernetes' `terminationGracePeriodSeconds`) and ends
-the wait with `SIGKILL`. Set a number here when you want zoxy to give up
+the wait with `SIGKILL`. Set a number here when you want zgix to give up
 before your platform does.
 
 ### Limits
@@ -1784,7 +1784,7 @@ feature it sizes is configured. Both are described further down.
 The defaults are lean: 1386 connection slots, 1386 relay buffer pairs,
 1311 upstream slots, roughly 34 MiB of pools, sized to start under a stock
 4096 `RLIMIT_NOFILE`. The ceiling is 11457 of each. Raising the pools
-raises the file-descriptor demand, which zoxy asserts against
+raises the file-descriptor demand, which zgix asserts against
 `RLIMIT_NOFILE` at startup rather than discovering as `EMFILE` later.
 
 `head_buffers` and `upstream_head_buffers` bound *request heads in flight*
@@ -1799,7 +1799,7 @@ it for big-cookie or JWT traffic. 1 KiB to 1 MiB, default 8 KiB.
 `tls_engines` bounds *TLS sessions in flight*, handshaking or terminated,
 and is zero unless some listener has a `tls` block. It decides what a TLS
 deployment costs: an engine is by far the largest per-connection object
-zoxy holds, about 111 KiB plus a 32 KiB plaintext buffer, so 1024 of them
+zgix holds, about 111 KiB plus a 32 KiB plaintext buffer, so 1024 of them
 is roughly 170 MiB. It defaults to your connection slots capped at 1024,
 and the startup banner prints the total. Lower it if that is more
 concurrent TLS than you serve.
@@ -1836,19 +1836,19 @@ nginx's figure, and `0` is unlimited. It is the one bound that reaches a
 connection that keeps asking, which is the one holding a conn slot and,
 on every request, a head buffer and an upstream lease. Past the cap the
 next response announces `Connection: close`, never a silent reset, and the
-client reconnects. `zoxy_l7_keepalive_requests_capped` counts it, and only
+client reconnects. `zgix_l7_keepalive_requests_capped` counts it, and only
 where the cap is the *binding* reason, so a rising count is the cap
 working rather than churn it coincided with.
 
 A parked *upstream* connection is not capped, where nginx caps both. It
 is shared across clients and carries the reuse the design rests on, and
 the occupancy this bounds is a client's, not an origin's. An origin that
-wants its own bound can announce it, and zoxy honours what an origin says
+wants its own bound can announce it, and zgix honours what an origin says
 about persistence.
 
 `cq_fill_eighths` trades connection ceiling for `io_uring`
 completion-queue burst headroom; `access_log_buffer_bytes` sizes the
-access log's staging buffers. What zoxy does when one of these pools runs
+access log's staging buffers. What zgix does when one of these pools runs
 out is [Under load](#under-load).
 
 ## Observability
@@ -1857,13 +1857,34 @@ out is [Under load](#under-load).
 
 An optional listener serves Prometheus exposition text: every shed rung,
 every lifecycle counter, and live pool-occupancy gauges. The experimental
-HTTP/3 path renders there too: the global `zoxy_h3_*` counter family
+HTTP/3 path renders there too: the global `zgix_h3_*` counter family
 (requests, responses, the `bad_gateway`/`gateway_timeout`/`shed_busy`/
 `no_route` verdicts, session opens and closes) plus, after the labeled
 breakdown, one row per configured h3 listener — live sessions, cumulative
 requests and relayed responses, and the parked keep-alive pool, each
 labeled by the listener's bind. The exit tally carries the global family;
 the per-listener rows are the scrape's alone.
+
+Four inventory families follow, the `*_info` convention — a constant-1
+gauge whose information lives in the labels — giving a control panel its
+site/application 清单 view straight off the scrape:
+
+```
+zgix_info{version="0.9.0"} 1
+zgix_listener_info{bind="0.0.0.0:443",kind="http",routes="12"} 1
+zgix_route_info{listener="0.0.0.0:443",host="api.example",prefix="/api",header="x-canary",cluster="api"} 1
+zgix_endpoint_info{cluster="api",endpoint="10.0.0.1:8080"} 1
+```
+
+`kind` is the listener's protocol (`http`, `l4`, `h3`; TLS termination
+does not rename an http listener). A route's `host` and `header` labels
+appear only when the route names them — an absent label means "any", the
+Prometheus convention — and `header` carries the predicate's name. h3
+listeners' routes share `route_info`, disambiguated by the `listener`
+label; an l4 listener's synthetic admission route is not path routing and
+stays out. Labels are prebuilt at startup and the render bound is priced
+over the same walks, so the scrape stays zero-allocation like everything
+else on this endpoint.
 
 ```json
 "admin": { "bind": "127.0.0.1:9100" }
@@ -1875,23 +1896,23 @@ is the only way to read live counters; no signal prints them, because a
 second snapshot on one stream invalidates the first.
 
 The gauges matter as much as the counters: a `shed_*` counter only moves
-once a wall is hit, while `zoxy_conn_slots_in_use` against
-`zoxy_conn_slots_capacity` shows the approach.
+once a wall is hit, while `zgix_conn_slots_in_use` against
+`zgix_conn_slots_capacity` shows the approach.
 
 The scrape also says **which backend**, per cluster and endpoint:
 
 ```text
-zoxy_endpoint_responses{cluster="api",endpoint="10.0.0.1:8080"} 4182
-zoxy_endpoint_connect_failed{cluster="api",endpoint="10.0.0.2:8080"} 17
-zoxy_endpoint_health_down{cluster="api",endpoint="10.0.0.2:8080"} 2
-zoxy_endpoint_healthy{cluster="api",endpoint="10.0.0.2:8080"} 0
+zgix_endpoint_responses{cluster="api",endpoint="10.0.0.1:8080"} 4182
+zgix_endpoint_connect_failed{cluster="api",endpoint="10.0.0.2:8080"} 17
+zgix_endpoint_health_down{cluster="api",endpoint="10.0.0.2:8080"} 2
+zgix_endpoint_healthy{cluster="api",endpoint="10.0.0.2:8080"} 0
 ```
 
 Dial failures, responses served and the health transitions
 (`endpoint_health_down` and `_up`) carry both labels. The "every endpoint
 was full" sheds carry only `cluster`, since no single endpoint was full.
-Two gauges read live state: `zoxy_endpoint_inflight` is the level the
-balancer compares, and `zoxy_endpoint_healthy` is the prober's current
+Two gauges read live state: `zgix_endpoint_inflight` is the level the
+balancer compares, and `zgix_endpoint_healthy` is the prober's current
 verdict, rendered for health-checked clusters only. Each labeled family
 sums to the bare process total it breaks down, an identity the simulator
 asserts on every seed. Label cardinality is bounded by the config
@@ -1903,12 +1924,12 @@ prices what the labels and their render buffers cost.
 Two families give a scrape the rest of the RED triad:
 
 ```text
-zoxy_cluster_responses{cluster="api",class="2xx"} 4182
-zoxy_cluster_responses{cluster="api",class="5xx"} 17
-zoxy_cluster_duration_seconds_bucket{cluster="api",le="0.005000000"} 3910
-zoxy_cluster_duration_seconds_bucket{cluster="api",le="+Inf"} 4199
-zoxy_cluster_duration_seconds_sum{cluster="api"} 12.884901888
-zoxy_cluster_duration_seconds_count{cluster="api"} 4199
+zgix_cluster_responses{cluster="api",class="2xx"} 4182
+zgix_cluster_responses{cluster="api",class="5xx"} 17
+zgix_cluster_duration_seconds_bucket{cluster="api",le="0.005000000"} 3910
+zgix_cluster_duration_seconds_bucket{cluster="api",le="+Inf"} 4199
+zgix_cluster_duration_seconds_sum{cluster="api"} 12.884901888
+zgix_cluster_duration_seconds_count{cluster="api"} 4199
 ```
 
 `cluster_responses` is the status the client actually received, classed.
@@ -1926,7 +1947,7 @@ Cluster is the granularity that answers "which backend got slow" without
 multiplying the axis that already dominates.
 
 The bucket ladder is compiled in: eighteen boundaries, 2.5× apart from
-25 µs to 10 s, so every zoxy's histogram is directly comparable to every
+25 µs to 10 s, so every zgix's histogram is directly comparable to every
 other's, and `_sum` and `_count` give an exact mean whatever the buckets
 do.
 
@@ -1934,7 +1955,7 @@ Only **completed** exchanges are observed. An exchange the client cut off
 mid-response is not in the histogram, so p99 measures how long serving
 takes rather than how long clients wait before giving up. Those show as
 `outcome: aborted` in the access log. `_count` therefore equals
-`zoxy_l7_responses` exactly, an identity the simulator asserts on every
+`zgix_l7_responses` exactly, an identity the simulator asserts on every
 seed.
 
 ### Access log
@@ -1951,18 +1972,29 @@ timeouts included) and one per L4 connection.
 ```
 
 `outcome` is what `status` cannot tell you: an origin answering `503` and
-zoxy shedding a request with `503` are the same three digits and opposite
+zgix shedding a request with `503` are the same three digits and opposite
 events. It reads `ok`, `rejected`, `shed`, `timed_out`, `upstream_failed`,
 `aborted`, or `closed`. The last is for L4 connections and for
 [tunnels](#tunnelled-upgrades-websocket), which end the way a relay ends
 rather than the way an exchange does.
 
 Logging never blocks the event loop, so a sink that stalls costs dropped
-lines rather than latency. `zoxy_access_log_dropped` counts them exactly.
+lines rather than latency. `zgix_access_log_dropped` counts them exactly.
+
+#### The admin endpoint's log tail
+
+The metrics scrape ends with a short access-log tail, whether or not a sink
+is configured: a `# zgix_access_log` marker line, then the newest HTTP
+lines as `# <json>` comments — one object per line, oldest first, in the
+same `outcome` vocabulary as the sink's. It is a bounded ring (the newest
+128 lines at 512 bytes each), so it answers without reading a file and
+never blocks the loop; a fact that does not exist for a request (no
+`upstream` chosen, an unparsed head) is an omitted key rather than a null.
+The bundled control panel's *logs* view parses exactly this section.
 
 #### Logging request headers
 
-By default a zoxy line and the backend's line for the same request share
+By default a zgix line and the backend's line for the same request share
 no key, so a slow request cannot be attributed to a hop. Naming headers
 fixes that without changing a byte on the wire:
 
@@ -1978,7 +2010,7 @@ fixes that without changing a byte on the wire:
 {"...":"...","status":200,"upstream_reused":true,"upstream_replayed":false,"request_headers":{"x-request-id":"7f3c…","user-agent":"curl/8.6.0"},"response_headers":{"x-cache":"HIT"},"duration_us":1873}
 ```
 
-zoxy does not mint an identifier. It is usually not the outermost hop: a
+zgix does not mint an identifier. It is usually not the outermost hop: a
 CDN, cloud LB or ingress in front almost always sets `X-Request-ID` or
 `traceparent`, and that header reaches the origin untouched, so logging it
 at both ends is the whole join. The same mechanism serves other purposes:
@@ -1987,7 +2019,7 @@ routing, the origin's `X-Cache` on the way out.
 
 Names are matched case-insensitively and logged lowercased. A header that
 did not arrive is omitted rather than logged as null. A repeated header
-logs its first value, the one zoxy itself read. Values are truncated at
+logs its first value, the one zgix itself read. Values are truncated at
 256 bytes with a trailing `...`, and up to 8 headers may be named across
 both lists. `response_headers` is ignored for L4 lines, which have no
 response to read. Absent lists leave the line exactly as it was.
@@ -1995,7 +2027,7 @@ response to read. Absent lists leave the line exactly as it was.
 The values are held per connection for the life of a request, so naming
 headers costs memory proportional to `conn_slots`, which the startup
 banner prints. A wider line also needs a staging buffer that can hold
-one; zoxy refuses to start rather than dropping every line that carries
+one; zgix refuses to start rather than dropping every line that carries
 them.
 
 `sink` is either `stdout`, the process's own standard output, inherited
@@ -2003,7 +2035,7 @@ rather than opened, so it costs no file descriptor and has no rotation
 story of its own, or `file` with a `path`:
 
 ```json
-"access_log": { "sink": "file", "path": "/var/log/zoxy/access.log" }
+"access_log": { "sink": "file", "path": "/var/log/zgix/access.log" }
 ```
 
 The file is created if absent and opened append-only at startup, never
@@ -2012,10 +2044,10 @@ every write lands at the current end, wherever the rotation just put it.
 
 Move-based rotation is served by `SIGHUP`, which reopens the configured
 path. The new fd opens *first*: a reopen that cannot open its file keeps
-the old one and counts `zoxy_access_log_reopen_failed`, because a failed
+the old one and counts `zgix_access_log_reopen_failed`, because a failed
 rotation must not destroy a working log. The swap happens only between
 writes, never under one, so every line accepted after the signal lands in
-the new file. `zoxy_access_log_reopened` counts the rotations that took.
+the new file. `zgix_access_log_reopened` counts the rotations that took.
 A successful reopen also heals a sink that had broken, since what broke
 was the fd the rotation just replaced. On a `stdout` sink, or with no log
 configured, `SIGHUP` is a no-op.
@@ -2023,10 +2055,10 @@ configured, `SIGHUP` is a no-op.
 ### Proxy-Status
 
 The access log answers you. This answers the client. A `503` from an
-overloaded zoxy and a `503` from a healthy zoxy relaying an overloaded
+overloaded zgix and a `503` from a healthy zgix relaying an overloaded
 backend are indistinguishable on the wire, and only one of them is your
 problem. Setting `proxy_status` on an `http` listener makes the pages
-zoxy renders *itself* say so, in an RFC 9209 `Proxy-Status` field:
+zgix renders *itself* say so, in an RFC 9209 `Proxy-Status` field:
 
 ```json
 {
@@ -2042,17 +2074,17 @@ zoxy renders *itself* say so, in an RFC 9209 `Proxy-Status` field:
 HTTP/1.1 503 Service Unavailable
 Content-Length: 0
 Date: Wed, 01 Jan 2020 00:00:00 GMT
-Server: zoxy
-Proxy-Status: zoxy; error=connection_limit_reached
+Server: zgix
+Proxy-Status: zgix; error=connection_limit_reached
 ```
 
 Four causes carry a token, and only those four:
 
 | cause | status | `error=` |
 |---|---|---|
-| no route matched — zoxy never dialed a backend, so the origin was not asked about this path | `404` | `destination_not_found` |
-| a [filter](#filters) refused on policy — zoxy's rule, not the origin's answer | the status the rule names (`400`/`403`/`404`/`429`) | `http_request_denied` |
-| a zoxy limit, any rung of the shed ladder — slots, buffers, tunnels, per-endpoint in-flight | `503` | `connection_limit_reached` |
+| no route matched — zgix never dialed a backend, so the origin was not asked about this path | `404` | `destination_not_found` |
+| a [filter](#filters) refused on policy — zgix's rule, not the origin's answer | the status the rule names (`400`/`403`/`404`/`429`) | `http_request_denied` |
+| a zgix limit, any rung of the shed ladder — slots, buffers, tunnels, per-endpoint in-flight | `503` | `connection_limit_reached` |
 | the backend was dialed and did not answer in time | `504` | `http_response_timeout` |
 
 The token names the **cause, not the status**. A filter rejecting with
@@ -2064,9 +2096,9 @@ Everything else is silent. A `400`, `413`, `414` or `431` that is the
 request's own fault gets nothing, because 9209's only fitting token
 (`http_request_error`) restates the status line. A `502` is skipped for
 the opposite reason: a refused dial, a reset mid-response and a malformed
-origin head are three different 9209 causes that zoxy answers at one
+origin head are three different 9209 causes that zgix answers at one
 place, so any single token would be right by accident. A `Proxy-Status`
-from zoxy therefore always carries something the status line did not.
+from zgix therefore always carries something the status line did not.
 
 What it does not do:
 
@@ -2074,7 +2106,7 @@ What it does not do:
   topology to every client that can provoke an error. The endpoint is in
   the access log.
 - **An upstream proxy's field survives.** `Proxy-Status` is a List, and
-  zoxy sets it only on pages it renders itself. A relayed response carries
+  zgix sets it only on pages it renders itself. A relayed response carries
   whatever the hop before it wrote, unedited, so a chain reads back in
   order.
 - **Configured error pages win.** A status you gave a body for in
@@ -2086,12 +2118,12 @@ What it does not do:
 > Off by default, and per listener, on the same reasoning as
 > [`forwarded`](#x-forwarded-for): the field states which of *this
 > proxy's* limits a caller hit. Inside a mesh that is a diagnostic; at an
-> untrusted edge it is a capacity disclosure, and zoxy cannot tell from
+> untrusted edge it is a capacity disclosure, and zgix cannot tell from
 > the inside which side of that line a listener is on.
 
 ## Under load
 
-When a resource is exhausted, zoxy degrades the newest work, keeps serving
+When a resource is exhausted, zgix degrades the newest work, keeps serving
 admitted work, and never allocates, blocks or dies. Every limit has a
 defined answer rather than an unbounded queue.
 
@@ -2136,5 +2168,5 @@ it does.
   integers.
 - [IMPLEMENTATION_NOTES.md](IMPLEMENTATION_NOTES.md) — measured findings,
   shelved experiments and open technical questions.
-- [zoxy.io/config](https://zoxy.io/config/) — every field, bound and default,
+- [zgix.io/config](https://zgix.io/config/) — every field, bound and default,
   rendered from the JSON Schema of the latest release.

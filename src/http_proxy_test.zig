@@ -18,7 +18,7 @@ const shed = @import("shed.zig");
 /// this is the value nearly every expectation below wants — the few
 /// scenarios that *do* cross a second spell their own, which is the
 /// clock proving it is live rather than pinned.
-const expected_date = "Date: Wed, 01 Jan 2020 00:00:00 GMT\r\nServer: zoxy\r\n";
+const expected_date = "Date: Wed, 01 Jan 2020 00:00:00 GMT\r\nServer: zgix\r\n";
 
 /// The `Date` and `Server` the bed's *origin* sends on the fixtures that
 /// carry them — deliberately unlike anything this proxy would write
@@ -59,7 +59,7 @@ const assert = std.debug.assert;
 const fixture_cert_pem = @embedFile("tls/testdata/cert.pem");
 const fixture_key_pem = @embedFile("tls/testdata/key.pem");
 /// The fixture certificate SAN a TLS client must offer.
-const fixture_host_name = "spike.zoxy.test";
+const fixture_host_name = "spike.zgix.test";
 
 const ServerSim = Server(SimIo);
 
@@ -280,7 +280,7 @@ const HttpClient = struct {
 };
 
 /// A scripted HTTP origin: reads requests (head + framed body, tracked
-/// with zoxy's own parser so the test asserts on exactly what the proxy
+/// with zgix's own parser so the test asserts on exactly what the proxy
 /// forwarded) and answers each with the canned `response`. It keeps its
 /// connection alive between requests — parked upstream connections come
 /// back to it — unless `close_after_response` scripts the origin-side
@@ -601,13 +601,13 @@ const Http1Bed = struct {
     }
 
     /// The same origin reached over a socket path (#303) — the shape a
-    /// zoxy on the same host as its application actually deploys in.
-    const origin_socket_path = "/run/zoxy-test/origin.sock";
+    /// zgix on the same host as its application actually deploys in.
+    const origin_socket_path = "/run/zgix-test/origin.sock";
 
     /// Where a `unix_listener` scenario accepts (#303) — the other half
-    /// of the same deployment, zoxy reached through a file by something
+    /// of the same deployment, zgix reached through a file by something
     /// local rather than over a port.
-    const listener_socket_path = "/run/zoxy-test/zoxy.sock";
+    const listener_socket_path = "/run/zgix-test/zgix.sock";
 
     /// An address no origin binds, so `SimIo` refuses every dial to it
     /// through its own listener lookup — the same answer a kernel gives
@@ -1668,7 +1668,7 @@ test "l7: OPTIONS asterisk-form is forwarded as \"*\", not as the \"/\" it match
 
 test "l7: a listener on a socket file serves a request (#303)" {
     // The other half of the local-origin shape: something on this host
-    // reaches zoxy through a file rather than a port. Above the accept
+    // reaches zgix through a file rather than a port. Above the accept
     // nothing changes — routing, filters, framing and the upstream leg
     // are all the same code answering the same way.
     var bed: Http1Bed = undefined;
@@ -1722,7 +1722,7 @@ test "l7: a socket-file listener logs no client address (#303)" {
 }
 
 test "l7: a Unix-socket endpoint carries a request end to end (#303)" {
-    // The deployment this exists for: zoxy on the same host as its
+    // The deployment this exists for: zgix on the same host as its
     // application, reaching it over a socket file rather than loopback —
     // no ephemeral port per request, and filesystem permissions as the
     // ACL. Above the dial nothing changes, which is the claim: a UDS is
@@ -1871,7 +1871,7 @@ test "l7: an opted-in listener names why it refused (#300)" {
 
     try std.testing.expectEqualStrings(
         "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n" ++ expected_date ++
-            "Proxy-Status: zoxy; error=destination_not_found\r\n\r\n",
+            "Proxy-Status: zgix; error=destination_not_found\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 0), bed.origin.requests_served);
@@ -1900,7 +1900,7 @@ test "l7: two 404s, two causes — the field says which (#300)" {
 
     try std.testing.expectEqualStrings(
         "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n" ++ expected_date ++
-            "Proxy-Status: zoxy; error=http_request_denied\r\n\r\n",
+            "Proxy-Status: zgix; error=http_request_denied\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_filtered"));
@@ -3476,7 +3476,7 @@ fn bedEndpointTag(bed: *const Http1Bed) [Balancer.endpoint_tag_len]u8 {
 test "l7: a sticky stamp on a terminated connection carries Secure (#125, #178)" {
     // The attribute used to ride nothing, on the reasoning that a proxy
     // which does not terminate TLS cannot know the client-facing scheme.
-    // #125 falsified that. Where zoxy terminates it knows the scheme is
+    // #125 falsified that. Where zgix terminates it knows the scheme is
     // https, and a routing cookie without `Secure` is one the browser
     // hands back over plaintext to the same host.
     //
@@ -3490,7 +3490,7 @@ test "l7: a sticky stamp on a terminated connection carries Secure (#125, #178)"
         .tls = true,
         .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
         .pick = .hash,
-        .hash_key = .{ .cookie = "zoxy-srv" },
+        .hash_key = .{ .cookie = "zgix-srv" },
     });
     defer bed.tearDown();
 
@@ -3513,7 +3513,7 @@ test "l7: a sticky stamp on a terminated connection carries Secure (#125, #178)"
     const expected = std.fmt.bufPrint(
         &expected_buffer,
         "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n" ++
-            "Set-Cookie: zoxy-srv={s}; Path=/; HttpOnly; Secure\r\n" ++
+            "Set-Cookie: zgix-srv={s}; Path=/; HttpOnly; Secure\r\n" ++
             "Connection: close\r\n\r\nhi",
         .{&bedEndpointTag(&bed)},
     ) catch unreachable;
@@ -3532,7 +3532,7 @@ test "l7: a cookieless request on a cookie cluster is assigned and stamped (#178
         // application's Set-Cookie must ride through beside it.
         .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nSet-Cookie: app=1\r\n\r\nhi",
         .pick = .hash,
-        .hash_key = .{ .cookie = "zoxy-srv" },
+        .hash_key = .{ .cookie = "zgix-srv" },
     });
     defer bed.tearDown();
 
@@ -3543,7 +3543,7 @@ test "l7: a cookieless request on a cookie cluster is assigned and stamped (#178
     const expected = std.fmt.bufPrint(
         &expected_buffer,
         "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nSet-Cookie: app=1\r\n" ++
-            "Set-Cookie: zoxy-srv={s}; Path=/; HttpOnly\r\n" ++
+            "Set-Cookie: zgix-srv={s}; Path=/; HttpOnly\r\n" ++
             "Connection: close\r\n\r\nhi",
         .{&bedEndpointTag(&bed)},
     ) catch unreachable;
@@ -3560,14 +3560,14 @@ test "l7: a request naming the endpoint it reaches is followed, not re-stamped (
         .seed = 32,
         .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
         .pick = .hash,
-        .hash_key = .{ .cookie = "zoxy-srv" },
+        .hash_key = .{ .cookie = "zgix-srv" },
     });
     defer bed.tearDown();
 
     var request_buffer: [256]u8 = undefined;
     const request = std.fmt.bufPrint(
         &request_buffer,
-        "GET / HTTP/1.1\r\nHost: o\r\nCookie: theme=dark; zoxy-srv={s}\r\n" ++
+        "GET / HTTP/1.1\r\nHost: o\r\nCookie: theme=dark; zgix-srv={s}\r\n" ++
             "Connection: close\r\n\r\n",
         .{&bedEndpointTag(&bed)},
     ) catch unreachable;
@@ -3592,7 +3592,7 @@ test "l7: a well-formed tag naming no endpoint is repicked and re-stamped (#178)
         .seed = 33,
         .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
         .pick = .hash,
-        .hash_key = .{ .cookie = "zoxy-srv" },
+        .hash_key = .{ .cookie = "zgix-srv" },
     });
     defer bed.tearDown();
 
@@ -3600,14 +3600,14 @@ test "l7: a well-formed tag naming no endpoint is repicked and re-stamped (#178)
     // this cluster: a config that shrank, or a forgery. Either way the
     // request is served and the response re-announces.
     try bed.exchange("GET / HTTP/1.1\r\nHost: o\r\n" ++
-        "Cookie: zoxy-srv=ffffffffffffffff\r\nConnection: close\r\n\r\n");
+        "Cookie: zgix-srv=ffffffffffffffff\r\nConnection: close\r\n\r\n");
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     var expected_buffer: [512]u8 = undefined;
     const expected = std.fmt.bufPrint(
         &expected_buffer,
         "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n" ++
-            "Set-Cookie: zoxy-srv={s}; Path=/; HttpOnly\r\n" ++
+            "Set-Cookie: zgix-srv={s}; Path=/; HttpOnly\r\n" ++
             "Connection: close\r\n\r\nhi",
         .{&bedEndpointTag(&bed)},
     ) catch unreachable;
@@ -3623,7 +3623,7 @@ test "l7: a malformed tag is an absent one — assigned, not repicked (#178)" {
         .seed = 34,
         .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
         .pick = .hash,
-        .hash_key = .{ .cookie = "zoxy-srv" },
+        .hash_key = .{ .cookie = "zgix-srv" },
     });
     defer bed.tearDown();
 
@@ -3631,7 +3631,7 @@ test "l7: a malformed tag is an absent one — assigned, not repicked (#178)" {
     // request is a first request, not a re-homing — the distinction the
     // repicked counter exists to keep clean.
     try bed.exchange("GET / HTTP/1.1\r\nHost: o\r\n" ++
-        "Cookie: zoxy-srv=notatag\r\nConnection: close\r\n\r\n");
+        "Cookie: zgix-srv=notatag\r\nConnection: close\r\n\r\n");
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_sticky_assigned"));
@@ -3710,7 +3710,7 @@ test "l7: h3_advertise rides beside the #178 stamp at the full filter budget" {
         .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
         .response_filters = &rules,
         .pick = .hash,
-        .hash_key = .{ .cookie = "zoxy-srv" },
+        .hash_key = .{ .cookie = "zgix-srv" },
         .h3_advertise = "h3=\":4443\"; ma=3600",
     });
     defer bed.tearDown();
@@ -3724,7 +3724,7 @@ test "l7: h3_advertise rides beside the #178 stamp at the full filter budget" {
         "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n" ++
             "X-One: 1\r\n" ++
             "X-Two: 2\r\n" ++
-            "Set-Cookie: zoxy-srv={s}; Path=/; HttpOnly\r\n" ++
+            "Set-Cookie: zgix-srv={s}; Path=/; HttpOnly\r\n" ++
             "Alt-Svc: h3=\":4443\"; ma=3600\r\n" ++
             "Connection: close\r\n\r\nhi",
         .{&bedEndpointTag(&bed)},
@@ -4177,7 +4177,7 @@ test "l7: the head-read deadline reaps a slowloris that never completes" {
     // it is the cheapest proof the slot reads a live clock (#234).
     try std.testing.expectEqualStrings(
         "HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\n" ++
-            "Date: Wed, 01 Jan 2020 00:00:01 GMT\r\nServer: zoxy\r\n" ++
+            "Date: Wed, 01 Jan 2020 00:00:01 GMT\r\nServer: zgix\r\n" ++
             "Connection: close\r\n\r\n",
         bed.client.response(),
     );
@@ -4206,7 +4206,7 @@ test "l7: a mute origin earns the §8 request-deadline 504 verdict" {
     // that the stamp reads a live clock rather than a pinned one (#234).
     try std.testing.expectEqualStrings(
         "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n" ++
-            "Date: Wed, 01 Jan 2020 00:00:01 GMT\r\nServer: zoxy\r\nConnection: close\r\n\r\n",
+            "Date: Wed, 01 Jan 2020 00:00:01 GMT\r\nServer: zgix\r\nConnection: close\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
@@ -5386,7 +5386,7 @@ test "l7: a response cut off mid-flight logs aborted, not ok" {
     // mid-response log a success that never happened, with the origin's
     // status attached to lend it weight. An operator counting
     // `outcome:"ok"` would have read more successes than
-    // `zoxy_l7_responses` reports, with nothing in the line to say which
+    // `zgix_l7_responses` reports, with nothing in the line to say which
     // ones were fiction.
     //
     // The origin promises 32 bytes and sends none, so the head reaches the
@@ -5777,7 +5777,7 @@ test "l7: an oversize inbound chain fails safe to the observed peer, and is coun
 
 test "l7: without a forwarded block the header travels untouched" {
     // The default must stay bit-for-bit what it was before this existed:
-    // zoxy neither adds nor strips, and a client-supplied value reaches
+    // zgix neither adds nor strips, and a client-supplied value reaches
     // the origin exactly as sent — including a forged one, which is the
     // operator's call to make by configuring a mode.
     var bed: Http1Bed = undefined;
@@ -5880,7 +5880,7 @@ const TlsWindDown = struct {
 test "l7: a completed handshake issues its session tickets" {
     // The post-handshake flight, and the reason it exists: the ~45 ms
     // stall (IMPLEMENTATION_NOTES) is a client's second small write held
-    // by its own Nagle, waiting for an ACK zoxy has no reason to send.
+    // by its own Nagle, waiting for an ACK zgix has no reason to send.
     // Tickets are what give it one — and they are only worth anything if
     // they go out *after* the client's Finished, which is what makes
     // "issued once the session is up" the assertion rather than "issued".
@@ -5957,7 +5957,7 @@ const TlsResumeAfter = struct {
 };
 
 test "l7: a ticket issued by one session resumes the next" {
-    // The round trip the whole feature is: a ticket zoxy sealed, handed
+    // The round trip the whole feature is: a ticket zgix sealed, handed
     // to a client, offered back on a fresh connection, and opened by the
     // key that sealed it. Nothing short of two handshakes proves it —
     // the seal and open are unit-tested against each other, but only
@@ -6580,7 +6580,7 @@ test "l7: a 103 does not settle the exchange, so no answer is left unread" {
 }
 
 test "l7: an origin that only ever sends interims is cut at the bound" {
-    // Neither nginx nor HAProxy bounds this; zoxy must, because an
+    // Neither nginx nor HAProxy bounds this; zgix must, because an
     // unbounded loop on the one thread is what §1 rules out (#232). The
     // overrun is counted apart from a malformed head: nothing was
     // malformed, the bound is what ran out.

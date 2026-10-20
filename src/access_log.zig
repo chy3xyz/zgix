@@ -44,14 +44,14 @@ pub const Kind = enum(u1) {
 };
 
 /// How the thing being logged ended. Deliberately not derivable from
-/// `status`: an origin's own `503` and zoxy's shed `503` are the same
+/// `status`: an origin's own `503` and zgix's shed `503` are the same
 /// three digits and opposite events, and telling them apart is most of
 /// what an operator reads an access log for.
 pub const Outcome = enum(u8) {
     /// The origin answered and its whole response reached the client. The
     /// status is the origin's, whatever it is.
     ok,
-    /// zoxy refused the request itself (§7): malformed, oversize,
+    /// zgix refused the request itself (§7): malformed, oversize,
     /// unroutable, unsupported, or stopped by a filter rule.
     rejected,
     /// A filter rule answered the request with a redirect (#176). Not
@@ -64,7 +64,7 @@ pub const Outcome = enum(u8) {
     /// counting what the origins served must not find these in it, and
     /// one counting what policy answered must not have to subtract.
     responded,
-    /// zoxy ran out of a resource and answered `503` (§8) — a relay buffer
+    /// zgix ran out of a resource and answered `503` (§8) — a relay buffer
     /// or an upstream slot the request needed.
     shed,
     /// The exchange outlived `timeouts.request_ms` and was answered `504`
@@ -274,7 +274,7 @@ fn renderHttpFields(record: *const Record, writer: *std.Io.Writer) std.Io.Writer
 /// One direction's #140 headers as a nested object, omitted entirely
 /// when the config named none. Nested rather than flattened so a header
 /// called `status` cannot shadow the real field — and so "what the
-/// client sent" stays visibly apart from "what zoxy observed".
+/// client sent" stays visibly apart from "what zgix observed".
 ///
 /// A configured-but-absent header is omitted rather than emitted as
 /// null: the object then says what arrived, and a consumer asking
@@ -363,6 +363,207 @@ pub fn captureTruncated(target: []u8, source: []const u8) []const u8 {
     return target[0..target.len];
 }
 
+/// The admin scrape's access-log tail: the newest `log_ring_lines` HTTP
+/// lines in fixed slots, oldest-to-newest on render. Written by
+/// `AccessLog.record` — the event loop's single thread is the only
+/// writer, so no lock; read only by the admin plane's render, same
+/// thread. Reserved unconditionally (§8, the admin plane's terms) and
+/// arena-allocated once, so the admin "logs" view works whether or not a
+/// sink is configured: a broken or absent sink must not take the panel's
+/// view down with it, which is why the ring write leads `record`'s sink
+/// logic rather than following it.
+pub const AdminRing = struct {
+    /// `log_ring_lines` × `log_ring_line_bytes` from the startup arena,
+    /// empty slice before `reserve` (never in production: `Server.init`
+    /// reserves unconditionally). Each slot opens with a little-endian
+    /// u16 length, then the `# <json>\n` line itself.
+    storage: []u8 = &.{},
+    /// Next slot to overwrite; `count` slots behind it are live.
+    head: usize = 0,
+    count: usize = 0,
+
+    /// The worst line the renderer below can emit, derived field by
+    /// field; the tightness test pins this against `log_ring_line_bytes`.
+    pub fn lineBytesMax() usize {
+        const c = constants;
+        return "# ".len + // wire comment prefix
+            1 + // '{'
+            5 + c.log_ring_timestamp_cap + 1 + // "t":"<stamp>"
+            12 + c.log_ring_outcome_cap + 1 + // ,"outcome":"<name>"
+            10 + c.log_ring_method_cap + // ,"method":<string>
+            8 + c.log_ring_host_cap + // ,"host":<string>
+            8 + c.log_ring_path_cap + // ,"path":<string>
+            9 + 5 + // ,"status":<u16>
+            11 + c.log_ring_cluster_cap + // ,"cluster":<string>
+            12 + c.log_ring_upstream_cap + // ,"upstream":<string>
+            14 + 20 + // ,"duration_us":<u64 widest>
+            1 + // '}'
+            "\n".len +
+            2; // slot length header
+    }
+
+    /// The scrape section's worst case: the marker line plus every slot
+    /// at its widest — what `Server.metricsBytes` and `Admin.init` must
+    /// reserve, so the render can never overflow the response buffer.
+    pub fn sectionBytesMax() usize {
+        return "# zgix_access_log\n".len +
+            constants.log_ring_lines * constants.log_ring_line_bytes;
+    }
+
+    pub fn reserve(ring: *AdminRing, arena: std.mem.Allocator) error{OutOfMemory}!void {
+        if (ring.storage.len != 0) return;
+        ring.storage = try arena.alloc(
+            u8,
+            constants.log_ring_lines * constants.log_ring_line_bytes,
+        );
+        ring.head = 0;
+        ring.count = 0;
+    }
+
+    fn slot(ring: *AdminRing, index: usize) []u8 {
+        assert(index < constants.log_ring_lines);
+        const width = constants.log_ring_line_bytes;
+        return ring.storage[index * width ..][0..width];
+    }
+
+    /// Append one record, dropping it only when the closed-form bound is
+    /// somehow exceeded (a future field outgrowing `lineBytesMax` without
+    /// the bound's re-derivation) — a missing line is strictly better
+    /// than the half JSON a truncation would leave the panel, which parses
+    /// every line. The bound's tightness test is what makes this branch
+    /// unreachable arithmetic rather than policy.
+    pub fn record(ring: *AdminRing, entry: *const Record) void {
+        if (ring.storage.len == 0) return;
+        const target = ring.slot(ring.head);
+        var writer: std.Io.Writer = .fixed(target[2..]);
+        renderAdminLine(entry, &writer) catch return;
+        std.mem.writeInt(u16, target[0..2], @intCast(writer.end), .little);
+        ring.head = (ring.head + 1) % constants.log_ring_lines;
+        ring.count = @min(ring.count + 1, constants.log_ring_lines);
+    }
+
+    /// The `# zgix_access_log` marker plus the live lines, oldest first
+    /// (the panel reverses for display itself). Writes into `buffer`,
+    /// stopping short only if a caller ignored `sectionBytesMax` — the
+    /// ring is a best-effort tail, and a short section beats an overflow.
+    pub fn render(ring: *const AdminRing, buffer: []u8) usize {
+        var writer: std.Io.Writer = .fixed(buffer);
+        writer.writeAll("# zgix_access_log\n") catch return writer.end;
+        var index: usize = 0;
+        while (index < ring.count) : (index += 1) {
+            const oldest_first =
+                (ring.head + constants.log_ring_lines - ring.count + index) %
+                constants.log_ring_lines;
+            const line = ring.storage[oldest_first * constants.log_ring_line_bytes ..][0..constants.log_ring_line_bytes];
+            const len = std.mem.readInt(u16, line[0..2], .little);
+            assert(len <= line.len - 2);
+            writer.writeAll("# ") catch return writer.end;
+            writer.writeAll(line[2..][0..len]) catch return writer.end;
+        }
+        return writer.end;
+    }
+};
+
+/// One ring line: `# ` + the JSON object + `\n`. Field policy mirrors the
+/// wire the panel parses: a fact that does not exist is an omitted key,
+/// never null — `upstream`/`cluster` when routing never chose one,
+/// `method`/`host`/`path`/`status` when the request head never parsed.
+/// Strings ride the capped escaper below; numbers and the timestamp are
+/// width-bounded by construction.
+fn renderAdminLine(record: *const Record, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    // The slot holds the bare JSON object plus newline; `AdminRing.render`
+    // owns the "# " comment prefix, so a slot is a payload, not a line.
+    try writer.writeAll("{\"t\":\"");
+    try writeTimestamp(writer, record.started_wall_ns);
+    try writer.print("\",\"outcome\":\"{t}\"", .{record.outcome});
+    if (record.method.len > 0) {
+        try writer.writeAll(",\"method\":");
+        try writeJsonStringCapped(writer, record.method, constants.log_ring_method_cap);
+    }
+    if (record.host.len > 0) {
+        try writer.writeAll(",\"host\":");
+        try writeJsonStringCapped(writer, record.host, constants.log_ring_host_cap);
+    }
+    if (record.path.len > 0) {
+        try writer.writeAll(",\"path\":");
+        try writeJsonStringCapped(writer, record.path, constants.log_ring_path_cap);
+    }
+    if (record.status != 0) {
+        try writer.print(",\"status\":{d}", .{record.status});
+    }
+    if (record.cluster.len > 0) {
+        try writer.writeAll(",\"cluster\":");
+        try writeJsonStringCapped(writer, record.cluster, constants.log_ring_cluster_cap);
+    }
+    if (record.upstream) |address| {
+        // Rendered then escaped like every other string: `Address`'s
+        // renderable-forms guarantee (no escapable bytes in an IP literal
+        // or a loader-checked `unix:` path) is what the sink line relies
+        // on too, and the cap covers it either way.
+        var rendered: [constants.log_ring_upstream_cap]u8 = undefined;
+        // The cap is the render bound, so this cannot fail; an overflow
+        // would be a bound bug, and an empty upstream is a safer lie than
+        // a half-written one.
+        const text = std.fmt.bufPrint(&rendered, "{f}", .{address}) catch rendered[0..0];
+        try writer.writeAll(",\"upstream\":");
+        try writeJsonStringCapped(writer, text, constants.log_ring_upstream_cap);
+    }
+    try writer.print(",\"duration_us\":{d}", .{
+        @divFloor(record.duration_ns, std.time.ns_per_us),
+    });
+    try writer.writeAll("}\n");
+}
+
+/// `source` as one JSON string whose ESCAPED form — quotes included — is
+/// at most `cap` bytes, truncating at the last complete escape or raw
+/// byte that fits and marking the cut with `...`. The minimal correct
+/// escaper: `"` and `\` double, the other control characters take
+/// `\u00XX` (the shape the task pins; `\b`/`\t` shorthands would be legal
+/// JSON but a second dialect to audit). The inputs are client-controlled
+/// bytes — a path may carry anything — so the escape accounting is per
+/// byte, never per input length.
+fn writeJsonStringCapped(
+    writer: *std.Io.Writer,
+    source: []const u8,
+    cap: usize,
+) std.Io.Writer.Error!void {
+    const marker = "...";
+    assert(cap > marker.len + 2);
+    try writer.writeByte('"');
+    var used: usize = 1;
+    for (source) |byte| {
+        const escaped: ?[]const u8 = switch (byte) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            0x00...0x1f => null, // \u00XX below
+            else => null,
+        };
+        const width: usize = if (escaped) |sequence|
+            sequence.len
+        else if (byte < 0x20)
+            6 // \u00XX
+        else
+            1;
+        if (used + width > cap - marker.len) {
+            try writer.writeAll(marker);
+            used += marker.len;
+            break;
+        }
+        if (escaped) |sequence| {
+            try writer.writeAll(sequence);
+        } else if (byte < 0x20) {
+            const hex = "0123456789abcdef";
+            try writer.writeAll("\\u00");
+            try writer.writeByte(hex[byte >> 4]);
+            try writer.writeByte(hex[byte & 0x0f]);
+        } else {
+            try writer.writeByte(byte);
+        }
+        used += width;
+    }
+    try writer.writeByte('"');
+}
+
 /// The sink: two staging buffers, one in-flight write, and the drop rung.
 /// Generic over the Io backend like the rest of the serving path, so the
 /// simulator drives it and can read back exactly what production would
@@ -407,6 +608,10 @@ pub fn AccessLog(comptime IoType: type) type {
         /// the fd being closed must not be one the ring still holds.
         reopen_pending: bool,
         completion: IoType.Completion,
+        /// The admin scrape's tail (see `AdminRing`): written before any
+        /// sink logic so a broken or absent sink never takes the panel's
+        /// view down with it.
+        ring: AdminRing,
 
         const Self = @This();
 
@@ -436,15 +641,18 @@ pub fn AccessLog(comptime IoType: type) type {
             log.broken = false;
             log.reopen_pending = false;
             log.completion = .{};
+            log.ring = .{};
             assert(log.isQuiescent());
         }
 
-        /// Reserve the staging buffers, or nothing when the log is off
-        /// (§5). Separate from `init` because it is the one part that
-        /// allocates, and it allocates from the startup arena exactly once.
+        /// Reserve the staging buffers and the admin ring, or — for the
+        /// buffers only — nothing when the log is off (§5). The ring is
+        /// not sink state: it is admin-plane state, reserved on the
+        /// plane's unconditional terms like every other admin budget.
         pub fn reserve(log: *Self, arena: std.mem.Allocator) error{OutOfMemory}!void {
             assert(log.buffers[0].len == 0);
             assert(log.buffers[1].len == 0);
+            try log.ring.reserve(arena);
             if (log.sink == null) return;
             for (&log.buffers) |*buffer| {
                 buffer.* = try arena.alloc(u8, log.buffer_bytes);
@@ -459,6 +667,10 @@ pub fn AccessLog(comptime IoType: type) type {
         /// two ways a line can be lost — no room, or a broken sink — are
         /// counted here rather than returned.
         pub fn record(log: *Self, entry: *const Record) void {
+            // The admin ring leads: it is a consumer beside the sink, not
+            // part of it, and its view must survive everything that can
+            // take the sink down — absence, backpressure, a broken pipe.
+            log.ring.record(entry);
             if (log.sink == null) return;
             if (log.broken) {
                 log.server.counters.increment("access_log_dropped");
@@ -702,7 +914,7 @@ test "access log: named headers ride nested objects, absent ones omitted (#140)"
     );
     // Nesting is what keeps a header from shadowing a real field: a
     // header literally called `status` lands inside the object, and the
-    // line's own `status` is still the one zoxy answered with.
+    // line's own `status` is still the one zgix answered with.
     const shadow_names = [_][]const u8{"status"};
     const shadow_values = [_][]const u8{"not-a-status"};
     entry.request_headers = .{ .names = &shadow_names, .values = &shadow_values };
@@ -880,4 +1092,190 @@ test "access log: a truncated capture says so" {
     try testing.expectEqualStrings("/0123456789abcde", captureTruncated(&target, "/0123456789abcde"));
     // One byte over: the prefix survives and the cut is visible.
     try testing.expectEqualStrings("/0123456789ab...", captureTruncated(&target, "/0123456789abcdef"));
+}
+
+// ---------------------------------------------------------------------------
+// The admin ring: the scrape's access-log tail. Written by the sink's only
+// entry point, read by the admin render; tests drive both directly.
+// ---------------------------------------------------------------------------
+
+fn ringRecord(path: []const u8, status: u16, started_wall_ns: u64) Record {
+    return .{
+        .kind = .http,
+        .outcome = .ok,
+        .started_wall_ns = started_wall_ns,
+        .duration_ns = 1_200_000,
+        .client = null,
+        .upstream = null,
+        .cluster = "origin",
+        .bytes_in = 100,
+        .bytes_out = 200,
+        .method = "GET",
+        .host = "example.test",
+        .path = path,
+        .status = status,
+    };
+}
+
+/// Count the `# ` payload lines after the marker; returns their start
+/// offsets in render order.
+fn ringLineStarts(rendered: []const u8, starts: *[constants.log_ring_lines]usize) usize {
+    const marker = "# zgix_access_log\n";
+    assert(std.mem.startsWith(u8, rendered, marker));
+    var count: usize = 0;
+    var rest = rendered[marker.len..];
+    while (rest.len > 0) {
+        assert(rest[0] == '#');
+        assert(rest[1] == ' ');
+        starts[count] = (rest.ptr - rendered.ptr) + 2;
+        count += 1;
+        const newline = std.mem.indexOfScalar(u8, rest, '\n') orelse return count;
+        rest = rest[newline + 1 ..];
+    }
+    return count;
+}
+
+test "admin ring: records render as the marker plus byte-exact JSON lines, oldest first" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ring: AdminRing = .{};
+    try ring.reserve(arena_state.allocator());
+
+    // The rendered tail's expected spelling, timestamp included, built
+    // with the same writer the render uses — byte-exact without hand
+    // arithmetic on the epoch.
+    var stamp_buffer: [32]u8 = undefined;
+    var stamp_writer: std.Io.Writer = .fixed(&stamp_buffer);
+    try writeTimestamp(&stamp_writer, 1_761_000_000_123_000_000);
+    const stamp = stamp_writer.buffered();
+
+    for (0..3) |index| {
+        var path_buf: [8]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/p{d}", .{index}) catch unreachable;
+        ring.record(&ringRecord(path, 200 + @as(u16, @intCast(index)), 1_761_000_000_123_000_000));
+    }
+
+    var buffer: [AdminRing.sectionBytesMax()]u8 = undefined;
+    const rendered = buffer[0..ring.render(&buffer)];
+    var expected_buf: [AdminRing.sectionBytesMax()]u8 = undefined;
+    const expected = std.fmt.bufPrint(&expected_buf,
+        \\# zgix_access_log
+        \\# {{"t":"{s}","outcome":"ok","method":"GET","host":"example.test","path":"/p0","status":200,"cluster":"origin","duration_us":1200}}
+        \\# {{"t":"{s}","outcome":"ok","method":"GET","host":"example.test","path":"/p1","status":201,"cluster":"origin","duration_us":1200}}
+        \\# {{"t":"{s}","outcome":"ok","method":"GET","host":"example.test","path":"/p2","status":202,"cluster":"origin","duration_us":1200}}
+        \\
+    , .{ stamp, stamp, stamp }) catch unreachable;
+    try testing.expectEqualStrings(expected, rendered);
+}
+
+test "admin ring: a full ring evicts the oldest lines and keeps order" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ring: AdminRing = .{};
+    try ring.reserve(arena_state.allocator());
+
+    // One more than the ring holds: the first must be gone, the rest in
+    // arrival order.
+    const total = constants.log_ring_lines + 1;
+    for (0..total) |index| {
+        var path_buf: [12]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/req-{d}", .{index}) catch unreachable;
+        ring.record(&ringRecord(path, 200, 1_761_000_000_123_000_000));
+    }
+
+    var buffer: [AdminRing.sectionBytesMax()]u8 = undefined;
+    const rendered = buffer[0..ring.render(&buffer)];
+    var starts: [constants.log_ring_lines]usize = undefined;
+    const count = ringLineStarts(rendered, &starts);
+    try testing.expectEqual(constants.log_ring_lines, count);
+    const first = rendered[starts[0]..];
+    const last = rendered[starts[count - 1]..];
+    // The evicted line is the oldest; the survivors are /req-1 .. /req-128
+    // in order.
+    try testing.expect(std.mem.startsWith(u8, first, "{\"t\":"));
+    try testing.expect(std.mem.indexOf(u8, rendered, "/req-0") == null);
+    try testing.expect(std.mem.indexOf(u8, first, "/req-1") != null);
+    try testing.expect(std.mem.indexOf(u8, last, "/req-128") != null);
+    // Order is monotone: every line's "/req-N" index increases.
+    var prev: usize = 0;
+    for (0..count) |index| {
+        const line = rendered[starts[index]..];
+        const at = std.mem.indexOf(u8, line, "/req-").?;
+        const tail = line[at + 5 ..];
+        const end = std.mem.indexOfScalar(u8, tail, '"').?;
+        const n = try std.fmt.parseInt(usize, tail[0..end], 10);
+        try testing.expect(n > prev or index == 0);
+        if (index > 0) try testing.expectEqual(prev + 1, n);
+        prev = n;
+    }
+}
+
+test "admin ring: strings escape and truncate at their escaped caps" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ring: AdminRing = .{};
+    try ring.reserve(arena_state.allocator());
+
+    // Escapes: quote, backslash, and a control character take their JSON
+    // spellings, and the line stays inside its slot either way.
+    var nasty: Record = ringRecord("/a\"b\\c\x01d", 200, 1_761_000_000_123_000_000);
+    nasty.host = "ho\x02st";
+    ring.record(&nasty);
+
+    // A path past its escaped cap truncates with the marker, and an
+    // all-control path (6 escaped bytes per input byte) still fits.
+    const long_path_text = comptime blk: {
+        var bytes: [301]u8 = undefined;
+        bytes[0] = '/';
+        for (bytes[1..]) |*byte| byte.* = 'x';
+        break :blk bytes;
+    };
+    var long_path: Record = ringRecord("", 200, 1_761_000_000_123_000_000);
+    long_path.path = &long_path_text;
+    ring.record(&long_path);
+    const control_path_text = comptime blk: {
+        var bytes: [400]u8 = undefined;
+        for (&bytes) |*byte| byte.* = 0x01;
+        break :blk bytes;
+    };
+    var control_path: Record = ringRecord("", 200, 1_761_000_000_123_000_000);
+    control_path.path = &control_path_text;
+    ring.record(&control_path);
+
+    var buffer: [AdminRing.sectionBytesMax()]u8 = undefined;
+    const rendered = buffer[0..ring.render(&buffer)];
+    try testing.expect(std.mem.indexOf(u8, rendered, "/a\\\"b\\\\c\\u0001d") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "ho\\u0002st") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "...") != null);
+    // Every line stayed within its slot: the render is at most the marker
+    // plus one slot per record.
+    try testing.expect(rendered.len <= "# zgix_access_log\n".len + 3 * constants.log_ring_line_bytes);
+}
+
+test "admin ring: an empty ring renders the marker only" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ring: AdminRing = .{};
+    try ring.reserve(arena_state.allocator());
+
+    var buffer: [AdminRing.sectionBytesMax()]u8 = undefined;
+    const rendered = buffer[0..ring.render(&buffer)];
+    try testing.expectEqualStrings("# zgix_access_log\n", rendered);
+}
+
+test "admin ring: the closed-form line and section bounds carry the render" {
+    // The whole test: lineBytesMax's field-by-field sum must fit a slot,
+    // and the section bound must be exactly the marker plus every slot
+    // at its widest — the figures `Server.metricsBytes` and `Admin.init`
+    // reserve.
+    try testing.expect(AdminRing.lineBytesMax() <= constants.log_ring_line_bytes);
+    try testing.expectEqual(
+        "# zgix_access_log\n".len +
+            constants.log_ring_lines * constants.log_ring_line_bytes,
+        AdminRing.sectionBytesMax(),
+    );
+    // And the slack is small: the bound is the shape's, not a rounded-up
+    // number's (the tightness pin, on h3_listener_status_bytes_max's
+    // precedent).
+    try testing.expect(AdminRing.lineBytesMax() >= constants.log_ring_line_bytes - 32);
 }

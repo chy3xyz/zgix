@@ -23,9 +23,16 @@
 //! experimental HTTP/3 path's per-listener rows (`h3_runtime`), which the
 //! admin reaches through an untyped pointer exactly like the seam's own
 //! witness reaches the counters — the admin plane names no h3 type.
+//!
+//! The last section is always the access-log tail: the `# zgix_access_log`
+//! marker plus the newest ring lines as `# <json>` comments (oldest
+//! first; the panel reverses for display). It renders even when the ring
+//! is empty — an empty table is a legitimate view, and the marker is how
+//! the panel tells "no lines yet" from "this build emits no ring".
 
 const std = @import("std");
 
+const access_log_module = @import("access_log.zig");
 const constants = @import("constants.zig");
 const counters_module = @import("counters.zig");
 const Io = @import("io/io.zig");
@@ -39,6 +46,10 @@ const assert = std.debug.assert;
 pub const response_head =
     "HTTP/1.1 200 OK\r\n" ++
     "Content-Type: text/plain; version=0.0.4\r\n" ++
+    // Lets a locally-opened control panel (panel/) fetch scrapes; the
+    // endpoint is unauthenticated diagnostic output, same exposure as
+    // the metrics themselves.
+    "Access-Control-Allow-Origin: *\r\n" ++
     "Connection: close\r\n\r\n";
 
 /// A full response is the fixed head, one rendering of every counter,
@@ -57,9 +68,9 @@ pub const response_head =
 pub const h3_listener_status_bytes_max: usize = blk: {
     const bind_max: usize = 64;
     const digits_max: usize = 20; // len("18446744073709551615")
-    const header_max: usize = "# TYPE ".len + "zoxy_h3_listener_connections".len +
+    const header_max: usize = "# TYPE ".len + "zgix_h3_listener_connections".len +
         " counter\n".len;
-    const row_max: usize = "zoxy_h3_listener_connections".len +
+    const row_max: usize = "zgix_h3_listener_connections".len +
         "{bind=\"\"}".len + bind_max + " ".len + digits_max + "\n".len;
     break :blk @as(usize, constants.h3_listeners_max) *
         (4 * row_max + 4 * header_max + 16);
@@ -69,9 +80,9 @@ test "admin: the h3 listener-status bound covers a worst-case rendering" {
     // Four rows plus the four headers per listener, at the widest family
     // name, the longest bind the writer can render, and a 20-digit
     // count — the bound must carry the shape it guards.
-    const row = "zoxy_h3_listener_connections".len + "{bind=\"".len +
+    const row = "zgix_h3_listener_connections".len + "{bind=\"".len +
         64 + "\"}".len + " ".len + 20 + "\n".len;
-    const header = "# TYPE ".len + "zoxy_h3_listener_connections".len +
+    const header = "# TYPE ".len + "zgix_h3_listener_connections".len +
         " counter\n".len;
     const per_listener = 4 * row + 4 * header;
     try std.testing.expect(h3_listener_status_bytes_max >=
@@ -167,7 +178,8 @@ pub fn Admin(comptime IoType: type) type {
             admin.response = try arena.alloc(u8, response_head.len +
                 counters_module.Counters.render_bytes_max +
                 server.labeled.render_bytes_max +
-                h3_listener_status_bytes_max);
+                h3_listener_status_bytes_max +
+                access_log_module.AdminRing.sectionBytesMax());
             assert(admin.response.len <= std.math.maxInt(u32));
             admin.server = server;
             admin.bind_address = bind_address;
@@ -336,6 +348,11 @@ pub fn Admin(comptime IoType: type) type {
                 );
                 total += written;
             }
+            // The access-log tail closes the body: marker plus the ring's
+            // live lines, oldest first. The response buffer reserved the
+            // section's closed-form bound at init, so the render cannot
+            // overrun it.
+            total += admin.server.access_log.ring.render(admin.response[total..]);
             admin.response_len = @intCast(total);
             admin.sent = 0;
             assert(admin.response_len >= response_head.len);

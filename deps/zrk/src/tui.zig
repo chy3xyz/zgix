@@ -64,7 +64,7 @@ const Colors = struct {
     const enabled: Colors = .{
         .reset = "\x1b[0m",
         .dim = "\x1b[90m",
-        .amber = "\x1b[38;5;214m", // the zoxy signal orange
+        .amber = "\x1b[38;5;214m", // the zgix signal orange
         .amber_hi = "\x1b[38;5;222m",
         .red = "\x1b[38;5;203m",
     };

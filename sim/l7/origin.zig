@@ -8,14 +8,14 @@
 
 const std = @import("std");
 
-const zoxy = @import("zoxy");
+const zgix = @import("zgix");
 
 const canon = @import("canon.zig");
 const scripts = @import("scripts.zig");
 
-const Io = zoxy.Io;
-const parser = zoxy.http.parser;
-const constants = zoxy.constants;
+const Io = zgix.Io;
+const parser = zgix.http.parser;
+const constants = zgix.constants;
 
 const assert = std.debug.assert;
 

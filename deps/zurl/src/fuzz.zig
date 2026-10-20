@@ -452,7 +452,7 @@ const interesting_bytes = "\r\n: ;,\t0123456789abcdefxHTTP/.";
 ///
 /// This loop exists because `zig build fuzz --fuzz` does not build on Zig
 /// 0.16.0: the bundled compiler/test_runner.zig fails to compile under -ffuzz
-/// with a StackTrace type mismatch at test_runner.zig:566. zoxy hit the
+/// with a StackTrace type mismatch at test_runner.zig:566. zgix hit the
 /// identical wall (its src/config.zig records it). Waiting for the toolchain
 /// would leave the parser with its hand-written shapes and nothing else, so
 /// this does the job a mutator does — derive inputs from the seeds and push

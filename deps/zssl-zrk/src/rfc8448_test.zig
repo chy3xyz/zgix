@@ -4,7 +4,7 @@
 //! trace prints, and record protection opens (and re-seals, where the
 //! trace's nonces make it deterministic) every protected record in the
 //! session. Agreement here is agreement with the RFC author's independent
-//! implementation — the same class of evidence zoxy's Tier-0.5 gate buys
+//! implementation — the same class of evidence zgix's Tier-0.5 gate buys
 //! from `std.crypto.tls.Client`.
 
 const std = @import("std");

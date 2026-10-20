@@ -51,8 +51,8 @@ pub fn Budget(comptime IoType: type) type {
             cq_entries: u32,
         };
 
-        /// What the banner's first line stamps. The name on it is zoxy's
-        /// either way — what follows is the budget of zoxy's pools, and
+        /// What the banner's first line stamps. The name on it is zgix's
+        /// either way — what follows is the budget of zgix's pools, and
         /// `bench/run.zig` parses these lines from outside the process —
         /// so an embedder names itself on a line of its own rather than
         /// through this.
@@ -516,7 +516,7 @@ pub fn Budget(comptime IoType: type) type {
             // report pastes and `--version` is what it does not think to
             // run.
             try emit(sink,
-                \\zoxy {s}{s}
+                \\zgix {s}{s}
                 \\budgets (DESIGN.md §5/§8; closed-form except where marked):
                 \\  memory  total {d} KiB = conn slots {d} x {d} B + stream slots {d} x {d} B
                 \\          + relay buffers {d} x {d} B
@@ -876,9 +876,19 @@ test "poolSizesFor: an h3 listener on a tls cluster reserves its engine pool" {
     // by exactly the engine pool the TLS listener added.
     try testing.expectEqual(@as(u32, 0), plain_sizes.h3_upstream_tls_engines);
     try testing.expectEqual(@as(u64, 0), plain_sizes.h3_upstream_tls_engine_bytes);
+    // The engine pool is what the delta isolates once the metrics terms
+    // are taken out: the two configs differ only in the cluster their
+    // h3 route names, and the inventory families' closed forms price a
+    // config's real label bytes — the `route_info` row is one byte
+    // longer for "origin" than "plain" (rendered three times over:
+    // render bound, admin response, exit-dump staging) plus one in the
+    // label table, which is §5 pricing reality, not engine pool.
+    const engine_pool = @as(u64, tls_sizes.h3_upstream_tls_engines) *
+        constants.upstream_tls_engine_bytes_max;
+    const metrics_delta = tls_sizes.metrics_bytes - plain_sizes.metrics_bytes;
     try testing.expectEqual(
-        @as(u64, tls_sizes.h3_upstream_tls_engines) * constants.upstream_tls_engine_bytes_max,
-        BudgetSim.totalBytes(&tls, 0) - BudgetSim.totalBytes(&plain, 0),
+        engine_pool,
+        BudgetSim.totalBytes(&tls, 0) - BudgetSim.totalBytes(&plain, 0) - metrics_delta,
     );
 }
 
@@ -919,11 +929,17 @@ test "poolSizesFor: h3 sessions, exchanges and parked slots join the closed form
     try testing.expectEqual(@as(u32, 0), none_sizes.h3_exchanges);
     try testing.expectEqual(@as(u32, 0), none_sizes.h3_parked);
     // The printed total moves by exactly the three terms the h3 listener
-    // added — the engines stay zero on a plaintext cluster.
+    // added — the engines stay zero on a plaintext cluster. The metrics
+    // terms move too: the inventory families price the h3 listener's
+    // label bytes, which the config without one does not carry (§5
+    // pricing the config's reality, the same adjustment the
+    // cluster-named route makes in the engine-pool test above).
+    const pool_terms = @as(u64, h3_sizes.h3_sessions) * constants.h3_session_slot_bytes +
+        @as(u64, h3_sizes.h3_exchanges) * constants.h3_exchange_slot_bytes +
+        @as(u64, h3_sizes.h3_parked) * constants.h3_parked_slot_bytes;
+    const metrics_delta = h3_sizes.metrics_bytes - none_sizes.metrics_bytes;
     try testing.expectEqual(
-        @as(u64, h3_sizes.h3_sessions) * constants.h3_session_slot_bytes +
-            @as(u64, h3_sizes.h3_exchanges) * constants.h3_exchange_slot_bytes +
-            @as(u64, h3_sizes.h3_parked) * constants.h3_parked_slot_bytes,
-        BudgetSim.totalBytes(&h3, 0) - BudgetSim.totalBytes(&none, 0),
+        pool_terms,
+        BudgetSim.totalBytes(&h3, 0) - BudgetSim.totalBytes(&none, 0) - metrics_delta,
     );
 }

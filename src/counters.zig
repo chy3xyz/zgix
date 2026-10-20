@@ -14,6 +14,9 @@ const config_module = @import("config.zig");
 const constants = @import("constants.zig");
 const io_module = @import("io/io.zig");
 const upstream_module = @import("net/upstream.zig");
+const router_module = @import("http/router.zig");
+const parser_module = @import("http/parser.zig");
+const credentials_module = @import("tls/Credentials.zig");
 
 const assert = std.debug.assert;
 
@@ -815,8 +818,8 @@ pub const Counters = struct {
     }
 
     /// The metric-name prefix for the Prometheus exposition rendering
-    /// (`render`). Every counter is exposed as `zoxy_<field>`.
-    pub const metric_prefix = "zoxy_";
+    /// (`render`). Every counter is exposed as `zgix_<field>`.
+    pub const metric_prefix = "zgix_";
 
     /// Exact byte bound on a full `render` (§5: the caller sizes a fixed
     /// buffer to it, so rendering never allocates and never truncates).
@@ -1062,6 +1065,19 @@ pub const Counters = struct {
 /// strings are prebuilt here at init, so a scrape renders them with the
 /// same zero-allocation discipline as everything else (§5).
 pub const Labeled = struct {
+    /// Build metadata the labeled tables cannot reach any other way: the
+    /// library module has no `build_options` import (that one is the
+    /// binary's alone — importing it here would put the file in two
+    /// modules at once, the error build.zig's comment names), so the
+    /// version travels as a process-global set once by `main` before
+    /// `Server.init`. Tests and the simulator never write it, which is
+    /// what keeps the parallel test threads clear of a data race: a
+    /// reader either sees "" (no version row, the library default) or
+    /// the startup write that happened before any test existed.
+    pub const build = struct {
+        pub var version: []const u8 = "";
+    };
+
     keys: upstream_module.EndpointKeys,
     /// Rendered `{cluster="…",endpoint="…"}` per key — empty at the
     /// ragged holes between clusters, which no render row ever reads.
@@ -1124,6 +1140,43 @@ pub const Labeled = struct {
     cluster_duration_sum_ns: []Value,
     cluster_duration_count: []Value,
     l4_shed_inflight: []Value,
+    /// The inventory families (the panel's 清单视图): prebuilt label
+    /// strings rendered as constant-1 gauge rows — Prometheus' `*_info`
+    /// convention, information in the labels, the value carrying none.
+    /// No `Value` tables back these: there is nothing to witness,
+    /// reconcile, or census-count; the rows are the config read back.
+    /// `endpoint_info` shares the endpoint families' label bytes rather
+    /// than storing its own copy — one storage, two families — and
+    /// `route_responses` shares `route_info`'s the same way.
+    info_version_label: []const u8 = "",
+    /// One `{bind=…,kind=…,routes=…}` per TCP and h3 listener, config
+    /// order.
+    listener_info_labels: [][]const u8 = &.{},
+    /// One row per http/h3 route, config order. An l4 listener's single
+    /// catch-all route is an admission artifact, not path routing, and
+    /// stays out — the family says what routes traffic by path.
+    route_info_labels: [][]const u8 = &.{},
+    /// One `{name=…,listener=…,not_after=…,days_left=…}` per configured
+    /// certificate reference (§B1): every `tls.certificates` entry of every
+    /// listener, then every h3 listener's certificate, config order. The
+    /// family reports expiry as a load-time snapshot — `days_left` is
+    /// computed once against the startup clock and never refreshed, so a
+    /// scrape reads "days remaining at boot", not a live countdown, and a
+    /// SIGHUP certificate rotation does not move it. One row per
+    /// *reference*: a certificate file shared by two listeners wears both
+    /// binds (multi-row, not comma-joined) so each listener's panel row
+    /// stands alone. Entries whose file could not be read or parsed stay
+    /// empty — see `buildCertInfoLabels`.
+    cert_info_labels: [][]const u8 = &.{},
+    /// Per-route completed-response counters (§B2): one cell per route
+    /// `route_info` describes, in the same config order, so the counting
+    /// table and the label table are index-aligned and the family renders
+    /// the `route_info` label bytes under a new name — one storage, two
+    /// families, the `endpoint_info` precedent. L7-only: the h3 seam
+    /// cannot import this module (build.zig's seam invariant), so h3
+    /// exchanges keep `h3_responses` as their total and `reconciles`
+    /// asserts this table against `l7_responses` alone.
+    route_responses: []Value = &.{},
     /// Exact byte bound on one `render` of this config — the runtime
     /// sibling of `Counters.render_bytes_max`, tight the same way, and
     /// the term the caller sizes its buffer (and the memory banner its
@@ -1146,6 +1199,32 @@ pub const Labeled = struct {
     /// Healthy is a 0/1 gauge: one digit is its widest rendering.
     const healthy_digits_max = 1;
 
+    /// The `not_after` label's spelling: RFC 3339 UTC to second
+    /// resolution, always exactly this wide. X.509 times are UTCTime or
+    /// GeneralizedTime, both of which carry at most a four-digit year, so
+    /// a parsed `notAfter` is guaranteed to fit — the renderer asserts it
+    /// rather than pricing a wider row for a year that cannot occur.
+    const rfc3339_utc_bytes = "2036-07-22T05:35:17Z".len;
+    /// `days_left` is a u32: ten digits is its widest rendering, and the
+    /// term every pure-config price uses (the value is file-derived, so a
+    /// pure walk cannot know its true width — the one documented slack in
+    /// the config-level forms, on `versionLabelLenBound`'s precedent;
+    /// `init` re-prices the rows it actually built and stays exact).
+    const days_left_digits_max = 10; // len("4294967295")
+    /// How much of a certificate file `cert_info` reads looking for the
+    /// leaf PEM block. The serving bound a leaf must fit lives at
+    /// `constants.tls_cert_chain_bytes_max` (8 KiB of DER); base64's 4/3
+    /// plus armor and chain siblings leaves this comfortably past any
+    /// loadable leaf's first block, and a file whose leaf starts past it
+    /// is refused rather than partially read — the row is observability,
+    /// absence beats a false one. Module-local rather than in
+    /// `constants.zig`: another file owns that surface.
+    const cert_info_pem_read_bytes = 16 * 1024;
+    /// What the leaf's decoded DER may take of the read scratch: the same
+    /// chain bound `Credentials.load` enforces, so a leaf this module
+    /// refuses is one the serving path refused first.
+    const cert_info_der_bytes = constants.tls_cert_chain_bytes_max;
+
     /// The per-endpoint families, tag names matching the field they
     /// count into — `incrementEndpoint` resolves the table by tag, so a
     /// rename that split the two would not compile.
@@ -1156,7 +1235,7 @@ pub const Labeled = struct {
         health_down,
         health_up,
 
-        /// The exposition name (behind `zoxy_`). A switch, not
+        /// The exposition name (behind `zgix_`). A switch, not
         /// concatenation, so the rendered vocabulary reads in one place.
         fn name(family: EndpointFamily) []const u8 {
             return switch (family) {
@@ -1171,7 +1250,7 @@ pub const Labeled = struct {
 
     /// The status classes a response is bucketed into (#299). Closed and
     /// small on purpose: `passive_ejection` already reasons in classes
-    /// (`status_class` in its config), so this is an observation zoxy
+    /// (`status_class` in its config), so this is an observation zgix
     /// makes turned into one an operator can alert on, not a new
     /// vocabulary. A status below 100 or above 599 cannot reach here —
     /// the parser refuses it — so there is no "other" arm to render.
@@ -1240,9 +1319,11 @@ pub const Labeled = struct {
         arena: std.mem.Allocator,
         config: *const config_module.Config,
         keys: upstream_module.EndpointKeys,
+        version: []const u8,
     ) error{OutOfMemory}!void {
         assert(config.clusters.len >= 1);
         assert(keys.count == @as(u32, @intCast(config.clusters.len)) * keys.stride);
+        assert(version.len <= constants.version_label_bytes_max);
         labeled.keys = keys;
         const cluster_count = config.clusters.len;
         labeled.endpoint_labels = try arena.alloc([]const u8, keys.count);
@@ -1262,6 +1343,15 @@ pub const Labeled = struct {
         labeled.cluster_duration_sum_ns = try allocValues(arena, cluster_count);
         labeled.cluster_duration_count = try allocValues(arena, cluster_count);
         labeled.l4_shed_inflight = try allocValues(arena, cluster_count);
+        // §B2's table is sized by the same walk that sizes
+        // `route_info_labels`, so the two stay index-aligned by
+        // construction; no http/h3 routes means no L7 traffic can exist,
+        // and the empty table renders as a header with zero rows.
+        const route_count = routeInfoRowCount(config);
+        labeled.route_responses = if (route_count == 0)
+            &.{}
+        else
+            try allocValues(arena, route_count);
         // Holes stay empty — the one answer to "what did init leave
         // here", and the tripwire `incrementEndpoint` asserts against.
         @memset(labeled.endpoint_labels, "");
@@ -1277,8 +1367,294 @@ pub const Labeled = struct {
                     try endpointLabel(arena, cluster.name, address);
             }
         }
-        labeled.render_bytes_max = renderBytesMaxFor(config);
+        try labeled.buildInventoryLabels(arena, config, version);
+        // The instance bound replaces `cert_info`'s config-level row term
+        // (priced at `days_left`'s widest spelling, since a pure walk
+        // cannot read the certificates) with the exact width of the rows
+        // init actually built — the tightness doctrine pins the instance
+        // bound, and the banner's number staying above it is the one safe
+        // direction. Unbuilt rows (unreadable files, see
+        // `buildCertInfoLabels`) only widen the gap.
+        const cert_bound = certInfoRenderBytesForBound(config);
+        assert(certInfoRenderBytesExact(labeled) <= cert_bound);
+        labeled.render_bytes_max = renderBytesMaxFor(config) - cert_bound +
+            certInfoRenderBytesExact(labeled) +
+            infoVersionBytes(if (version.len == 0) 0 else versionLabelLen(version));
         assert(labeled.render_bytes_max >= 1);
+    }
+
+    /// The inventory labels, prebuilt through the same renderers the
+    /// closed forms measure: one walk builds, one walk prices, and the
+    /// two cannot drift because both go through the len functions beside
+    /// the renderers.
+    fn buildInventoryLabels(
+        labeled: *Labeled,
+        arena: std.mem.Allocator,
+        config: *const config_module.Config,
+        version: []const u8,
+    ) error{OutOfMemory}!void {
+        labeled.info_version_label = if (version.len == 0)
+            ""
+        else
+            try versionLabel(arena, version);
+        const route_count = routeInfoRowCount(config);
+        const listener_count = config.listeners.len + config.h3_listeners.len;
+        labeled.listener_info_labels = if (listener_count == 0)
+            &.{}
+        else
+            try arena.alloc([]const u8, listener_count);
+        labeled.route_info_labels = if (route_count == 0)
+            &.{}
+        else
+            try arena.alloc([]const u8, route_count);
+        var scratch: [endpoint_literal_bytes_max]u8 = undefined;
+        var listener_at: usize = 0;
+        var route_at: usize = 0;
+        for (config.listeners) |*listener| {
+            // The family reports the listener's protocol; TLS termination
+            // (#125) is orthogonal and does not rename it — a TLS edge
+            // listener is still kind="http".
+            const kind: []const u8 = if (listener.protocol == .l4) "l4" else "http";
+            const bind = renderBindLiteral(&scratch, &listener.bind_address);
+            labeled.listener_info_labels[listener_at] =
+                try listenerInfoLabel(arena, bind, kind, listener.routes.len);
+            listener_at += 1;
+            if (listener.protocol == .http) {
+                for (listener.routes) |*route| {
+                    labeled.route_info_labels[route_at] =
+                        try routeInfoLabel(arena, bind, route, config);
+                    route_at += 1;
+                }
+            }
+        }
+        for (config.h3_listeners) |*listener| {
+            // h3 routes share the route_info family; the listener label
+            // carries the h3 bind, which is what disambiguates them.
+            const bind = renderBindLiteral(&scratch, &listener.bind_address);
+            labeled.listener_info_labels[listener_at] =
+                try listenerInfoLabel(arena, bind, "h3", listener.routes.len);
+            listener_at += 1;
+            for (listener.routes) |*route| {
+                labeled.route_info_labels[route_at] =
+                    try routeInfoLabel(arena, bind, route, config);
+                route_at += 1;
+            }
+        }
+        assert(listener_at == labeled.listener_info_labels.len);
+        assert(route_at == labeled.route_info_labels.len);
+        try labeled.buildCertInfoLabels(arena, config);
+    }
+
+    /// The `cert_info` rows: one walk over every configured certificate
+    /// reference, reading each leaf's `notAfter` once, at init. The
+    /// reads ride `io.blocking` — startup paths have no Io, and §4
+    /// gathers every fd surface under `src/io/` — and the serving path
+    /// never touches this code, which is what keeps §5's promise (the
+    /// loop allocates nothing) intact.
+    ///
+    /// Production order makes every configured row build: `main` loads
+    /// the same files through `Credentials.load` before `Server.init`
+    /// runs, so an unreadable or unparseable entry here is an embedder or
+    /// test config, and the row it would have worn stays empty — the
+    /// family renders the rows that built, never a fabricated expiry.
+    /// `days_left` is stamped against the wall clock at this walk: the
+    /// snapshot the field's doc promises, and the reason a SIGHUP rotation
+    /// does not move it.
+    fn buildCertInfoLabels(
+        labeled: *Labeled,
+        arena: std.mem.Allocator,
+        config: *const config_module.Config,
+    ) error{OutOfMemory}!void {
+        const row_count = certInfoRowCount(config);
+        if (row_count == 0) {
+            // The plaintext deployment: the family still renders its
+            // header with zero rows (see `renderInfo`), so a scraper can
+            // rely on the family's existence rather than its absence.
+            labeled.cert_info_labels = &.{};
+            return;
+        }
+        labeled.cert_info_labels = try arena.alloc([]const u8, row_count);
+        // The read and decode scratch is one allocation per init, shared
+        // across the walk — single-threaded init, strictly sequential.
+        // Sized by the module-local bounds so a hostile file cannot make
+        // init grow without bound.
+        const read_scratch = try arena.alloc(u8, cert_info_pem_read_bytes + cert_info_der_bytes);
+        const pem_scratch = read_scratch[0..cert_info_pem_read_bytes];
+        const der_scratch = read_scratch[cert_info_pem_read_bytes..];
+        @memset(labeled.cert_info_labels, "");
+        var at: usize = 0;
+        var bind_scratch: [endpoint_literal_bytes_max]u8 = undefined;
+        for (config.listeners) |*listener| {
+            const tls = listener.tls orelse continue;
+            const bind = renderBindLiteral(&bind_scratch, &listener.bind_address);
+            for (tls.certificates) |*certificate| {
+                if (try certInfoLabel(
+                    arena,
+                    certificate.cert_path,
+                    certificate.names,
+                    bind,
+                    pem_scratch,
+                    der_scratch,
+                )) |label| {
+                    labeled.cert_info_labels[at] = label;
+                    at += 1;
+                }
+            }
+        }
+        for (config.h3_listeners) |*listener| {
+            const bind = renderBindLiteral(&bind_scratch, &listener.bind_address);
+            // An h3 listener's certificate has no configured SNI names —
+            // the name label wears "default" (the same role the name
+            // serves on a listener set's unnamed first entry, the
+            // certificate a client naming nothing is handed).
+            if (try certInfoLabel(arena, listener.cert_path, &.{}, bind, pem_scratch, der_scratch)) |label| {
+                labeled.cert_info_labels[at] = label;
+                at += 1;
+            }
+        }
+    }
+
+    /// How many `cert_info` rows the config asks for: every listener
+    /// `tls.certificates` entry plus every h3 listener's certificate. The
+    /// allocation and both price walks share this, so the slice's length
+    /// is config-pinned even where a row's *content* is file-derived.
+    fn certInfoRowCount(config: *const config_module.Config) usize {
+        var count: usize = 0;
+        for (config.listeners) |*listener| {
+            if (listener.tls) |tls| count += tls.certificates.len;
+        }
+        count += config.h3_listeners.len;
+        return count;
+    }
+
+    /// What one `cert_info` label costs at `days_left`'s widest spelling
+    /// — the pure-config price every closed form shares. `name` arrives
+    /// already escaped-width (`escapedLen`), as do all priced strings.
+    fn certInfoLabelLen(name_len: usize, bind_len: usize, days_digits: usize) usize {
+        return "{name=\"".len + name_len +
+            "\",listener=\"".len + bind_len +
+            "\",not_after=\"".len + rfc3339_utc_bytes +
+            "\",days_left=\"".len + days_digits + "\"}".len;
+    }
+
+    /// The config-level render term for the whole family: header plus one
+    /// bound-priced row per configured certificate reference.
+    fn certInfoRenderBytesForBound(config: *const config_module.Config) usize {
+        var total = typeLineLen("cert_info", "gauge");
+        var bind_scratch: [endpoint_literal_bytes_max]u8 = undefined;
+        for (config.listeners) |*listener| {
+            const tls = listener.tls orelse continue;
+            const bind_len = renderBindLiteral(&bind_scratch, &listener.bind_address).len;
+            for (tls.certificates) |*certificate| {
+                total += rowLen(
+                    "cert_info",
+                    certInfoLabelLen(certNameLen(certificate.names), bind_len, days_left_digits_max),
+                    1,
+                );
+            }
+        }
+        for (config.h3_listeners) |*listener| {
+            const bind_len = renderBindLiteral(&bind_scratch, &listener.bind_address).len;
+            total += rowLen(
+                "cert_info",
+                certInfoLabelLen(certNameLen(&.{}), bind_len, days_left_digits_max),
+                1,
+            );
+        }
+        return total;
+    }
+
+    /// The exact render term of the family as init built it — header plus
+    /// one row per built label — the sum the instance bound uses in place
+    /// of `certInfoRenderBytesForBound`. Priced off the stored labels
+    /// rather than re-walking the config, so a skipped row shrinks the
+    /// bound by exactly the bytes the render will not write.
+    fn certInfoRenderBytesExact(labeled: *const Labeled) usize {
+        var total: usize = typeLineLen("cert_info", "gauge");
+        for (labeled.cert_info_labels) |label| {
+            if (label.len == 0) continue; // a reference whose cert never built
+            total += rowLen("cert_info", label.len, 1);
+        }
+        return total;
+    }
+
+    /// The `name` label's priced width: the first configured DNS name, or
+    /// `"default"` where the config names none. CredentialSet derives the
+    /// served names from the leaf when the list is empty; this family
+    /// stays config-pinned so its pricing walk never reads a file, and
+    /// "default" is the truthful answer there too — the unnamed entry of
+    /// a listener's set is the one a no-SNI client is served.
+    fn certNameLen(names: []const []const u8) usize {
+        if (names.len == 0) return "default".len;
+        return escapedLen(names[0]);
+    }
+
+    /// Build one row's label, or null when the certificate cannot be
+    /// read or parsed. The PEM decode and the x509 parse live in
+    /// `tls/Credentials.zig` — the crypto boundary, where zssl imports
+    /// are allowed to live — and run the same decoder `Credentials.load`
+    /// runs, so a refusal here is a refusal the serving path already
+    /// made. The file read rides `io.blocking.readFilePrefix`: a startup
+    /// path with no Io, which is where §4 gathers every fd surface.
+    fn certInfoLabel(
+        arena: std.mem.Allocator,
+        cert_path: []const u8,
+        names: []const []const u8,
+        bind: []const u8,
+        pem_scratch: []u8,
+        der_scratch: []u8,
+    ) error{OutOfMemory}!?[]const u8 {
+        const pem = io_module.blocking.readFilePrefix(cert_path, pem_scratch) orelse return null;
+        const not_after = credentials_module.pemLeafNotAfter(pem, der_scratch) orelse return null;
+        const now_s = io_module.blocking.wallClockSeconds();
+        // The load-time snapshot: whole days between the startup clock
+        // and expiry. An expired certificate wears 0 — a u32 cannot say
+        // "negative", and the past is what the `not_after` label is for.
+        const days_left: u32 = if (not_after > now_s)
+            @intCast((not_after - now_s) / std.time.s_per_day)
+        else
+            0;
+        var stamp: [rfc3339_utc_bytes]u8 = undefined;
+        _ = renderRfc3339Utc(&stamp, not_after) orelse return null;
+        const name = if (names.len >= 1) names[0] else "default";
+        const buffer = try arena.alloc(u8, certInfoLabelLen(escapedLen(name), bind.len, std.fmt.count("{d}", .{days_left})));
+        var writer = std.Io.Writer.fixed(buffer);
+        writer.writeAll("{name=\"") catch unreachable;
+        writeEscaped(&writer, name) catch unreachable;
+        writer.writeAll("\",listener=\"") catch unreachable;
+        writer.writeAll(bind) catch unreachable;
+        writer.writeAll("\",not_after=\"") catch unreachable;
+        writer.writeAll(&stamp) catch unreachable;
+        writer.print("\",days_left=\"{d}\"}}", .{days_left}) catch unreachable;
+        return writer.buffered();
+    }
+
+    /// `epoch` as RFC 3339 UTC to second resolution — always exactly
+    /// `rfc3339_utc_bytes` wide — or null when the year needs more than
+    /// the four digits X.509 times are guaranteed to fit (a GeneralizedTime
+    /// parser cannot produce one, and the guard keeps the fixed width
+    /// honest for any value the DER layer below could hand up).
+    fn renderRfc3339Utc(buffer: *[rfc3339_utc_bytes]u8, epoch_s: u64) ?[]const u8 {
+        const epoch_secs: std.time.epoch.EpochSeconds = .{ .secs = epoch_s };
+        const year_day = epoch_secs.getEpochDay().calculateYearDay();
+        if (year_day.year > 9999) return null;
+        const month_day = year_day.calculateMonthDay();
+        const day_secs = epoch_secs.getDaySeconds();
+        var writer = std.Io.Writer.fixed(buffer);
+        // `month.numeric()` — the 1-based spelling, `access_log`'s
+        // `writeTimestamp` conversion — rather than backingInt arithmetic
+        // the enum's representation has no business exposing.
+        writer.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+            @as(u64, year_day.year),
+            @as(u64, month_day.month.numeric()),
+            @as(u64, month_day.day_index) + 1,
+            @as(u64, day_secs.getHoursIntoDay()),
+            @as(u64, day_secs.getMinutesIntoHour()),
+            @as(u64, day_secs.getSecondsIntoMinute()),
+        }) catch unreachable;
+        const text = writer.buffered();
+        assert(text.len == rfc3339_utc_bytes);
+        return text;
     }
 
     fn allocValues(arena: std.mem.Allocator, count: usize) error{OutOfMemory}![]Value {
@@ -1399,9 +1775,250 @@ pub const Labeled = struct {
         return writer.buffered();
     }
 
+    /// What `writeEscaped` emits for `value` — the measure half of the
+    /// pair, so a label's allocation and its closed-form price walk the
+    /// same bytes. The measure-then-render shape (rather than the
+    /// cluster/endpoint labels' fixed scratch) exists because a route's
+    /// header name has no loader length bound — `validateHeaderName`
+    /// checks tokens, not width — and allocating what the walk measures
+    /// prices any legal config exactly instead of crashing a wide one.
+    fn escapedLen(value: []const u8) usize {
+        var len: usize = value.len;
+        for (value) |byte| {
+            if (byte == '\\' or byte == '"' or byte == '\n') len += 1;
+        }
+        return len;
+    }
+
+    /// The address literal the `{f}` render produces, in caller scratch —
+    /// the loader bounds every address a config can carry (IP literals by
+    /// their grammar, socket paths by `unix_path_bytes_max` with
+    /// renderability enforced at load), so the fixed writer cannot fill.
+    /// Generic over the two bind spellings a config can carry: TCP
+    /// listeners hold an `io_module.Address` (IP or `unix:`), h3 an
+    /// `IpAddress` (QUIC has no socket-path form). Both render with
+    /// `{f}`; the unix assert rides only the variant that can be one —
+    /// the loader's renderability guarantee (`pathIsRenderable`) is
+    /// what keeps the fixed writer from filling either way.
+    fn renderBindLiteral(scratch: []u8, address: anytype) []const u8 {
+        assert(scratch.len >= endpoint_literal_bytes_max);
+        if (@TypeOf(address.*) == io_module.Address and address.* == .unix) {
+            assert(io_module.Address.pathIsRenderable(address.unix));
+        }
+        var writer = std.Io.Writer.fixed(scratch);
+        writer.print("{f}", .{address.*}) catch unreachable;
+        return writer.buffered();
+    }
+
+    fn versionLabelLen(version: []const u8) usize {
+        return "{version=\"".len + escapedLen(version) + "\"}".len;
+    }
+
+    fn renderVersionLabel(buffer: []u8, version: []const u8) []const u8 {
+        assert(buffer.len >= versionLabelLen(version));
+        var writer = std.Io.Writer.fixed(buffer);
+        writer.writeAll("{version=\"") catch unreachable;
+        writeEscaped(&writer, version) catch unreachable;
+        writer.writeAll("\"}") catch unreachable;
+        return writer.buffered();
+    }
+
+    fn versionLabel(arena: std.mem.Allocator, version: []const u8) error{OutOfMemory}![]const u8 {
+        const buffer = try arena.alloc(u8, versionLabelLen(version));
+        return renderVersionLabel(buffer, version);
+    }
+
+    fn listenerInfoLabelLen(bind_len: usize, kind: []const u8, routes_count: usize) usize {
+        return "{bind=\"".len + bind_len + "\",kind=\"".len + kind.len +
+            "\",routes=\"".len + std.fmt.count("{d}", .{routes_count}) + "\"}".len;
+    }
+
+    fn renderListenerInfoLabel(
+        buffer: []u8,
+        bind: []const u8,
+        kind: []const u8,
+        routes_count: usize,
+    ) []const u8 {
+        assert(buffer.len >= listenerInfoLabelLen(bind.len, kind, routes_count));
+        var writer = std.Io.Writer.fixed(buffer);
+        writer.print("{{bind=\"{s}\",kind=\"{s}\",routes=\"{d}\"}}", .{
+            bind, kind, routes_count,
+        }) catch unreachable;
+        return writer.buffered();
+    }
+
+    fn listenerInfoLabel(
+        arena: std.mem.Allocator,
+        bind: []const u8,
+        kind: []const u8,
+        routes_count: usize,
+    ) error{OutOfMemory}![]const u8 {
+        const buffer = try arena.alloc(u8, listenerInfoLabelLen(bind.len, kind, routes_count));
+        return renderListenerInfoLabel(buffer, bind, kind, routes_count);
+    }
+
+    fn routeInfoLabelLen(
+        bind_len: usize,
+        route: *const router_module.Route,
+        config: *const config_module.Config,
+    ) usize {
+        assert(route.cluster_index < config.clusters.len);
+        var len = "{listener=\"".len + bind_len + "\"".len;
+        // A null host omits the label entirely — the Prometheus
+        // convention: an absent label is "any", where an empty one
+        // would claim the empty host exists.
+        if (route.host) |host| len += ",host=\"".len + escapedLen(host) + "\"".len;
+        len += ",prefix=\"".len + escapedLen(route.prefix) + "\"".len;
+        // The predicate's name only: equals-vs-present is a matching
+        // detail, not an identity one, and the panel keys on the name.
+        if (route.header) |predicate| len += ",header=\"".len + escapedLen(predicate.name) + "\"".len;
+        len += ",cluster=\"".len + escapedLen(config.clusters[route.cluster_index].name) + "\"}".len;
+        return len;
+    }
+
+    fn renderRouteInfoLabel(
+        buffer: []u8,
+        bind: []const u8,
+        route: *const router_module.Route,
+        config: *const config_module.Config,
+    ) []const u8 {
+        assert(buffer.len >= routeInfoLabelLen(bind.len, route, config));
+        assert(route.cluster_index < config.clusters.len);
+        var writer = std.Io.Writer.fixed(buffer);
+        writer.print("{{listener=\"{s}\"", .{bind}) catch unreachable;
+        if (route.host) |host| {
+            writer.writeAll(",host=\"") catch unreachable;
+            writeEscaped(&writer, host) catch unreachable;
+            writer.writeAll("\"") catch unreachable;
+        }
+        writer.writeAll(",prefix=\"") catch unreachable;
+        writeEscaped(&writer, route.prefix) catch unreachable;
+        writer.writeAll("\"") catch unreachable;
+        if (route.header) |predicate| {
+            writer.writeAll(",header=\"") catch unreachable;
+            writeEscaped(&writer, predicate.name) catch unreachable;
+            writer.writeAll("\"") catch unreachable;
+        }
+        writer.writeAll(",cluster=\"") catch unreachable;
+        writeEscaped(&writer, config.clusters[route.cluster_index].name) catch unreachable;
+        writer.writeAll("\"}") catch unreachable;
+        return writer.buffered();
+    }
+
+    fn routeInfoLabel(
+        arena: std.mem.Allocator,
+        bind: []const u8,
+        route: *const router_module.Route,
+        config: *const config_module.Config,
+    ) error{OutOfMemory}![]const u8 {
+        const buffer = try arena.alloc(u8, routeInfoLabelLen(bind.len, route, config));
+        return renderRouteInfoLabel(buffer, bind, route, config);
+    }
+
+    /// The `zgix_info{version=…}` family's exact byte width for one
+    /// version label — the one term that cannot live in the pure-config
+    /// `renderBytesMaxFor`, because a version is build-pinned rather
+    /// than config-pinned. An escaped length of zero means no version
+    /// was installed and the whole family (header included) is absent,
+    /// which prices to zero.
+    pub fn infoVersionBytes(version_label_len: usize) usize {
+        if (version_label_len == 0) return 0;
+        return typeLineLen("info", "gauge") + rowLen("info", version_label_len, 1);
+    }
+
+    /// The banner's pricing of the version family: the same row at the
+    /// loader-comptime bound rather than the build's actual version, so
+    /// the §5 closed form over-covers by at most the slack between a
+    /// 32-byte worst spelling and the real tag. The instance bound
+    /// (`init`) stays exact — the tightness doctrine pins that one, and
+    /// a budget's one safe direction to be loose in is up.
+    pub fn infoVersionBytesForBound() usize {
+        return infoVersionBytes(versionLabelLenBound());
+    }
+
+    fn versionLabelLenBound() usize {
+        return "{version=\"".len + 2 * @as(usize, constants.version_label_bytes_max) + "\"}".len;
+    }
+
+    /// The `route_responses` families' row terms, one per http and h3
+    /// route in config order — the priced twin of `route_responses`'s
+    /// render walk, measuring the same labels `route_info` allocates.
+    fn routeResponsesRenderBytes(config: *const config_module.Config) usize {
+        var total: usize = 0;
+        var bind_scratch: [endpoint_literal_bytes_max]u8 = undefined;
+        for (config.listeners) |*listener| {
+            if (listener.protocol != .http) continue;
+            const bind_len = renderBindLiteral(&bind_scratch, &listener.bind_address).len;
+            for (listener.routes) |*route| {
+                total += rowLen("route_responses", routeInfoLabelLen(bind_len, route, config), u64_digits_max);
+            }
+        }
+        for (config.h3_listeners) |*listener| {
+            const bind_len = renderBindLiteral(&bind_scratch, &listener.bind_address).len;
+            for (listener.routes) |*route| {
+                total += rowLen("route_responses", routeInfoLabelLen(bind_len, route, config), u64_digits_max);
+            }
+        }
+        return total;
+    }
+
+    /// http and h3 listeners carry routes into `route_info`; an l4
+    /// listener's admission artifact does not (see the field's doc).
+    fn routeInfoRowCount(config: *const config_module.Config) usize {
+        var count: usize = 0;
+        for (config.listeners) |*listener| {
+            if (listener.protocol == .http) count += listener.routes.len;
+        }
+        for (config.h3_listeners) |*listener| {
+            count += listener.routes.len;
+        }
+        return count;
+    }
+
+    /// The inventory families' config-pinned render terms — the priced
+    /// twin of `buildInventoryLabels`, walking the same config through
+    /// the same len functions. Every label is priced at exactly the
+    /// bytes init allocates, so the bound stays exact; the version row
+    /// alone is build-pinned and rides `infoVersionBytes` at init (the
+    /// banner prices it at `infoVersionBytesForBound` — the one
+    /// documented slack in the §5 closed form).
+    fn inventoryRenderBytes(config: *const config_module.Config) usize {
+        var total: usize = 0;
+        if (config.listeners.len + config.h3_listeners.len >= 1) {
+            total += typeLineLen("listener_info", "gauge");
+        }
+        if (routeInfoRowCount(config) >= 1) {
+            total += typeLineLen("route_info", "gauge");
+        }
+        total += typeLineLen("endpoint_info", "gauge");
+        var bind_scratch: [endpoint_literal_bytes_max]u8 = undefined;
+        for (config.listeners) |*listener| {
+            const bind_len = renderBindLiteral(&bind_scratch, &listener.bind_address).len;
+            const kind: []const u8 = if (listener.protocol == .l4) "l4" else "http";
+            total += rowLen("listener_info", listenerInfoLabelLen(bind_len, kind, listener.routes.len), 1);
+            if (listener.protocol == .http) {
+                for (listener.routes) |*route| {
+                    total += rowLen("route_info", routeInfoLabelLen(bind_len, route, config), 1);
+                }
+            }
+        }
+        for (config.h3_listeners) |*listener| {
+            const bind_len = renderBindLiteral(&bind_scratch, &listener.bind_address).len;
+            total += rowLen("listener_info", listenerInfoLabelLen(bind_len, "h3", listener.routes.len), 1);
+            for (listener.routes) |*route| {
+                total += rowLen("route_info", routeInfoLabelLen(bind_len, route, config), 1);
+            }
+        }
+        // `endpoint_info`'s rows are priced in the cluster walk below,
+        // beside the families that share their label bytes — one walk
+        // over the endpoints, whichever family is asking.
+        return total;
+    }
+
     /// What `init` takes from the startup arena for this config (§5):
-    /// the six value tables, the label slice headers and the label bytes
-    /// themselves, and the two per-cluster scalars. Closed-form in the
+    /// the value tables, the label slice headers and the label bytes
+    /// themselves, the cert read scratch, and the two per-cluster
+    /// scalars. Closed-form in the
     /// config — it renders the same labels init dupes, through the same
     /// renderer — so the banner's term is a prediction `init` then meets
     /// exactly.
@@ -1426,11 +2043,68 @@ pub const Labeled = struct {
         total += cluster_count * StatusClass.count * @sizeOf(Value);
         total += cluster_count * duration_bucket_count * @sizeOf(Value);
         total += 2 * cluster_count * @sizeOf(Value); // duration sum + count
+        // §B2's table, priced here because init allocates it: one Value
+        // cell per route row `route_info` describes.
+        const route_rows = routeInfoRowCount(config);
+        if (route_rows >= 1) total += route_rows * @sizeOf(Value);
         var scratch: [label_scratch_bytes]u8 = undefined;
         for (config.clusters) |*cluster| {
             total += renderClusterLabel(&scratch, cluster.name).len;
             for (cluster.endpoints) |*address| {
                 total += renderEndpointLabel(&scratch, cluster.name, address).len;
+            }
+        }
+        // The inventory labels: one slice header per row (the version row
+        // is a bare slice) plus the label bytes `init` dupes. The
+        // `endpoint_info` family stores nothing — its label bytes are the
+        // endpoint families' (see the field's doc), priced once above.
+        // The version label prices at the same bound the render term
+        // uses: the table is config-walked, and a build-pinned string has
+        // no business in a pure-config walk.
+        total += @sizeOf([]const u8) + versionLabelLenBound();
+        const inventory_rows = config.listeners.len + config.h3_listeners.len +
+            routeInfoRowCount(config) + certInfoRowCount(config);
+        if (inventory_rows >= 1) {
+            total += inventory_rows * @sizeOf([]const u8);
+        }
+        // §B1's rows: the label bytes `init` dupes, priced at the same
+        // bound the render term uses (`days_left` at its u32 widest — the
+        // value is file-derived, so the pure walk cannot know its true
+        // width; init allocates the narrower built row, on
+        // `versionLabelLenBound`'s slack precedent), plus the read and
+        // decode scratch `buildCertInfoLabels` reserves once when the
+        // config names any certificate.
+        var cert_scratch: [endpoint_literal_bytes_max]u8 = undefined;
+        for (config.listeners) |*listener| {
+            const tls = listener.tls orelse continue;
+            const bind_len = renderBindLiteral(&cert_scratch, &listener.bind_address).len;
+            for (tls.certificates) |*certificate| {
+                total += certInfoLabelLen(certNameLen(certificate.names), bind_len, days_left_digits_max);
+            }
+        }
+        for (config.h3_listeners) |*listener| {
+            const bind_len = renderBindLiteral(&cert_scratch, &listener.bind_address).len;
+            total += certInfoLabelLen(certNameLen(&.{}), bind_len, days_left_digits_max);
+        }
+        if (certInfoRowCount(config) >= 1) {
+            total += cert_info_pem_read_bytes + cert_info_der_bytes;
+        }
+        var bind_scratch: [endpoint_literal_bytes_max]u8 = undefined;
+        for (config.listeners) |*listener| {
+            const bind = renderBindLiteral(&bind_scratch, &listener.bind_address);
+            const kind: []const u8 = if (listener.protocol == .l4) "l4" else "http";
+            total += listenerInfoLabelLen(bind.len, kind, listener.routes.len);
+            if (listener.protocol == .http) {
+                for (listener.routes) |*route| {
+                    total += routeInfoLabelLen(bind.len, route, config);
+                }
+            }
+        }
+        for (config.h3_listeners) |*listener| {
+            const bind = renderBindLiteral(&bind_scratch, &listener.bind_address);
+            total += listenerInfoLabelLen(bind.len, "h3", listener.routes.len);
+            for (listener.routes) |*route| {
+                total += routeInfoLabelLen(bind.len, route, config);
             }
         }
         assert(total >= 1);
@@ -1528,6 +2202,54 @@ pub const Labeled = struct {
         assert(previous < std.math.maxInt(u64));
     }
 
+    /// The matched route's global ordinal: the index its row wears in
+    /// `route_info_labels` and `route_responses`, counted in config order
+    /// — http listeners' routes first (config order, l4 skipped: its
+    /// catch-all is not path routing), then h3 listeners' routes. This is
+    /// the request-time twin of `buildInventoryLabels`' route walk: the
+    /// two must enumerate in the same order, which is why both live here.
+    /// `routes` is the connection's borrowed table and `matched` points
+    /// into it (router.find's contract), so the listener is identified by
+    /// slice identity — a pointer compare per listener per request, on a
+    /// config-bounded table, beside the route scan the request already
+    /// paid.
+    pub fn routeIndexFor(
+        config: *const config_module.Config,
+        routes: []const router_module.Route,
+        matched: *const router_module.Route,
+    ) u32 {
+        assert(routes.len >= 1);
+        const byte_offset = @intFromPtr(matched) - @intFromPtr(routes.ptr);
+        assert(byte_offset % @sizeOf(router_module.Route) == 0);
+        const local: u32 = @intCast(byte_offset / @sizeOf(router_module.Route));
+        assert(local < routes.len);
+        var base: u32 = 0;
+        for (config.listeners) |*listener| {
+            if (listener.protocol != .http) continue;
+            if (listener.routes.ptr == routes.ptr) return base + local;
+            base += @intCast(listener.routes.len);
+        }
+        for (config.h3_listeners) |*listener| {
+            if (listener.routes.ptr == routes.ptr) return base + local;
+            base += @intCast(listener.routes.len);
+        }
+        unreachable; // `matched` points into a configured listener's table.
+    }
+
+    /// Count one completed L7 exchange against the route that matched it
+    /// (§B2), at the same `finishExchange` witness that increments
+    /// `l7_responses` — the pairing `reconciles` asserts. Loop thread
+    /// only, like every other witness here.
+    pub fn incrementRoute(labeled: *Labeled, route_index: u32) void {
+        // No http/h3 routes means no L7 traffic can exist to witness; the
+        // empty table renders as a header with zero rows.
+        if (labeled.route_responses.len == 0) return;
+        assert(route_index < labeled.route_responses.len);
+        assert(labeled.route_info_labels[route_index].len >= 1);
+        const previous = labeled.route_responses[route_index].add(1);
+        assert(previous < std.math.maxInt(u64));
+    }
+
     /// Render every labeled family as Prometheus exposition text —
     /// `Counters.render`'s dialect, appended after it by the callers
     /// that serve both. Zero-alloc into a caller-owned buffer of at
@@ -1546,10 +2268,12 @@ pub const Labeled = struct {
         inline for (comptime std.enums.values(ClusterFamily)) |family| {
             labeled.renderClusterFamily(&writer, family);
         }
+        labeled.renderRouteResponses(&writer);
         labeled.renderStatusClasses(&writer);
         labeled.renderDuration(&writer);
         labeled.renderInflight(&writer, views);
         labeled.renderHealthy(&writer, views);
+        labeled.renderInfo(&writer);
         const text = writer.buffered();
         assert(text.len >= 1);
         assert(text.len <= labeled.render_bytes_max);
@@ -1598,6 +2322,27 @@ pub const Labeled = struct {
             writer.print("{s}{s}{s} {d}\n", .{
                 metric_prefix,
                 comptime family.name(),
+                label,
+                value.get(),
+            }) catch unreachable;
+        }
+    }
+
+    /// Per-route completed responses (§B2): the `route_info` label bytes
+    /// under a counter name — one storage, two families, index-aligned by
+    /// construction (see the field's doc). Every route renders on every
+    /// scrape, zero counts included: a dashboard alerting on a route's
+    /// traffic wants the series present before the first request, the
+    /// same argument `renderEndpointFamily` makes.
+    fn renderRouteResponses(labeled: *const Labeled, writer: *std.Io.Writer) void {
+        assert(labeled.route_responses.len == labeled.route_info_labels.len);
+        writer.print(
+            "# TYPE {s}route_responses counter\n",
+            .{metric_prefix},
+        ) catch unreachable;
+        for (labeled.route_info_labels, labeled.route_responses) |label, *value| {
+            writer.print("{s}route_responses{s} {d}\n", .{
+                metric_prefix,
                 label,
                 value.get(),
             }) catch unreachable;
@@ -1746,6 +2491,71 @@ pub const Labeled = struct {
         }
     }
 
+    /// The inventory families: version first, then one row per listener,
+    /// per route, and per endpoint — every row the constant 1 the
+    /// `*_info` convention wears. Unlike the witness families these
+    /// render from prebuilt labels alone, so the only work a scrape does
+    /// is the writing.
+    fn renderInfo(labeled: *const Labeled, writer: *std.Io.Writer) void {
+        if (labeled.info_version_label.len >= 1) {
+            writer.print(
+                "# TYPE {s}info gauge\n{s}info{s} 1\n",
+                .{ metric_prefix, metric_prefix, labeled.info_version_label },
+            ) catch unreachable;
+        }
+        if (labeled.listener_info_labels.len >= 1) {
+            writer.print(
+                "# TYPE {s}listener_info gauge\n",
+                .{metric_prefix},
+            ) catch unreachable;
+            for (labeled.listener_info_labels) |label| {
+                writer.print("{s}listener_info{s} 1\n", .{
+                    metric_prefix, label,
+                }) catch unreachable;
+            }
+        }
+        if (labeled.route_info_labels.len >= 1) {
+            writer.print(
+                "# TYPE {s}route_info gauge\n",
+                .{metric_prefix},
+            ) catch unreachable;
+            for (labeled.route_info_labels) |label| {
+                writer.print("{s}route_info{s} 1\n", .{
+                    metric_prefix, label,
+                }) catch unreachable;
+            }
+        }
+        // cert_info wears its header even with zero rows: a plaintext
+        // deployment answers the family's existence with an empty one,
+        // where dropping the header would leave a scraper guessing
+        // between "no certificates" and "no exposition".
+        writer.print(
+            "# TYPE {s}cert_info gauge\n",
+            .{metric_prefix},
+        ) catch unreachable;
+        for (labeled.cert_info_labels) |label| {
+            if (label.len == 0) continue; // a reference whose cert never built
+            writer.print("{s}cert_info{s} 1\n", .{
+                metric_prefix, label,
+            }) catch unreachable;
+        }
+        // `endpoint_info` reuses the endpoint families' label bytes — the
+        // cluster+endpoint pair is exactly this family's identity, and a
+        // second table would be two copies to keep in step.
+        writer.print(
+            "# TYPE {s}endpoint_info gauge\n",
+            .{metric_prefix},
+        ) catch unreachable;
+        for (0..labeled.endpoint_counts.len) |cluster_index| {
+            for (0..labeled.endpoint_counts[cluster_index]) |endpoint_index| {
+                const key = labeled.keys.key(@intCast(cluster_index), @intCast(endpoint_index));
+                writer.print("{s}endpoint_info{s} 1\n", .{
+                    metric_prefix, labeled.endpoint_labels[key],
+                }) catch unreachable;
+            }
+        }
+    }
+
     fn checkedClusterCount(labeled: *const Labeled) u16 {
         var count: u16 = 0;
         for (labeled.cluster_checked) |checked| {
@@ -1773,6 +2583,18 @@ pub const Labeled = struct {
         total += typeLineLen("endpoint_inflight", "gauge");
         total += typeLineLen("cluster_responses", "counter");
         total += typeLineLen("cluster_duration_seconds", "histogram");
+        total += inventoryRenderBytes(config);
+        // §B2's family: header plus one 20-digit row per route, priced off
+        // the same labels `route_info` stores — the row walk is the
+        // `buildInventoryLabels` route walk, so the two cannot drift.
+        total += typeLineLen("route_responses", "counter");
+        total += routeResponsesRenderBytes(config);
+        // §B1's family: header plus one bound-priced row per configured
+        // certificate reference. `init` swaps the row term for the exact
+        // width of the rows it built (see there); the bound this form
+        // states stays above every instance, which is all the banner
+        // asks of it.
+        total += certInfoRenderBytesForBound(config);
         var checked_clusters: usize = 0;
         var scratch: [label_scratch_bytes]u8 = undefined;
         for (config.clusters) |*cluster| {
@@ -1816,6 +2638,7 @@ pub const Labeled = struct {
                     total += rowLen(family.name(), label_len, u64_digits_max);
                 }
                 total += rowLen("endpoint_inflight", label_len, inflight_digits_max);
+                total += rowLen("endpoint_info", label_len, 1);
                 if (cluster_checked) {
                     total += rowLen("endpoint_healthy", label_len, healthy_digits_max);
                 }
@@ -1879,6 +2702,21 @@ pub const Labeled = struct {
         assert(tableTotal(labeled.cluster_responses) == counters.get("l7_responses"));
         assert(tableTotal(labeled.cluster_duration_count) == counters.get("l7_responses"));
         assert(tableTotal(labeled.cluster_duration_buckets) == counters.get("l7_responses"));
+        // §B2: per-route responses partition the same total, because both
+        // are written at `finishExchange` one increment apart — every
+        // completed L7 exchange matched exactly one route, and no other
+        // path increments either side. L7-only by construction: the h3
+        // seam cannot import this module, so h3 exchanges are absent
+        // here and present in `h3_responses` — folding them in would
+        // require the seam to break the build.zig invariant, and the
+        // per-route h3 count is the follow-on slice that does. An empty
+        // table means the config routes nothing by path, so no L7
+        // exchange can complete and the identity holds vacuously —
+        // `tableTotal` asserts non-empty and is deliberately not bent
+        // for the vacuous case.
+        if (labeled.route_responses.len >= 1) {
+            assert(tableTotal(labeled.route_responses) == counters.get("l7_responses"));
+        }
     }
 };
 
@@ -1930,22 +2768,22 @@ test "counters: render emits Prometheus exposition for every field" {
 
     // Every counter appears exactly once as a TYPE line and a sample line,
     // and the sample carries the live value.
-    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zoxy_accepted counter\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_accepted 2\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_l7_responses 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zgix_accepted counter\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_accepted 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_l7_responses 1\n") != null);
     // Untouched counters still render at zero — a scrape sees the whole set.
-    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_completed 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_completed 0\n") != null);
 
     // Gauges ride the same rendering, typed `gauge` — a scrape that read
     // an occupancy as a counter would chart nonsense through `rate()`.
-    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zoxy_upstream_slots_leased gauge\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_upstream_slots_leased 5\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_upstream_slots_parked 11\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_upstream_slots_capacity 16\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_conn_slots_in_use 7\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zgix_upstream_slots_leased gauge\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_upstream_slots_leased 5\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_upstream_slots_parked 11\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_upstream_slots_capacity 16\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_conn_slots_in_use 7\n") != null);
     // No gauge is rendered as a counter, and no counter as a gauge.
-    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_upstream_slots_leased counter") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_accepted gauge") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_upstream_slots_leased counter") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_accepted gauge") == null);
 
     // One TYPE line per counter *and* gauge field: the rendering is complete.
     var type_lines: usize = 0;
@@ -2159,7 +2997,7 @@ test "counters: labeled init builds one label per configured endpoint" {
     const clusters = labeledTestClusters();
     const config = labeledTestConfig(&clusters);
     var labeled: Labeled = undefined;
-    try labeled.init(arena_state.allocator(), &config, labeled_test_keys);
+    try labeled.init(arena_state.allocator(), &config, labeled_test_keys, "");
 
     try std.testing.expectEqualStrings(
         "{cluster=\"api\",endpoint=\"10.0.0.1:8080\"}",
@@ -2195,7 +3033,7 @@ test "counters: labeled labels escape what the exposition grammar reserves" {
     };
     const config = labeledTestConfig(&clusters);
     var labeled: Labeled = undefined;
-    try labeled.init(arena_state.allocator(), &config, .init(1, 1));
+    try labeled.init(arena_state.allocator(), &config, .init(1, 1), "");
 
     // A quote or backslash in a cluster name must not break the label
     // grammar: the loader bounds a name's length, never its bytes.
@@ -2211,7 +3049,7 @@ test "counters: labeled render speaks the exposition dialect" {
     const clusters = labeledTestClusters();
     const config = labeledTestConfig(&clusters);
     var labeled: Labeled = undefined;
-    try labeled.init(arena_state.allocator(), &config, labeled_test_keys);
+    try labeled.init(arena_state.allocator(), &config, labeled_test_keys, "");
 
     labeled.incrementEndpoint(.responses, labeled_test_keys.key(0, 1));
     labeled.incrementEndpoint(.responses, labeled_test_keys.key(0, 1));
@@ -2233,19 +3071,19 @@ test "counters: labeled render speaks the exposition dialect" {
 
     // Counters carry their values, and untouched series render at zero —
     // a scrape sees the whole configured set, exactly like `Counters`.
-    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zoxy_endpoint_responses counter\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_endpoint_responses{cluster=\"api\",endpoint=\"10.0.0.2:8080\"} 2\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_endpoint_connect_failed{cluster=\"api\",endpoint=\"10.0.0.1:8080\"} 0\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_cluster_l7_shed_inflight{cluster=\"solo\"} 1\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_cluster_l4_shed_inflight{cluster=\"api\"} 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zgix_endpoint_responses counter\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_endpoint_responses{cluster=\"api\",endpoint=\"10.0.0.2:8080\"} 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_endpoint_connect_failed{cluster=\"api\",endpoint=\"10.0.0.1:8080\"} 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_cluster_l7_shed_inflight{cluster=\"solo\"} 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_cluster_l4_shed_inflight{cluster=\"api\"} 0\n") != null);
     // The inflight gauge reads the live view: both protocols summed.
-    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zoxy_endpoint_inflight gauge\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_endpoint_inflight{cluster=\"api\",endpoint=\"10.0.0.1:8080\"} 5\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zgix_endpoint_inflight gauge\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_endpoint_inflight{cluster=\"api\",endpoint=\"10.0.0.1:8080\"} 5\n") != null);
     // Healthy renders the prober's verdict for checked endpoints only:
     // an unprobed endpoint has no verdict to dress up as a 1.
-    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_endpoint_healthy{cluster=\"api\",endpoint=\"10.0.0.2:8080\"} 0\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_endpoint_healthy{cluster=\"api\",endpoint=\"10.0.0.1:8080\"} 1\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_endpoint_healthy{cluster=\"solo\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_endpoint_healthy{cluster=\"api\",endpoint=\"10.0.0.2:8080\"} 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_endpoint_healthy{cluster=\"api\",endpoint=\"10.0.0.1:8080\"} 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_endpoint_healthy{cluster=\"solo\"") == null);
 
     // #299's two families. The class joins the cluster label rather than
     // replacing it, and every class renders even at zero — a scrape that
@@ -2254,30 +3092,48 @@ test "counters: labeled render speaks the exposition dialect" {
     labeled.observeExchange(0, 503, 3_000_000);
     labeled.observeExchange(0, 200, 30_000);
     const with_observations = labeled.render(&views, buffer);
-    try std.testing.expect(std.mem.indexOf(u8, with_observations, "# TYPE zoxy_cluster_responses counter\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zoxy_cluster_responses{cluster=\"api\",class=\"5xx\"} 1\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zoxy_cluster_responses{cluster=\"api\",class=\"2xx\"} 1\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zoxy_cluster_responses{cluster=\"api\",class=\"4xx\"} 0\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zoxy_cluster_responses{cluster=\"solo\",class=\"2xx\"} 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_observations, "# TYPE zgix_cluster_responses counter\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zgix_cluster_responses{cluster=\"api\",class=\"5xx\"} 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zgix_cluster_responses{cluster=\"api\",class=\"2xx\"} 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zgix_cluster_responses{cluster=\"api\",class=\"4xx\"} 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zgix_cluster_responses{cluster=\"solo\",class=\"2xx\"} 0\n") != null);
     // The histogram is cumulative: the 30us observation is inside every
     // bound, the 3ms one only from 5ms up.
-    try std.testing.expect(std.mem.indexOf(u8, with_observations, "# TYPE zoxy_cluster_duration_seconds histogram\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zoxy_cluster_duration_seconds_bucket{cluster=\"api\",le=\"0.000050000\"} 1\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zoxy_cluster_duration_seconds_bucket{cluster=\"api\",le=\"0.005000000\"} 2\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zoxy_cluster_duration_seconds_bucket{cluster=\"api\",le=\"+Inf\"} 2\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zoxy_cluster_duration_seconds_count{cluster=\"api\"} 2\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zoxy_cluster_duration_seconds_sum{cluster=\"api\"} 0.003030000\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_observations, "# TYPE zgix_cluster_duration_seconds histogram\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zgix_cluster_duration_seconds_bucket{cluster=\"api\",le=\"0.000050000\"} 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zgix_cluster_duration_seconds_bucket{cluster=\"api\",le=\"0.005000000\"} 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zgix_cluster_duration_seconds_bucket{cluster=\"api\",le=\"+Inf\"} 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zgix_cluster_duration_seconds_count{cluster=\"api\"} 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zgix_cluster_duration_seconds_sum{cluster=\"api\"} 0.003030000\n") != null);
 
     // One TYPE line per family: four endpoint counters, two cluster
     // counters, #299's status classes and histogram, the inflight gauge,
-    // and healthy (a checked cluster exists).
+    // healthy (a checked cluster exists), the inventory's endpoint_info,
+    // and the two families that render their headers even when empty —
+    // route_responses and cert_info (this bed names no routes and no
+    // certificates). The version row stays absent where no version was
+    // installed (this bed passes ""), and the config names no listeners
+    // for listener_info.
     var type_lines: usize = 0;
     var search: usize = 0;
     while (std.mem.indexOfPos(u8, text, search, "# TYPE ")) |at| {
         type_lines += 1;
         search = at + "# TYPE ".len;
     }
-    try std.testing.expectEqual(@as(usize, 11), type_lines);
+    try std.testing.expectEqual(@as(usize, 14), type_lines);
+    // Both header-always families are present, rows included where the
+    // config names any: this bed has neither routes nor certificates, so
+    // each renders its header and stops.
+    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zgix_route_responses counter\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_route_responses{") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zgix_cert_info gauge\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_cert_info{") == null);
+    // endpoint_info reuses the endpoint families' label bytes — one row
+    // per configured endpoint, the shared {cluster=…,endpoint=…} pair on
+    // every one.
+    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zgix_endpoint_info gauge\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_endpoint_info{cluster=\"api\",endpoint=\"10.0.0.1:8080\"} 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_endpoint_info{cluster=\"solo\",endpoint=\"[2001:db8::1]:9000\"} 1\n") != null);
 }
 
 test "counters: labeled render bound is exact at the maximum values" {
@@ -2286,7 +3142,7 @@ test "counters: labeled render bound is exact at the maximum values" {
     const clusters = labeledTestClusters();
     const config = labeledTestConfig(&clusters);
     var labeled: Labeled = undefined;
-    try labeled.init(arena_state.allocator(), &config, labeled_test_keys);
+    try labeled.init(arena_state.allocator(), &config, labeled_test_keys, "");
 
     for ([_][]Counters.Value{
         labeled.connect_failed,          labeled.responses,
@@ -2294,6 +3150,7 @@ test "counters: labeled render bound is exact at the maximum values" {
         labeled.health_up,               labeled.l7_shed_inflight,
         labeled.l4_shed_inflight,        labeled.cluster_responses,
         labeled.cluster_duration_sum_ns, labeled.cluster_duration_count,
+        labeled.route_responses,
     }) |table| {
         for (table) |*value| value.set(std.math.maxInt(u64));
     }
@@ -2338,7 +3195,7 @@ test "counters: labeled render drops the healthy family with nothing checked" {
     };
     const config = labeledTestConfig(&clusters);
     var labeled: Labeled = undefined;
-    try labeled.init(arena_state.allocator(), &config, .init(1, 1));
+    try labeled.init(arena_state.allocator(), &config, .init(1, 1), "");
 
     var l7 = [_]u16{0};
     var l4 = [_]u16{0};
@@ -2352,7 +3209,7 @@ test "counters: labeled render drops the healthy family with nothing checked" {
     // No prober, no verdicts: the whole family is absent, TYPE line and
     // all, rather than a page of constant 1s meaning "unknown".
     try std.testing.expect(std.mem.indexOf(u8, text, "endpoint_healthy") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_endpoint_inflight{cluster=\"quiet\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_endpoint_inflight{cluster=\"quiet\"") != null);
 }
 
 test "counters: the labeled families partition their process totals" {
@@ -2361,7 +3218,7 @@ test "counters: the labeled families partition their process totals" {
     const clusters = labeledTestClusters();
     const config = labeledTestConfig(&clusters);
     var labeled: Labeled = undefined;
-    try labeled.init(arena_state.allocator(), &config, labeled_test_keys);
+    try labeled.init(arena_state.allocator(), &config, labeled_test_keys, "");
     var counters: Counters = .{};
 
     // Every witness moves both views of its total: the bare counter and
@@ -2379,9 +3236,498 @@ test "counters: the labeled families partition their process totals" {
     labeled.observeExchange(0, 200, 40_000);
     labeled.incrementEndpoint(.responses, labeled_test_keys.key(1, 0));
     labeled.observeExchange(1, 503, 2_000_000_000);
+    // §B2: a completed exchange also moves the route it matched — the
+    // fourth labeled view of the same `l7_responses` total. This bed
+    // names no routes, so the empty table's sum is zero against two; the
+    // route-populated pairing is the route test's job.
     counters.increment("health_endpoint_down");
     labeled.incrementEndpoint(.health_down, labeled_test_keys.key(0, 0));
     counters.increment("l4_shed_endpoint_inflight");
     labeled.incrementCluster(.l4_shed_inflight, 0);
     labeled.reconciles(&counters);
+}
+
+const inventory_test_version = "1.2.3-test";
+
+/// The 清单 fixture: an http listener with a host-scoped route and a
+/// header-predicated one, an l4 listener, an h3 listener, and one
+/// cluster with two endpoints. Everything the four inventory families
+/// can say, in one config.
+fn inventoryTestConfig(
+    clusters: []const config_module.Config.Cluster,
+) config_module.Config {
+    const http_routes = struct {
+        const list = [_]router_module.Route{
+            .{ .host = "api.example", .prefix = "/api", .cluster_index = 0 },
+            .{
+                .prefix = "/",
+                .cluster_index = 0,
+                .header = .{ .name = "x-canary", .kind = .present, .value = "" },
+            },
+        };
+    };
+    const l4_routes = struct {
+        const list = [_]router_module.Route{
+            .{ .prefix = "/", .cluster_index = 0 },
+        };
+    };
+    const h3_routes = struct {
+        const list = [_]router_module.Route{
+            .{ .prefix = "/", .cluster_index = 0 },
+        };
+    };
+    const listeners = struct {
+        const list = [_]config_module.Config.Listener{
+            .{
+                .bind_address = labeledTestAddress("127.0.0.1:8080"),
+                .bind_mode = null,
+                .routes = &http_routes.list,
+                .protocol = .http,
+            },
+            .{
+                .bind_address = labeledTestAddress("127.0.0.1:9000"),
+                .bind_mode = null,
+                .routes = &l4_routes.list,
+                .protocol = .l4,
+            },
+        };
+    };
+    const h3_listeners = struct {
+        const list = [_]config_module.Config.H3Listener{
+            .{
+                .bind_address = std.Io.net.IpAddress.parseLiteral("127.0.0.1:4443") catch unreachable,
+                .routes = &h3_routes.list,
+                .cert_path = "cert.pem",
+                .key_path = "key.pem",
+            },
+        };
+    };
+    var config = labeledTestConfig(clusters);
+    config.listeners = &listeners.list;
+    config.h3_listeners = &h3_listeners.list;
+    return config;
+}
+
+test "counters: the inventory families render the config back, verbatim" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const api_endpoints = struct {
+        const list = [_]io_module.Address{
+            labeledTestAddress("10.0.0.1:8080"),
+            labeledTestAddress("10.0.0.2:8080"),
+        };
+    };
+    const clusters = [_]config_module.Config.Cluster{
+        .{ .name = "api", .endpoints = &api_endpoints.list },
+    };
+    const config = inventoryTestConfig(&clusters);
+    var labeled: Labeled = undefined;
+    try labeled.init(
+        arena_state.allocator(),
+        &config,
+        .init(1, 2),
+        inventory_test_version,
+    );
+
+    var l7: [2]u16 = @splat(0);
+    var l4: [2]u16 = @splat(0);
+    const healthy: [2]bool = @splat(true);
+    const views: Labeled.LiveViews = .{ .load = .{ .l7 = &l7, .l4 = &l4 }, .healthy = &healthy };
+
+    const buffer = try arena_state.allocator().alloc(u8, labeled.render_bytes_max);
+    const text = labeled.render(&views, buffer);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zgix_info gauge\n" ++
+        "zgix_info{version=\"1.2.3-test\"} 1\n") != null);
+    // listener rows: http and l4 and h3, in config order, the route
+    // count on each. TLS termination would not rename the http kind —
+    // the family reports the protocol (see init's comment).
+    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zgix_listener_info gauge\n" ++
+        "zgix_listener_info{bind=\"127.0.0.1:8080\",kind=\"http\",routes=\"2\"} 1\n" ++
+        "zgix_listener_info{bind=\"127.0.0.1:9000\",kind=\"l4\",routes=\"1\"} 1\n" ++
+        "zgix_listener_info{bind=\"127.0.0.1:4443\",kind=\"h3\",routes=\"1\"} 1\n") != null);
+    // Route rows: the host-scoped route carries host= and no header
+    // label; the predicate route omits host (the Prometheus convention —
+    // an absent label is "any") and carries the predicate's name; the
+    // l4 listener's synthetic admission route is absent. The h3 route
+    // wears the h3 bind, sharing the family.
+    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zgix_route_info gauge\n" ++
+        "zgix_route_info{listener=\"127.0.0.1:8080\",host=\"api.example\",prefix=\"/api\",cluster=\"api\"} 1\n" ++
+        "zgix_route_info{listener=\"127.0.0.1:8080\",prefix=\"/\",header=\"x-canary\",cluster=\"api\"} 1\n" ++
+        "zgix_route_info{listener=\"127.0.0.1:4443\",prefix=\"/\",cluster=\"api\"} 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "listener=\"127.0.0.1:9000\"") == null);
+    // endpoint_info: the endpoint families' own label bytes, one row
+    // per endpoint — the sharing the field's doc promises, proven here
+    // by rendering exactly the stored slice (pointer and length) into
+    // the row.
+    const key = labeled.keys.key(0, 0);
+    const shared = labeled.endpoint_labels[key];
+    const needle = try std.fmt.allocPrint(arena_state.allocator(), "zgix_endpoint_info{s} 1\n", .{shared});
+    try std.testing.expect(std.mem.indexOf(u8, text, needle) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zgix_endpoint_info gauge\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_endpoint_info{cluster=\"api\",endpoint=\"10.0.0.2:8080\"} 1\n") != null);
+}
+
+test "counters: the inventory families fill the bound exactly at their widest" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const api_endpoints = struct {
+        const list = [_]io_module.Address{
+            labeledTestAddress("10.0.0.1:8080"),
+            labeledTestAddress("10.0.0.2:8080"),
+        };
+    };
+    const clusters = [_]config_module.Config.Cluster{
+        .{ .name = "api", .endpoints = &api_endpoints.list },
+    };
+    const config = inventoryTestConfig(&clusters);
+    var labeled: Labeled = undefined;
+    try labeled.init(
+        arena_state.allocator(),
+        &config,
+        .init(1, 2),
+        inventory_test_version,
+    );
+
+    // Inventory rows are constant-1 gauges: their widest rendering is
+    // their only one, so saturating the witness families (as the
+    // original tightness test does) still fills to the last byte — the
+    // bound prices every family it renders, and these render alongside.
+    // §B2's route rows join that saturation; §B1's header is priced and
+    // rendered always, and this bed's h3 certificate file does not
+    // exist, so the skipped row is re-priced out of the instance bound
+    // by init — the bound stays exact for what the render actually
+    // writes.
+    for ([_][]Labeled.Value{
+        labeled.connect_failed,
+        labeled.responses,
+        labeled.no_response,
+        labeled.health_down,
+        labeled.health_up,
+        labeled.l7_shed_inflight,
+        labeled.l4_shed_inflight,
+        labeled.cluster_responses,
+        labeled.cluster_duration_sum_ns,
+        labeled.cluster_duration_count,
+        labeled.route_responses,
+    }) |table| {
+        for (table) |*value| value.set(std.math.maxInt(u64));
+    }
+    for (labeled.cluster_duration_buckets, 0..) |*value, index| {
+        const first = index % Labeled.duration_bucket_count == 0;
+        value.set(if (first) std.math.maxInt(u64) else 0);
+    }
+
+    var l7: [2]u16 = @splat(std.math.maxInt(u16));
+    var l4: [2]u16 = @splat(std.math.maxInt(u16));
+    const healthy: [2]bool = @splat(true);
+    const views: Labeled.LiveViews = .{ .load = .{ .l7 = &l7, .l4 = &l4 }, .healthy = &healthy };
+
+    const buffer = try arena_state.allocator().alloc(u8, labeled.render_bytes_max);
+    const text = labeled.render(&views, buffer);
+    try std.testing.expectEqual(labeled.render_bytes_max, text.len);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_info{version=\"1.2.3-test\"} 1\n") != null);
+}
+
+const cert_fixture_pem = @embedFile("tls/testdata/cert.pem");
+/// The fixture leaf's notAfter, from `openssl x509 -noout -enddate`:
+/// Oct 17 06:56:58 2036 GMT — the exact spelling the label must wear.
+const cert_fixture_not_after = "2036-10-17T06:56:58Z";
+const cert_fixture_not_after_epoch: u64 = 2107839418;
+
+/// Fills the caller's storage with the §B1 fixture — two listeners
+/// sharing one certificate file (one naming it, one not) and an h3
+/// listener with the same file: three references, three rows, the
+/// multi-listener sharing rendered as separate rows by decision. The
+/// slices the returned config carries point at the caller's arrays (a
+/// certificate path is runtime, so nothing here can be a container-level
+/// static), which is why every piece arrives by pointer.
+fn certInfoFixture(
+    clusters: []const config_module.Config.Cluster,
+    cert_path: []const u8,
+    routes: *[1]router_module.Route,
+    certs_named: *[1]config_module.Config.Listener.Tls.Certificate,
+    certs_unnamed: *[1]config_module.Config.Listener.Tls.Certificate,
+    listeners: *[2]config_module.Config.Listener,
+    h3_listeners: *[1]config_module.Config.H3Listener,
+) config_module.Config {
+    routes.* = .{
+        .{ .prefix = "/", .cluster_index = 0 },
+    };
+    certs_named.* = .{
+        .{ .cert_path = cert_path, .key_path = cert_path, .names = &.{"edge.example"} },
+    };
+    certs_unnamed.* = .{
+        .{ .cert_path = cert_path, .key_path = cert_path, .names = &.{} },
+    };
+    listeners.* = .{
+        .{
+            .bind_address = labeledTestAddress("127.0.0.1:8443"),
+            .bind_mode = null,
+            .routes = routes,
+            .protocol = .http,
+            .tls = .{ .certificates = certs_named },
+        },
+        .{
+            .bind_address = labeledTestAddress("127.0.0.1:8444"),
+            .bind_mode = null,
+            .routes = routes,
+            .protocol = .http,
+            .tls = .{ .certificates = certs_unnamed },
+        },
+    };
+    h3_listeners.* = .{
+        .{
+            .bind_address = std.Io.net.IpAddress.parseLiteral("127.0.0.1:4443") catch unreachable,
+            .routes = routes,
+            .cert_path = cert_path,
+            .key_path = cert_path,
+        },
+    };
+    var config = labeledTestConfig(clusters);
+    config.listeners = listeners;
+    config.h3_listeners = h3_listeners;
+    return config;
+}
+
+test "counters: cert_info renders one row per configured certificate reference" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // One file, three references: the rows differ by name and listener
+    // bind, and share the expiry. The write rides std.testing.io — the
+    // blocking test Io, the one tmpDir's own cleanup already requires;
+    // the config then names the file by the same CWD-relative path the
+    // runner resolves, which is exactly how a deployment's relative
+    // `cert_path` reaches `readCertPem`.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cert.pem", .data = cert_fixture_pem });
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const endpoints = struct {
+        const list = [_]io_module.Address{labeledTestAddress("127.0.0.1:1")};
+    };
+    const clusters = [_]config_module.Config.Cluster{
+        .{ .name = "api", .endpoints = &endpoints.list },
+    };
+    const cert_path = try std.fmt.allocPrint(arena_state.allocator(), ".zig-cache/tmp/{s}/cert.pem", .{tmp.sub_path});
+    var routes: [1]router_module.Route = undefined;
+    var certs_named: [1]config_module.Config.Listener.Tls.Certificate = undefined;
+    var certs_unnamed: [1]config_module.Config.Listener.Tls.Certificate = undefined;
+    var listeners: [2]config_module.Config.Listener = undefined;
+    var h3_listeners: [1]config_module.Config.H3Listener = undefined;
+    const config = certInfoFixture(
+        &clusters,
+        cert_path,
+        &routes,
+        &certs_named,
+        &certs_unnamed,
+        &listeners,
+        &h3_listeners,
+    );
+    var labeled: Labeled = undefined;
+    try labeled.init(arena_state.allocator(), &config, .init(1, 1), "");
+
+    var l7 = [_]u16{0};
+    var l4 = [_]u16{0};
+    const healthy = [_]bool{true};
+    const views: Labeled.LiveViews = .{ .load = .{ .l7 = &l7, .l4 = &l4 }, .healthy = &healthy };
+    const buffer = try arena_state.allocator().alloc(u8, labeled.render_bytes_max);
+    const text = labeled.render(&views, buffer);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zgix_cert_info gauge\n") != null);
+    // The named reference wears its configured DNS name; the unnamed
+    // listener entry and the h3 certificate wear "default". The shared
+    // file renders twice — one row per (certificate, listener) pair, the
+    // multi-row decision the field's doc records, never a comma join.
+    const named = std.fmt.allocPrint(arena_state.allocator(), "zgix_cert_info{{name=\"edge.example\",listener=\"127.0.0.1:8443\"," ++
+        "not_after=\"{s}\",days_left=\"", .{cert_fixture_not_after}) catch unreachable;
+    const unnamed = std.fmt.allocPrint(arena_state.allocator(), "zgix_cert_info{{name=\"default\",listener=\"127.0.0.1:8444\"," ++
+        "not_after=\"{s}\",days_left=\"", .{cert_fixture_not_after}) catch unreachable;
+    const h3_named = std.fmt.allocPrint(arena_state.allocator(), "zgix_cert_info{{name=\"default\",listener=\"127.0.0.1:4443\"," ++
+        "not_after=\"{s}\",days_left=\"", .{cert_fixture_not_after}) catch unreachable;
+    for ([_][]const u8{ named, unnamed, h3_named }) |prefix| {
+        const at = std.mem.indexOf(u8, text, prefix) orelse
+            return error.CertInfoRowMissing;
+        // The row closes with the quoted day count and the constant 1:
+        // days_left is a load-time snapshot, so the test derives it from
+        // the same certificate facts — the wall clock may cross a UTC day
+        // boundary between init and the check, which is the one window
+        // the pair of bounds allows for.
+        const digits_end = std.mem.indexOfScalarPos(u8, text, at + prefix.len, '"') orelse
+            return error.CertInfoDaysLeftMalformed;
+        const days_left = try std.fmt.parseInt(u32, text[at + prefix.len .. digits_end], 10);
+        const now_s = io_module.blocking.wallClockSeconds();
+        const expected = if (cert_fixture_not_after_epoch > now_s)
+            (cert_fixture_not_after_epoch - now_s) / std.time.s_per_day
+        else
+            0;
+        try std.testing.expect(days_left == expected or days_left == expected + 1);
+        try std.testing.expectEqualStrings("\"} 1\n", text[digits_end .. digits_end + "\"} 1\n".len]);
+    }
+}
+
+test "counters: a certificate that cannot be read renders no row" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const endpoints = struct {
+        const list = [_]io_module.Address{labeledTestAddress("127.0.0.1:1")};
+    };
+    const clusters = [_]config_module.Config.Cluster{
+        .{ .name = "api", .endpoints = &endpoints.list },
+    };
+    // The path names nothing on disk — the rows stay empty, the family
+    // keeps its header, and the instance bound is the header alone.
+    var routes: [1]router_module.Route = undefined;
+    var certs_named: [1]config_module.Config.Listener.Tls.Certificate = undefined;
+    var certs_unnamed: [1]config_module.Config.Listener.Tls.Certificate = undefined;
+    var listeners: [2]config_module.Config.Listener = undefined;
+    var h3_listeners: [1]config_module.Config.H3Listener = undefined;
+    const config = certInfoFixture(
+        &clusters,
+        "/nonexistent/cert.pem",
+        &routes,
+        &certs_named,
+        &certs_unnamed,
+        &listeners,
+        &h3_listeners,
+    );
+    var labeled: Labeled = undefined;
+    try labeled.init(arena_state.allocator(), &config, .init(1, 1), "");
+    for (labeled.cert_info_labels) |label| try std.testing.expectEqual(@as(usize, 0), label.len);
+
+    var l7 = [_]u16{0};
+    var l4 = [_]u16{0};
+    const healthy = [_]bool{true};
+    const views: Labeled.LiveViews = .{ .load = .{ .l7 = &l7, .l4 = &l4 }, .healthy = &healthy };
+    const buffer = try arena_state.allocator().alloc(u8, labeled.render_bytes_max);
+    const text = labeled.render(&views, buffer);
+    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zgix_cert_info gauge\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_cert_info{") == null);
+    // The render stays inside the instance bound — the header priced,
+    // the skipped rows re-priced out — without the bound needing to be
+    // tight: tightness is the saturated beds' claim, and this bed's
+    // witness families all render at zero.
+    try std.testing.expect(text.len <= labeled.render_bytes_max);
+}
+
+/// The §B2 fixture: an http listener with three routes and an h3
+/// listener with one, so the global ordinal space runs http-first,
+/// config order, h3 after — the order `buildInventoryLabels` builds
+/// `route_info` in and `routeIndexFor` must reproduce at request time.
+fn routeResponsesTestConfig(
+    clusters: []const config_module.Config.Cluster,
+) config_module.Config {
+    const http_routes = struct {
+        const list = [_]router_module.Route{
+            .{ .host = "api.example", .prefix = "/api", .cluster_index = 0 },
+            .{
+                .prefix = "/",
+                .cluster_index = 0,
+                .header = .{ .name = "x-canary", .kind = .present, .value = "" },
+            },
+            .{ .prefix = "/", .cluster_index = 0 },
+        };
+    };
+    const h3_routes = struct {
+        const list = [_]router_module.Route{
+            .{ .prefix = "/", .cluster_index = 0 },
+        };
+    };
+    const listeners = struct {
+        const list = [_]config_module.Config.Listener{
+            .{
+                .bind_address = labeledTestAddress("127.0.0.1:8080"),
+                .bind_mode = null,
+                .routes = &http_routes.list,
+                .protocol = .http,
+            },
+        };
+    };
+    const h3_listeners = struct {
+        const list = [_]config_module.Config.H3Listener{
+            .{
+                .bind_address = std.Io.net.IpAddress.parseLiteral("127.0.0.1:4443") catch unreachable,
+                .routes = &h3_routes.list,
+                .cert_path = "cert.pem",
+                .key_path = "key.pem",
+            },
+        };
+    };
+    var config = labeledTestConfig(clusters);
+    config.listeners = &listeners.list;
+    config.h3_listeners = &h3_listeners.list;
+    return config;
+}
+
+test "counters: route_responses charges the matched route and partitions l7_responses" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const endpoints = struct {
+        const list = [_]io_module.Address{labeledTestAddress("127.0.0.1:1")};
+    };
+    const clusters = [_]config_module.Config.Cluster{
+        .{ .name = "api", .endpoints = &endpoints.list },
+    };
+    const config = routeResponsesTestConfig(&clusters);
+    const route_test_keys: upstream_module.EndpointKeys = .init(1, 1);
+    var labeled: Labeled = undefined;
+    try labeled.init(arena_state.allocator(), &config, route_test_keys, "");
+    var counters: Counters = .{};
+
+    const http_routes = config.listeners[0].routes;
+    const h3_routes = config.h3_listeners[0].routes;
+    // The ordinals the request path will compute: host-scoped route,
+    // header-predicated route, catch-all, then the h3 listener's route.
+    const canary_header = [_]parser_module.Header{parser_module.Header.init("x-canary", "true")};
+    const matched_host = router_module.find(http_routes, "api.example", "/api/v2", &.{}).?;
+    const matched_canary = router_module.find(http_routes, "other.example", "/", &canary_header).?;
+    const matched_catchall = router_module.find(http_routes, "other.example", "/", &.{}).?;
+    const matched_h3 = router_module.find(h3_routes, "", "/", &.{}).?;
+    try std.testing.expectEqual(@as(u32, 0), Labeled.routeIndexFor(&config, http_routes, matched_host));
+    try std.testing.expectEqual(@as(u32, 1), Labeled.routeIndexFor(&config, http_routes, matched_canary));
+    try std.testing.expectEqual(@as(u32, 2), Labeled.routeIndexFor(&config, http_routes, matched_catchall));
+    try std.testing.expectEqual(@as(u32, 3), Labeled.routeIndexFor(&config, h3_routes, matched_h3));
+
+    // Four exchanges across three routes: two on the canary route, one
+    // on the catch-all, one on the host-scoped route. Each moves the
+    // whole `l7_responses` party together — the bare counter, the
+    // endpoint cell, the cluster class and duration, and the route cell
+    // — which is the pairing every partition in `reconciles` asserts.
+    // The h3 listener's route is deliberately never charged: §B2 is
+    // L7-only, and its row rendering at zero is asserted on the scrape
+    // below.
+    for ([_]*const router_module.Route{ matched_canary, matched_canary, matched_catchall, matched_host }) |matched| {
+        labeled.incrementEndpoint(.responses, route_test_keys.key(0, 0));
+        labeled.observeExchange(0, 200, 40_000);
+        labeled.incrementRoute(Labeled.routeIndexFor(&config, http_routes, matched));
+        counters.increment("l7_responses");
+    }
+    labeled.reconciles(&counters);
+
+    var l7 = [_]u16{0};
+    var l4 = [_]u16{0};
+    const healthy = [_]bool{true};
+    const views: Labeled.LiveViews = .{ .load = .{ .l7 = &l7, .l4 = &l4 }, .healthy = &healthy };
+    const buffer = try arena_state.allocator().alloc(u8, labeled.render_bytes_max);
+    const text = labeled.render(&views, buffer);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zgix_route_responses counter\n") != null);
+    // The label bytes are the `route_info` rows under a counter name —
+    // the sharing the field's doc promises, proven by rendering the
+    // stored slice through the same needle the endpoint_info test uses.
+    for (labeled.route_info_labels, 0..) |label, index| {
+        const needle = try std.fmt.allocPrint(arena_state.allocator(), "zgix_route_responses{s} {d}\n", .{
+            label,
+            labeled.route_responses[index].get(),
+        });
+        try std.testing.expect(std.mem.indexOf(u8, text, needle) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_route_responses{listener=\"127.0.0.1:8080\",host=\"api.example\",prefix=\"/api\",cluster=\"api\"} 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_route_responses{listener=\"127.0.0.1:8080\",prefix=\"/\",header=\"x-canary\",cluster=\"api\"} 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_route_responses{listener=\"127.0.0.1:8080\",prefix=\"/\",cluster=\"api\"} 1\n") != null);
+    // The h3 listener's route renders its row — always at zero here,
+    // because §B2's count is L7-only (the seam cannot import this
+    // module); the row existing at all is what a route-indexed dashboard
+    // keys on.
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgix_route_responses{listener=\"127.0.0.1:4443\",prefix=\"/\",cluster=\"api\"} 0\n") != null);
 }

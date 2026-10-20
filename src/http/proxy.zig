@@ -39,6 +39,7 @@ const Balancer = @import("../balancer.zig").Balancer;
 const config_module = @import("../config.zig");
 const constants = @import("../constants.zig");
 const conn_module = @import("../net/Conn.zig");
+const counters_module = @import("../counters.zig");
 const stream_module = @import("../net/Stream.zig");
 const pump = @import("../net/pump.zig");
 const relay = @import("../net/relay.zig");
@@ -60,7 +61,7 @@ const assert = std.debug.assert;
 /// Formatted through the address type's own rendering and then stripped,
 /// rather than written out here, so an IPv6 address gets std's canonical
 /// `::` compression instead of a second spelling of it that could
-/// disagree with the one every other zoxy output uses.
+/// disagree with the one every other zgix output uses.
 ///
 /// At file scope, outside `Proxy(IoType)`: it depends on no backend, and
 /// the bracket handling is the fiddly part worth testing directly rather
@@ -94,7 +95,7 @@ fn bareAddress(
 const max_forwards_digits_max: u32 = 19;
 
 /// The #178 sticky cookie's attributes, and the widest value composed from
-/// them. `Secure` rides along only where zoxy terminates TLS and so knows
+/// them. `Secure` rides along only where zgix terminates TLS and so knows
 /// the scheme is https; on a plaintext listener something in front may
 /// have terminated it, and a `Secure` cookie the client can only return
 /// over http is one it will never return at all.
@@ -1160,6 +1161,13 @@ pub fn Proxy(comptime IoType: type) type {
                 return respond(server, conn, 404, "l7_no_route");
             };
             conn.stream.cluster_index = matched.cluster_index;
+            // §B2: the matched route's global ordinal, written beside the
+            // cluster so `finishExchange` can charge the completed
+            // exchange to the route that admitted it — the labeled twin
+            // of the count below, priced by `Labeled.routeIndexFor`'s
+            // pointer-identity walk over a config-bounded table.
+            conn.stream.route_index =
+                counters_module.Labeled.routeIndexFor(server.config, conn.routes, matched);
             conn.stream.log.suppressed = !matched.access_log;
             conn.stream.relay_buffer = server.acquireRelayBuffer() orelse {
                 return respond(server, conn, 503, "l7_shed_relay_buffers");
@@ -2039,7 +2047,7 @@ pub fn Proxy(comptime IoType: type) type {
         /// whatever the client felt like claiming — reaches the origin
         /// nowhere. `append` carries it, which is correct exactly when
         /// every hop in front is one the operator owns, and a forgery
-        /// otherwise. zoxy cannot tell those apart from the inside, which
+        /// otherwise. zgix cannot tell those apart from the inside, which
         /// is why this reads a configured mode rather than a heuristic.
         ///
         /// The result aliases `scratch`, which belongs to the caller's
@@ -3010,7 +3018,7 @@ pub fn Proxy(comptime IoType: type) type {
         /// used to ride nothing, on the reasoning that a proxy which does
         /// not terminate TLS cannot know the client-facing scheme — true
         /// when it was written and falsified by the very issue it cited
-        /// (#125). Where zoxy terminates, it knows: the scheme is https,
+        /// (#125). Where zgix terminates, it knows: the scheme is https,
         /// and a routing cookie without `Secure` is one the browser will
         /// hand back over plaintext to the same host, which is the
         /// downgrade the attribute exists to stop.
@@ -4213,6 +4221,12 @@ pub fn Proxy(comptime IoType: type) type {
                 conn.stream.upstream.?.cluster_index,
                 conn.stream.upstream.?.endpoint_index,
             ));
+            // §B2: the same completion against the route that matched it —
+            // one `route_responses` cell per `l7_responses`, at the same
+            // witness, which is the partition `reconciles` asserts. The
+            // h3 path keeps `h3_responses` as its total: its seam cannot
+            // import the labeled tables (build.zig's seam invariant).
+            server.labeled.incrementRoute(conn.stream.route_index);
             // #230: a served response ends whatever passive streak was
             // building. Any response — the status is deliberately not
             // read, because an origin answering 500 is a software bug

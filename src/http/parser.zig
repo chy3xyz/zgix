@@ -225,7 +225,7 @@ pub const Header = struct {
 /// `parseRequestHead`/`parseResponseHead` — which is what makes the
 /// serving path's long-lived scratch (`Server.header_scratch`) cover the
 /// whole cost. Under ReleaseSafe an `= undefined` local is 0xaa-filled on
-/// every call, and §9's flamegraph put that fill at 62% of zoxy's user
+/// every call, and §9's flamegraph put that fill at 62% of zgix's user
 /// cycles under L7 load: ~9.2 KiB per request across the four frames a
 /// keep-alive exchange parses. A cold call site may still declare one on
 /// the stack; the serving path may not.
@@ -340,7 +340,7 @@ pub const ResponseHead = struct {
 /// zero-fill of the whole aggregate — an `= undefined` array field
 /// included, which defeats the very point of declaring it `undefined`.
 /// As a field it cost a 2080-byte memset on every request — 35% of
-/// zoxy's user CPU under L7 load, the top symbol in the profile; as a
+/// zgix's user CPU under L7 load, the top symbol in the profile; as a
 /// loose local it costs nothing. `parseResponseHead` has always kept its
 /// header array loose for this reason, and measured zero.
 const RawRequest = struct {
@@ -646,7 +646,7 @@ comptime {
 }
 
 /// Incremental delimiter for chunked bodies (RFC 9112 §7.1) relayed
-/// verbatim: zoxy forwards the encoded bytes untouched and only needs to
+/// verbatim: zgix forwards the encoded bytes untouched and only needs to
 /// know where the message ends, so this scanner validates framing and
 /// counts — it never decodes or copies. Feed it the exact bytes that will
 /// be forwarded, in any split; whole-buffer and byte-at-a-time feeding
@@ -2041,7 +2041,7 @@ test "http parser: a header field name is exactly tchar" {
 }
 
 test "http parser: a request-target is pchar, and a backslash is not" {
-    // §7 routes on paths, so the bytes zoxy reads as a path and the bytes
+    // §7 routes on paths, so the bytes zgix reads as a path and the bytes
     // the origin reads as one must be the same bytes. IIS, .NET and
     // browser URL parsing normalize `\` to `/`, so a target the router
     // reads as `/public\..\admin` and an origin resolves to `/admin` is a
@@ -2347,18 +2347,18 @@ test "http parser: Accept-Encoding selects gzip only when its q allows" {
 test "http parser: cookieValue finds its crumb, byte-exactly" {
     const headers = [_]Header{
         Header.init("Host", "example"),
-        Header.init("Cookie", "theme=dark; zoxy-srv=0123456789abcdef; b=1"),
+        Header.init("Cookie", "theme=dark; zgix-srv=0123456789abcdef; b=1"),
     };
     try testing.expectEqualStrings(
         "0123456789abcdef",
-        cookieValue(&headers, "zoxy-srv").?,
+        cookieValue(&headers, "zgix-srv").?,
     );
     try testing.expectEqualStrings("dark", cookieValue(&headers, "theme").?);
     try testing.expectEqualStrings("1", cookieValue(&headers, "b").?);
     // Cookie *names* are case-sensitive (the header name is not): a
     // differently-cased crumb is a different cookie, RFC 6265's rule.
-    try testing.expectEqual(@as(?[]const u8, null), cookieValue(&headers, "ZOXY-SRV"));
-    try testing.expectEqual(@as(?[]const u8, null), cookieValue(&headers, "zoxy"));
+    try testing.expectEqual(@as(?[]const u8, null), cookieValue(&headers, "ZGIX-SRV"));
+    try testing.expectEqual(@as(?[]const u8, null), cookieValue(&headers, "zgix"));
     try testing.expectEqual(@as(?[]const u8, null), cookieValue(&headers, "srv"));
 
     // A value may contain `=` (base64 padding does); the crumb runs to
@@ -2369,11 +2369,11 @@ test "http parser: cookieValue finds its crumb, byte-exactly" {
 
     // No Cookie header, an empty value, and a value-less crumb.
     const bare = [_]Header{Header.init("Host", "example")};
-    try testing.expectEqual(@as(?[]const u8, null), cookieValue(&bare, "zoxy-srv"));
-    const empty = [_]Header{Header.init("Cookie", "zoxy-srv=; other=1")};
-    try testing.expectEqualStrings("", cookieValue(&empty, "zoxy-srv").?);
-    const nameless = [_]Header{Header.init("Cookie", "zoxy-srv")};
-    try testing.expectEqual(@as(?[]const u8, null), cookieValue(&nameless, "zoxy-srv"));
+    try testing.expectEqual(@as(?[]const u8, null), cookieValue(&bare, "zgix-srv"));
+    const empty = [_]Header{Header.init("Cookie", "zgix-srv=; other=1")};
+    try testing.expectEqualStrings("", cookieValue(&empty, "zgix-srv").?);
+    const nameless = [_]Header{Header.init("Cookie", "zgix-srv")};
+    try testing.expectEqual(@as(?[]const u8, null), cookieValue(&nameless, "zgix-srv"));
 }
 
 // Chunked-scanner tests drive `feed` through `chunkedOutcome`, the same

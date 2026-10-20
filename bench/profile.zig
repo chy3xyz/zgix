@@ -1,13 +1,13 @@
 //! Tier-0 pinned profiler (DESIGN.md §9): drive a fixed zrk load through a
-//! real zoxy against a loopback nginx origin, sample ONLY the zoxy pid with
-//! perf, and fold the result into a flamegraph. zoxy is pinned to one core so
+//! real zgix against a loopback nginx origin, sample ONLY the zgix pid with
+//! perf, and fold the result into a flamegraph. zgix is pinned to one core so
 //! the hardware PMU and LBR call-graph stay on a single core type — on a
 //! hybrid Intel part an unpinned process migrates between the cpu_core and
 //! cpu_atom PMUs and samples read as zero. Everything else (this process, its
 //! zrk load threads, the inherited nginx) is pinned off that core so the load
 //! generator never steals it.
 //!
-//! Run via `zig build profile`, which builds a ReleaseSafe zoxy (matching the
+//! Run via `zig build profile`, which builds a ReleaseSafe zgix (matching the
 //! shipped binary) and passes its path as the first argument; perf,
 //! flamegraph and nginx come from the dev shell. Tooling stays in Zig, not
 //! bash (TIGER_STYLE): the perf orchestration
@@ -22,19 +22,19 @@ const affinity = @import("affinity.zig");
 const zrk = @import("zrk");
 const zio = @import("zio");
 const spawn_path = @import("spawn_path.zig");
-const constants = @import("zoxy_constants");
+const constants = @import("zgix_constants");
 
 const assert = std.debug.assert;
 
 const origin_port: u16 = 19190;
-const zoxy_l4_port: u16 = 18190;
-const zoxy_http_port: u16 = 18191;
-const work_directory = ".zig-cache/zoxy-profile";
-const perf_data_path = work_directory ++ "/zoxy.perf.data";
-const script_path = work_directory ++ "/zoxy.script";
-const folded_path = work_directory ++ "/zoxy.folded";
-const svg_path = work_directory ++ "/zoxy-flamegraph.svg";
-const report_path = work_directory ++ "/zoxy.report";
+const zgix_l4_port: u16 = 18190;
+const zgix_http_port: u16 = 18191;
+const work_directory = ".zig-cache/zgix-profile";
+const perf_data_path = work_directory ++ "/zgix.perf.data";
+const script_path = work_directory ++ "/zgix.script";
+const folded_path = work_directory ++ "/zgix.folded";
+const svg_path = work_directory ++ "/zgix-flamegraph.svg";
+const report_path = work_directory ++ "/zgix.report";
 
 const Flags = struct {
     rate: u64 = 100_000,
@@ -44,15 +44,15 @@ const Flags = struct {
     /// which is what makes a per-connection-cost sweep possible here.
     connections: u32 = 64,
     /// zrk's load threads, independent of `connections`. Kept small: they
-    /// share every core except zoxy's.
+    /// share every core except zgix's.
     threads: u8 = 2,
     duration_s: u64 = 30,
     freq: u32 = 4000,
-    /// Core to dedicate to zoxy; null auto-picks the last P-core (or last cpu).
-    zoxy_cpu: ?u16 = null,
+    /// Core to dedicate to zgix; null auto-picks the last P-core (or last cpu).
+    zgix_cpu: ?u16 = null,
     /// Which listener to drive: the L4 relay or the L7 reverse proxy.
     protocol: Protocol = .l4,
-    /// zoxy's §8 per-exchange deadline, in ms; 0 (the default) leaves it
+    /// zgix's §8 per-exchange deadline, in ms; 0 (the default) leaves it
     /// disabled, which is also the shipped default. Non-zero puts the
     /// deadline's arming path on every request, so this is the flag that
     /// makes its cost measurable rather than argued about.
@@ -78,7 +78,7 @@ const Flags = struct {
     /// them. It is a separate question, so it gets a separate flag.
     ///
     /// It answers the gap that file records as unmeasured — what the ~52
-    /// points of kernel time on zoxy's core are doing, against the ~5 the
+    /// points of kernel time on zgix's core are doing, against the ~5 the
     /// profiler can see today. Needs `kernel.perf_event_paranoid <= 1`
     /// and, to resolve the symbols, `kernel.kptr_restrict = 0`; both are
     /// checked before a window opens rather than discovered in the output.
@@ -92,14 +92,14 @@ const Flags = struct {
     /// kernel stacks that might. Read the symbol table, not the
     /// flamegraph's kernel branches.
     kernel: bool = false,
-    zoxy_path: []const u8 = "zig-out/bin/zoxy-profile",
+    zgix_path: []const u8 = "zig-out/bin/zgix-profile",
 
     const Protocol = enum { l4, http };
 
-    fn zoxyPort(flags: *const Flags) u16 {
+    fn zgixPort(flags: *const Flags) u16 {
         return switch (flags.protocol) {
-            .l4 => zoxy_l4_port,
-            .http => zoxy_http_port,
+            .l4 => zgix_l4_port,
+            .http => zgix_http_port,
         };
     }
 };
@@ -122,42 +122,42 @@ pub fn main(init: std.process.Init) !u8 {
 
     try Io.Dir.cwd().createDirPath(io, work_directory);
 
-    // Topology: dedicate one core to zoxy, run everything else off it. Pin
-    // ourselves first so the nginx/zoxy/perf children and the zrk load threads
-    // all inherit the "everything else" mask; zoxy is then re-pinned alone.
+    // Topology: dedicate one core to zgix, run everything else off it. Pin
+    // ourselves first so the nginx/zgix/perf children and the zrk load threads
+    // all inherit the "everything else" mask; zgix is then re-pinned alone.
     // Non-null: `main` already returned above on non-Linux, the only case
     // `dedicate` yields null.
-    const zoxy_cpu = affinity.dedicate(io, flags.zoxy_cpu).?;
+    const zgix_cpu = affinity.dedicate(io, flags.zgix_cpu).?;
 
-    const cycles_event = try preflight(io, &flags, zoxy_cpu) orelse return 1;
+    const cycles_event = try preflight(io, &flags, zgix_cpu) orelse return 1;
 
     var origin_child = try spawnNginx(arena, io, environ);
     defer origin_child.kill(io);
 
-    var zoxy_child = try spawnZoxy(arena, io, flags.zoxy_path, flags.connections, flags.request_ms);
-    var zoxy_running = true;
-    defer if (zoxy_running) zoxy_child.kill(io);
-    const zoxy_pid = zoxy_child.id orelse return error.NoZoxyPid;
-    affinity.pinChildTo(zoxy_pid, zoxy_cpu);
+    var zgix_child = try spawnZgix(arena, io, flags.zgix_path, flags.connections, flags.request_ms);
+    var zgix_running = true;
+    defer if (zgix_running) zgix_child.kill(io);
+    const zgix_pid = zgix_child.id orelse return error.NoZgixPid;
+    affinity.pinChildTo(zgix_pid, zgix_cpu);
 
     // Warm up and prove the path serves before spending a measured run on it.
     try awaitResponsive(arena, io, &flags);
     std.debug.print(
-        "profile: zoxy pid {d} pinned to cpu {d} ({s}); driving {s} listener; origin + load pinned off it\n",
-        .{ zoxy_pid, zoxy_cpu, cycles_event, @tagName(flags.protocol) },
+        "profile: zgix pid {d} pinned to cpu {d} ({s}); driving {s} listener; origin + load pinned off it\n",
+        .{ zgix_pid, zgix_cpu, cycles_event, @tagName(flags.protocol) },
     );
     if (flags.kernel) announceKernelMode();
 
-    // Record only the zoxy pid for the load's duration while zrk saturates it.
-    var perf_child = try spawnPerf(arena, io, environ, zoxy_pid, cycles_event, &flags);
+    // Record only the zgix pid for the load's duration while zrk saturates it.
+    var perf_child = try spawnPerf(arena, io, environ, zgix_pid, cycles_event, &flags);
     std.debug.print(
         "profile: measuring {d}s at {d} req/s over {d} connections\n",
         .{ flags.duration_s, flags.rate, flags.connections },
     );
     const ring_scratch = try arena.alloc(u8, proc_scratch_bytes);
-    const ring_before = readRingSample(io, zoxy_pid, ring_scratch);
+    const ring_before = readRingSample(io, zgix_pid, ring_scratch);
     const report = try loadTest(arena, io, &flags);
-    printRingDelta(io, zoxy_pid, &ring_before, report.snapshot.counters.completed, ring_scratch);
+    printRingDelta(io, zgix_pid, &ring_before, report.snapshot.counters.completed, ring_scratch);
     const perf_term = try perf_child.wait(io);
     if (perf_term != .exited or perf_term.exited != 0) {
         std.debug.print("profile: perf record exited abnormally ({any})\n", .{perf_term});
@@ -169,15 +169,15 @@ pub fn main(init: std.process.Init) !u8 {
     try printTopSymbols(arena, io, environ);
 
     // Drain, not just death (§8): SIGTERM and wait for the clean exit.
-    try std.posix.kill(zoxy_pid, .TERM);
-    _ = try zoxy_child.wait(io);
-    zoxy_running = false;
+    try std.posix.kill(zgix_pid, .TERM);
+    _ = try zgix_child.wait(io);
+    zgix_running = false;
     return 0;
 }
 
 fn parseFlags(args: []const [:0]const u8) !Flags {
     var flags: Flags = .{};
-    var zoxy_path_set = false;
+    var zgix_path_set = false;
     var index: usize = 1;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
@@ -198,7 +198,7 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
             flags.freq = try std.fmt.parseUnsigned(u32, args[index], 10);
         } else if (std.mem.eql(u8, arg, "--cpu")) {
             index += 1;
-            flags.zoxy_cpu = try std.fmt.parseUnsigned(u16, args[index], 10);
+            flags.zgix_cpu = try std.fmt.parseUnsigned(u16, args[index], 10);
         } else if (std.mem.eql(u8, arg, "--quiesce-load")) {
             index += 1;
             flags.quiesce_load = try std.fmt.parseFloat(f64, args[index]);
@@ -226,13 +226,13 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
             }
         } else if (std.mem.eql(u8, arg, "--kernel")) {
             flags.kernel = true;
-        } else if (!zoxy_path_set and !std.mem.startsWith(u8, arg, "--")) {
-            // First bare argument is the zoxy binary (passed by `zig build`).
-            flags.zoxy_path = arg;
-            zoxy_path_set = true;
+        } else if (!zgix_path_set and !std.mem.startsWith(u8, arg, "--")) {
+            // First bare argument is the zgix binary (passed by `zig build`).
+            flags.zgix_path = arg;
+            zgix_path_set = true;
         } else {
             std.debug.print(
-                "usage: profile [zoxy-path] [--rate N] [--connections N] [--threads N] " ++
+                "usage: profile [zgix-path] [--rate N] [--connections N] [--threads N] " ++
                     "[--seconds N] [--freq N] [--cpu N] [--quiesce-load F] [--request-ms N] " ++
                     "[--protocol l4|http] [--kernel]\n",
                 .{},
@@ -262,7 +262,7 @@ fn spawnNginx(arena: std.mem.Allocator, io: Io, environ: std.process.Environ) !s
         \\    access_log off;
         \\    server {{
         \\        listen 127.0.0.1:{d};
-        \\        location / {{ return 200 "zoxy-profile-origin\n"; }}
+        \\        location / {{ return 200 "zgix-profile-origin\n"; }}
         \\    }}
         \\}}
         \\
@@ -306,21 +306,21 @@ fn connSlotsFor(connections: u32) u32 {
     return @max(slots, constants.conn_slots_default);
 }
 
-fn spawnZoxy(
+fn spawnZgix(
     arena: std.mem.Allocator,
     io: Io,
-    zoxy_path: []const u8,
+    zgix_path: []const u8,
     connections: u32,
     request_ms: u32,
 ) !std.process.Child {
     assert(connections >= 1);
-    // Rejected by the spawned zoxy's own config validation, but only after
+    // Rejected by the spawned zgix's own config validation, but only after
     // a spawn and ~2s of `awaitResponsive` retries that report the generic
     // TargetUnresponsive — so catch it here, where the flag was set.
     assert(request_ms <= constants.timeout_ms_max);
     // Both listeners always exist so the flag only picks which one zrk
     // drives; the idle one adds no load.
-    const config_path = work_directory ++ "/zoxy.json";
+    const config_path = work_directory ++ "/zgix.json";
     const config_json = try std.fmt.allocPrint(arena,
         \\{{
         \\    "listeners": [
@@ -334,8 +334,8 @@ fn spawnZoxy(
         \\}}
         \\
     , .{
-        zoxy_l4_port,
-        zoxy_http_port,
+        zgix_l4_port,
+        zgix_http_port,
         origin_port,
         request_ms,
         connSlotsFor(connections),
@@ -344,11 +344,11 @@ fn spawnZoxy(
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = config_json });
 
     return std.process.spawn(io, .{
-        .argv = &.{ zoxy_path, config_path },
+        .argv = &.{ zgix_path, config_path },
         .stdout = .inherit,
         .stderr = .inherit,
     }) catch |err| {
-        std.debug.print("profile: could not spawn {s} ({t}); run `zig build` first\n", .{ zoxy_path, err });
+        std.debug.print("profile: could not spawn {s} ({t}); run `zig build` first\n", .{ zgix_path, err });
         return err;
     };
 }
@@ -392,13 +392,13 @@ fn cpuListContains(list: []const u8, cpu: u16) bool {
     return false;
 }
 
-/// The cycles event to sample zoxy with, qualified by the PMU that owns
+/// The cycles event to sample zgix with, qualified by the PMU that owns
 /// the dedicated core, and scoped to user mode unless `kernel` says
 /// otherwise.
 ///
 /// This matters on a hybrid part. An unqualified `cycles:u` binds to a
 /// single PMU — cpu_atom, as perf resolves it here — while `dedicate`
-/// deliberately pins zoxy to a *P*-core. The two never meet, so the run
+/// deliberately pins zgix to a *P*-core. The two never meet, so the run
 /// records zero samples and still renders a flamegraph, which reads like
 /// a measurement instead of the failure it is. Naming the PMU that owns
 /// the chosen cpu keeps the pairing correct whichever core is picked,
@@ -531,16 +531,16 @@ fn announceKernelMode() void {
 fn refuseNoPtraceAttach() void {
     std.debug.print(
         \\profile: kernel.yama.ptrace_scope is not 0, so `perf record -p` cannot
-        \\  attach to zoxy and the recording would come back empty. Either:
+        \\  attach to zgix and the recording would come back empty. Either:
         \\    sudo sysctl -w kernel.yama.ptrace_scope=0
         \\  or run this profile as root.
         \\
     , .{});
 }
 
-/// Whether `perf record -p` can attach to zoxy at all.
+/// Whether `perf record -p` can attach to zgix at all.
 ///
-/// zoxy is spawned as *our* child so it can be pinned, warmed up and
+/// zgix is spawned as *our* child so it can be pinned, warmed up and
 /// drained on SIGTERM; perf is its sibling, not its ancestor. Under
 /// `yama/ptrace_scope > 0` the kernel refuses that attach — and perf
 /// reports success anyway, writing a header-only perf.data. Checked up
@@ -563,7 +563,7 @@ fn spawnPerf(
     arena: std.mem.Allocator,
     io: Io,
     environ: std.process.Environ,
-    zoxy_pid: std.process.Child.Id,
+    zgix_pid: std.process.Child.Id,
     event: []const u8,
     flags: *const Flags,
 ) !std.process.Child {
@@ -571,7 +571,7 @@ fn spawnPerf(
     // pointers or DWARF CFI needed. `-- sleep N` bounds the recording to the
     // load window; perf self-terminates when sleep exits and writes the data.
     assert(event.len > 0);
-    const pid = try std.fmt.allocPrint(arena, "{d}", .{zoxy_pid});
+    const pid = try std.fmt.allocPrint(arena, "{d}", .{zgix_pid});
     const freq = try std.fmt.allocPrint(arena, "{d}", .{flags.freq});
     const seconds = try std.fmt.allocPrint(arena, "{d}", .{flags.duration_s});
     const perf_bin = try spawn_path.resolve(arena, io, environ, "perf");
@@ -617,14 +617,14 @@ fn benchConfig(port: u16, rate: u64, connections: u32, threads: u8) zrk.cli.Conf
 /// it can record the wrong thing (a busy box). Null means perf cannot
 /// attach and the caller prints the fix; `error.BoxBusy` means the box
 /// never went quiet.
-fn preflight(io: Io, flags: *const Flags, zoxy_cpu: u16) !?[]const u8 {
+fn preflight(io: Io, flags: *const Flags, zgix_cpu: u16) !?[]const u8 {
     assert(flags.quiesce_load >= 0);
     if (!ptraceScopeAllowsAttach(io)) {
         refuseNoPtraceAttach();
         return null;
     }
     // Kernel samples asked for on a box that cannot take them, refused
-    // here rather than after nginx, zoxy and a whole load window have
+    // here rather than after nginx, zgix and a whole load window have
     // been spent producing a user-only profile nobody asked for.
     if (flags.kernel) {
         if (kernelSampleBlocker(io)) |blocker| {
@@ -632,7 +632,7 @@ fn preflight(io: Io, flags: *const Flags, zoxy_cpu: u16) !?[]const u8 {
             return null;
         }
     }
-    const cycles_event = cyclesEventFor(io, zoxy_cpu, flags.kernel);
+    const cycles_event = cyclesEventFor(io, zgix_cpu, flags.kernel);
     assert(cycles_event.len >= 1);
     // Before anything is spawned, so the wait is not itself adding load.
     try awaitQuietBox(io, flags);
@@ -644,7 +644,7 @@ fn preflight(io: Io, flags: *const Flags, zoxy_cpu: u16) !?[]const u8 {
 /// are what mean anything, the absolutes include startup.
 ///
 /// All of it comes from `/proc`, so the proxy needs no instrumentation and
-/// the numbers are the kernel's own rather than something zoxy reports
+/// the numbers are the kernel's own rather than something zgix reports
 /// about itself.
 const RingSample = struct {
     /// SQEs the loop has written: every op it has submitted.
@@ -980,7 +980,7 @@ fn awaitResponsive(arena: std.mem.Allocator, io: Io, flags: *const Flags) !void 
         // A 16-connection probe over one thread: this only has to prove the
         // path serves before the measured window, so it deliberately does
         // not inherit the run's connection count or thread pool.
-        var config = benchConfig(flags.zoxyPort(), 20_000, 16, 1);
+        var config = benchConfig(flags.zgixPort(), 20_000, 16, 1);
         config.duration_ns = std.time.ns_per_s / 2;
         const report = zrk.runner.run(arena, io, &config, 0, null, null, null) catch {
             if (attempt == attempts_max - 1) return error.TargetUnresponsive;
@@ -994,7 +994,7 @@ fn awaitResponsive(arena: std.mem.Allocator, io: Io, flags: *const Flags) !void 
 }
 
 fn loadTest(arena: std.mem.Allocator, io: Io, flags: *const Flags) !zrk.runner.Report {
-    var config = benchConfig(flags.zoxyPort(), flags.rate, flags.connections, flags.threads);
+    var config = benchConfig(flags.zgixPort(), flags.rate, flags.connections, flags.threads);
     config.duration_ns = flags.duration_s * std.time.ns_per_s;
     return zrk.runner.run(arena, io, &config, 0, null, null, null);
 }
@@ -1023,7 +1023,7 @@ fn generateFlamegraph(arena: std.mem.Allocator, io: Io, environ: std.process.Env
     try runToFile(arena, io, environ, &.{ "stackcollapse-perf.pl", script_path }, folded_path);
     try runToFile(arena, io, environ, &.{
         "flamegraph.pl", "--title",
-        "zoxy under load (user cycles, LBR call-graph) — see run for path",
+        "zgix under load (user cycles, LBR call-graph) — see run for path",
         folded_path,
     }, svg_path);
     std.debug.print("profile: flamegraph -> {s}\n", .{svg_path});
@@ -1042,7 +1042,7 @@ fn requireSamples(io: Io) !void {
     if (head.len > 0) return;
     std.debug.print(
         \\profile: perf recorded zero samples — no flamegraph written.
-        \\  Check that the event bound to the PMU owning zoxy's core, and that
+        \\  Check that the event bound to the PMU owning zgix's core, and that
         \\  perf could attach (kernel.yama.ptrace_scope, perf_event_paranoid).
         \\
     , .{});

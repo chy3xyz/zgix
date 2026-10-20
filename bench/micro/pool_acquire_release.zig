@@ -3,11 +3,11 @@
 //! CI gate. Example:
 //!
 //!   zig build bench-micro
-//!   poop ./zig-out/bin/zoxy-bench-pool ./new/zoxy-bench-pool
+//!   poop ./zig-out/bin/zgix-bench-pool ./new/zgix-bench-pool
 
 const std = @import("std");
 
-const zoxy = @import("zoxy");
+const zgix = @import("zgix");
 
 const iterations: u64 = 50_000_000;
 const slots: u32 = 1024;
@@ -20,7 +20,7 @@ const Item = struct {
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
-    var pool: zoxy.Pool(Item) = undefined;
+    var pool: zgix.Pool(Item) = undefined;
     try pool.init(arena, slots);
 
     var checksum: u64 = 0;

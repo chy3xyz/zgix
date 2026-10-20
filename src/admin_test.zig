@@ -138,13 +138,22 @@ fn expectedResponse(
         &views,
         buffer[admin.response_head.len + body.len ..],
     );
-    return buffer[0 .. admin.response_head.len + body.len + labeled.len];
+    // The access-log tail renders after the status hook (uninstalled in
+    // these scenarios): the marker plus the ring's lines. These scenarios
+    // complete no HTTP exchange, so the ring is always empty here — the
+    // marker alone is the expected section.
+    const total = admin.response_head.len + body.len + labeled.len;
+    const written = server.access_log.ring.render(buffer[total..]);
+    return buffer[0 .. total + written];
 }
 
 /// Generous fixed size for the test-side response staging: the bed's
 /// one-cluster config renders far below this, and `expectedResponse`
 /// asserts it covers the server's real buffer.
-const response_scratch_bytes = 64 * 1024;
+// Grew past 64 KiB when the access-log ring's closed-form bound joined
+// the admin response buffer (the server reserves the section whether or
+// not the ring holds lines; §8's unconditional terms).
+const response_scratch_bytes = 192 * 1024;
 
 /// A scripted scrape client. `.normal` sends the request and reads the
 /// response to EOF; `.drain_mid_scrape` begins the server drain the instant

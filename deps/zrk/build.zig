@@ -48,9 +48,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // The HTTP/2 frame codec and HPACK, shared with zoxy. `assertions = false`
+    // The HTTP/2 frame codec and HPACK, shared with zgix. `assertions = false`
     // is deliberate and is the whole reason that option exists: h2's checks are
-    // on by default because zoxy points it at the open internet, and zrk is a
+    // on by default because zgix points it at the open internet, and zrk is a
     // latency-measuring tool whose pitch is not injecting client-side noise
     // into the measurement. See zoxy-io/h2#6.
     const h2 = b.dependency("h2", .{
@@ -86,7 +86,7 @@ pub fn build(b: *std.Build) void {
     //
     // `sanitize_c = .off` for the vendored C moved there with it, which is
     // where it belongs: it is a property of building OpenSSL, not of building
-    // zrk. See zssl's build.zig, and zoxy-io/zoxy#283 for what shipped without
+    // zrk. See zssl's build.zig, and zoxy-io/zgix#283 for what shipped without
     // it.
     const zssl = b.dependency("zssl", .{
         .target = target,

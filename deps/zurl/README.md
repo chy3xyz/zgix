@@ -230,7 +230,7 @@ own box, not a number from this file — rule 8 in
 
 ## Licence
 
-MIT — see [LICENSE](LICENSE), the same terms as the sibling `zoxy` and `zrk`
+MIT — see [LICENSE](LICENSE), the same terms as the sibling `zgix` and `zrk`
 repositories.
 
 ## Docs

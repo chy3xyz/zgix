@@ -9,11 +9,11 @@
 
 const std = @import("std");
 
-const zoxy = @import("zoxy");
+const zgix = @import("zgix");
 
 const canon = @import("canon.zig");
-const constants = zoxy.constants;
-const parser = zoxy.http.parser;
+const constants = zgix.constants;
+const parser = zgix.http.parser;
 
 const assert = std.debug.assert;
 

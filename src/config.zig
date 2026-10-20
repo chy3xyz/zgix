@@ -777,7 +777,7 @@ pub const Config = struct {
         /// default.
         hash_key: HashKey = .source_ip,
 
-        /// The PROXY protocol header this cluster's origins expect zoxy
+        /// The PROXY protocol header this cluster's origins expect zgix
         /// to open every upstream connection with (#142 send), or null
         /// for none. Per *cluster* — HAProxy's `send-proxy` unit — since
         /// it states what the origin reads, not who connects. Only `l4`
@@ -851,7 +851,7 @@ pub const Config = struct {
 
         /// Which PROXY protocol version to write (#142): a closed
         /// vocabulary rather than a bool because the wire formats differ
-        /// and the *origin's* parser — not zoxy — decides which it
+        /// and the *origin's* parser — not zgix — decides which it
         /// reads. v2 is what cloud load balancers speak; v1 is
         /// human-readable in a tcpdump.
         pub const ProxyProtocolSend = enum(u1) {
@@ -2311,7 +2311,7 @@ pub const ConfigJson = struct {
     error_pages: ?ErrorPagesJson = null,
 
     pub const schema_doc =
-        "Startup config for the zoxy L4/L7 proxy. Encodes structure, enums, " ++
+        "Startup config for the zgix L4/L7 proxy. Encodes structure, enums, " ++
         "and numeric bounds; semantic checks (canonical route prefixes/hosts, " ++
         "IP:port literal parsing, reserved header names, endpoint port != 0) " ++
         "are enforced by the loader and are not expressible in JSON Schema.";
@@ -2340,7 +2340,7 @@ pub const ConfigJson = struct {
                 "startup), referenced by name from error_pages.",
         },
         .error_pages = .{
-            .desc = "Bodies for the statuses zoxy sends itself, keyed by " ++
+            .desc = "Bodies for the statuses zgix sends itself, keyed by " ++
                 "status literal, each naming a body. Configuring a status " ++
                 "is the opt-in — absent, every static response stays empty, " ++
                 "sheds included.",
@@ -2358,7 +2358,7 @@ pub const AccessLogJson = struct {
     response_headers: ?[]const []const u8 = null,
 
     pub const schema_doc =
-        "Optional access log. When present, zoxy writes one JSON object per " ++
+        "Optional access log. When present, zgix writes one JSON object per " ++
         "line for every HTTP exchange and every L4 connection; absent leaves " ++
         "it off and reserves nothing. Lines are dropped, and counted, rather " ++
         "than allowed to block the event loop when the sink cannot keep up.";
@@ -2500,7 +2500,7 @@ pub const LimitsJson = struct {
         },
         .tls_engines = .{
             .desc = "Concurrent TLS sessions — handshaking or terminated. The " ++
-                "largest per-connection object zoxy holds (~92 KiB plus a " ++
+                "largest per-connection object zgix holds (~92 KiB plus a " ++
                 "plaintext buffer), so this is what a TLS deployment's memory " ++
                 "follows. Zero exactly when no listener terminates TLS.",
             .minimum = 1,
@@ -2854,7 +2854,7 @@ pub const CompressJson = struct {
 };
 ///
 /// An object rather than the list of tokens this replaced, and the
-/// argument is the vocabulary: §7 requires it closed — a token zoxy
+/// argument is the vocabulary: §7 requires it closed — a token zgix
 /// cannot reason about must be refused by name, never ignored — and a
 /// list of strings can only be closed by the loader, in rules a reader
 /// of the schema never sees. As fields, the schema states the whole
@@ -3158,7 +3158,7 @@ pub const ForwardedJson = struct {
         "no default for `mode`, because `replace` and `append` are each a " ++
         "security bug in the other's position: an inbound chain is " ++
         "client-controlled at the edge and authoritative behind a proxy " ++
-        "you own, and zoxy cannot tell from the inside which side of that " ++
+        "you own, and zgix cannot tell from the inside which side of that " ++
         "line it is on.";
     pub const schema_fields = .{
         .mode = .{
@@ -3821,7 +3821,7 @@ pub const PickJson = struct {
         "Endpoint-pick policy: a bare policy string (p2c, rr), or an object " ++
         "selecting hash and naming what it keys on. The same key always " ++
         "selects the same endpoint, and the mapping is a pure function of " ++
-        "the key and the healthy endpoint set — so every zoxy process " ++
+        "the key and the healthy endpoint set — so every zgix process " ++
         "behind SO_REUSEPORT agrees without sharing any state.";
     pub const schema_fields = .{
         .policy = .{
@@ -3834,7 +3834,7 @@ pub const PickJson = struct {
                 "of an IPv4 address, the /64 prefix of an IPv6 one — RFC 8981 " ++
                 "rotation survives), header (rendezvous on the named header's " ++
                 "value), or cookie (the named cookie carries the endpoint " ++
-                "assignment itself, minted by zoxy — #178).",
+                "assignment itself, minted by zgix — #178).",
             .enum_type = std.meta.Tag(Config.Cluster.HashKey),
         },
         .name = .{
@@ -4163,7 +4163,7 @@ pub const PassiveEjectionJson = struct {
 pub const TimeoutsJson = struct {
     /// Optional: nginx ships 60 s for the same budget and HAProxy's
     /// `timeout connect` is conventionally single-digit seconds, so a
-    /// value zoxy can pick without guessing at anyone's policy. Zero
+    /// value zgix can pick without guessing at anyone's policy. Zero
     /// stays rejected — it would fail every dial before it left.
     connect_ms: u32 = constants.connect_ms_default,
     /// Optional, same argument: nginx's `keepalive_timeout` is 75 s and
@@ -4178,9 +4178,9 @@ pub const TimeoutsJson = struct {
     /// HAProxy and Caddy all default to waiting indefinitely, while
     /// Traefik picks 10 s and Envoy 600 s. A sixty-fold spread across
     /// mature implementations is not a default waiting to be discovered,
-    /// so zoxy declines to invent one and joins the majority. The
+    /// so zgix declines to invent one and joins the majority. The
     /// supervisor that sent the signal already owns the upper bound and
-    /// enforces it with SIGKILL; an operator who wants zoxy to give up
+    /// enforces it with SIGKILL; an operator who wants zgix to give up
     /// sooner than their platform does sets a number here.
     drain_deadline_ms: u32 = 0,
     /// Optional: absent or `0` means "no cap" (§6). The default keeps every
@@ -4188,7 +4188,7 @@ pub const TimeoutsJson = struct {
     max_lifetime_ms: u32 = 0,
     /// Optional, same shape: absent or `0` means "no cap" (§8). Opt-in
     /// because a request deadline is a policy an operator sets against
-    /// their own origin's latency, not a value zoxy can pick for them.
+    /// their own origin's latency, not a value zgix can pick for them.
     request_ms: u32 = 0,
     /// Optional, and `0` means "no cap" — but absence resolves to
     /// `constants.h3_exchange_ms_default`, not to off: the deadline
@@ -7083,7 +7083,7 @@ fn validateTimeouts(timeouts: *const TimeoutsJson) ValidationError!void {
     // the idle deadline waits out the connect-phase timer still counting
     // down, and fires late by up to `connect_ms - idle_ms`.
     //
-    // Rejected rather than clamped. A clamp would answer a config zoxy
+    // Rejected rather than clamped. A clamp would answer a config zgix
     // cannot honor with a log line, and the shipped defaults are already
     // ordered (`constants` asserts the same relation over the pair), so
     // this only ever fires on a hand-written config that was going to
@@ -8304,7 +8304,7 @@ test "config: filters compile into rules with matches and actions" {
         \\             "headers":[{"name":"X-Env","equals":"prod"}]},
         \\    "actions":[{"reject":403}]},
         \\   {"match":{"host":"api.example"},
-        \\    "actions":[{"header_set":{"name":"X-Via","value":"zoxy"}},
+        \\    "actions":[{"header_set":{"name":"X-Via","value":"zgix"}},
         \\               {"rewrite_prefix":{"from":"/old","to":"/new"}}]}]}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
@@ -9868,7 +9868,7 @@ test "config: a `$schema` editor hint loads and is ignored" {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state,
-            \\{"$schema":"https://zoxy.io/schema/config.schema.json",
+            \\{"$schema":"https://zgix.io/schema/config.schema.json",
             \\ "listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
@@ -10124,13 +10124,13 @@ const fuzz_seed_json =
     \\ {"bind":"127.0.0.1:8443","tls":{"cert":"/c.pem","key":"/k.pem"},"l4":{"cluster":"t"}}],
     \\ "clusters":{"o":{"endpoints":["127.0.0.1:9000",
     \\ {"address":"127.0.0.1:9001","weight":3}],
-    \\ "pick":{"policy":"hash","key":"cookie","name":"zoxy-srv"},"max_inflight":8,
+    \\ "pick":{"policy":"hash","key":"cookie","name":"zgix-srv"},"max_inflight":8,
     \\ "check":{"type":"http","path":"/health","expect_status":200,"timeout_ms":250}},
     \\ "t":{"endpoints":["127.0.0.1:9100"]}},
     \\ "timeouts":{"connect_ms":5000,"idle_ms":60000,"drain_deadline_ms":10000,
     \\ "max_lifetime_ms":300000,"request_ms":30000,"health_interval_ms":2000},
     \\ "limits":{"conn_slots":64,"relay_buffers":32,"upstream_slots":32,"tls_engines":16},
-    \\ "access_log":{"sink":"file","path":"/var/log/zoxy.log"},
+    \\ "access_log":{"sink":"file","path":"/var/log/zgix.log"},
     \\ "bodies":{"oops":{"inline":"be right back","content_type":"text/plain"}},
     \\ "error_pages":{"503":"oops"},
     \\ "admin":{"bind":"127.0.0.1:9901"}}
@@ -10265,11 +10265,11 @@ test "config: the access-log block resolves a sink, absent leaves it off" {
         defer arena_state.deinit();
         const parsed = try expectParseOk(
             &arena_state,
-            head ++ tail ++ ",\"access_log\":{\"sink\":\"file\",\"path\":\"/var/log/zoxy.log\"}}",
+            head ++ tail ++ ",\"access_log\":{\"sink\":\"file\",\"path\":\"/var/log/zgix.log\"}}",
         );
         try std.testing.expect(parsed.access_log_sink.? == .file);
         try std.testing.expectEqualStrings(
-            "/var/log/zoxy.log",
+            "/var/log/zgix.log",
             parsed.access_log_sink.?.file,
         );
         try std.testing.expectEqual(
@@ -10395,9 +10395,9 @@ test "config: pick resolves both spellings, and hash names its key" {
         const parsed = try expectParseOk(
             &arena_state,
             head_http ++ endpoints ++
-                ",\"pick\":{\"policy\":\"hash\",\"key\":\"cookie\",\"name\":\"zoxy-srv\"}" ++ tail,
+                ",\"pick\":{\"policy\":\"hash\",\"key\":\"cookie\",\"name\":\"zgix-srv\"}" ++ tail,
         );
-        try std.testing.expectEqualStrings("zoxy-srv", parsed.clusters[0].hash_key.cookie);
+        try std.testing.expectEqualStrings("zgix-srv", parsed.clusters[0].hash_key.cookie);
     }
     {
         var arena_state: std.heap.ArenaAllocator = undefined;
@@ -10449,7 +10449,7 @@ test "config: pick resolves both spellings, and hash names its key" {
     );
     try expectParseError(
         error.ClusterPickKeyWithoutHash,
-        head ++ endpoints ++ ",\"pick\":{\"policy\":\"p2c\",\"name\":\"zoxy-srv\"}" ++ tail,
+        head ++ endpoints ++ ",\"pick\":{\"policy\":\"p2c\",\"name\":\"zgix-srv\"}" ++ tail,
     );
     // The vocabularies are closed, each with its own error so a typo
     // says which field it is in.
@@ -10543,7 +10543,7 @@ test "config: a request-derived pick name is required, bounded, and a token" {
 test "config: a request-keyed hash cluster is unreachable from l4" {
     const tail = "}},\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
     const cookie_cluster = "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]," ++
-        "\"pick\":{\"policy\":\"hash\",\"key\":\"cookie\",\"name\":\"zoxy-srv\"}";
+        "\"pick\":{\"policy\":\"hash\",\"key\":\"cookie\",\"name\":\"zgix-srv\"}";
 
     // An l4 listener never parses a head, so a cookie there is a promise
     // nothing would keep — rejected as a pair, the `proxy_protocol_send`
@@ -10562,7 +10562,7 @@ test "config: a request-keyed hash cluster is unreachable from l4" {
             "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"}}]," ++
                 cookie_cluster ++ tail,
         );
-        try std.testing.expectEqualStrings("zoxy-srv", parsed.clusters[0].hash_key.cookie);
+        try std.testing.expectEqualStrings("zgix-srv", parsed.clusters[0].hash_key.cookie);
     }
 }
 
@@ -10595,7 +10595,7 @@ test "config: bodies render into complete pages, both variants, HEAD as prefix" 
         arena_state.allocator(),
         bodies_head ++
             "\"bodies\":{\"oops\":{\"inline\":\"gone\",\"content_type\":\"text/plain\"}," ++
-            "\"maint\":{\"file\":\"/etc/zoxy/maint.html\",\"content_type\":\"text/html\"}}," ++
+            "\"maint\":{\"file\":\"/etc/zgix/maint.html\",\"content_type\":\"text/html\"}}," ++
             "\"error_pages\":{\"404\":\"oops\",\"503\":\"maint\"}," ++ bodies_tail,
         test_file_source,
     );
@@ -10743,7 +10743,7 @@ test "config: a body names exactly one source, and its grammar is enforced" {
 
 test "config: error pages take only known statuses naming known bodies" {
     const one_body = "\"bodies\":{\"x\":{\"inline\":\"a\",\"content_type\":\"t/p\"}},";
-    // The closed static set: a status zoxy never sends as a static is a
+    // The closed static set: a status zgix never sends as a static is a
     // config the operator misread — 200 is not an error, 301 is the
     // redirect action's, 500 is not in the vocabulary.
     for ([_][]const u8{ "200", "301", "500" }) |status| {
@@ -11252,9 +11252,9 @@ test "config: a listener may bind a socket path (#303)" {
         defer arena_state.deinit();
         const parsed = try expectParseOk(
             &arena_state,
-            head ++ "\"unix:/run/zoxy.sock\"" ++ tail,
+            head ++ "\"unix:/run/zgix.sock\"" ++ tail,
         );
-        try std.testing.expectEqualStrings("/run/zoxy.sock", parsed.listeners[0].bind_address.unix);
+        try std.testing.expectEqualStrings("/run/zgix.sock", parsed.listeners[0].bind_address.unix);
         // Absent leaves whatever the umask gives, which is what every
         // other tool does and what an operator's directory permissions
         // are already expressed against.
@@ -11265,7 +11265,7 @@ test "config: a listener may bind a socket path (#303)" {
     // two fields the loader meant.
     try expectParseError(
         error.ListenerBindUnixPathRelative,
-        head ++ "\"unix:run/zoxy.sock\"" ++ tail,
+        head ++ "\"unix:run/zgix.sock\"" ++ tail,
     );
     try expectParseError(error.ListenerBindUnixPathInvalid, head ++ "\"unix:\"" ++ tail);
     try expectParseError(
@@ -11288,7 +11288,7 @@ test "config: a socket file's mode is octal, and only a socket has one (#303)" {
     const tail = ",\"http\":{\"cluster\":\"a\"}}]," ++
         "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
         "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
-    const unix_head = "{\"listeners\":[{\"bind\":\"unix:/run/zoxy.sock\"";
+    const unix_head = "{\"listeners\":[{\"bind\":\"unix:/run/zgix.sock\"";
 
     {
         var arena_state: std.heap.ArenaAllocator = undefined;
@@ -11333,7 +11333,7 @@ test "config: a unix listener refuses what needs a client address (#303)" {
     // these quietly wrong rather than absent. Refused at load (§5).
     const tail = "}}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
         "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
-    const head = "{\"listeners\":[{\"bind\":\"unix:/run/zoxy.sock\",\"http\":{\"cluster\":\"a\"";
+    const head = "{\"listeners\":[{\"bind\":\"unix:/run/zgix.sock\",\"http\":{\"cluster\":\"a\"";
 
     try expectParseError(
         error.ListenerUnixBindForwarded,
@@ -11346,7 +11346,7 @@ test "config: a unix listener refuses what needs a client address (#303)" {
     );
     try expectParseError(
         error.ListenerUnixBindSourceIpHash,
-        "{\"listeners\":[{\"bind\":\"unix:/run/zoxy.sock\",\"http\":{\"cluster\":\"a\"}}]," ++
+        "{\"listeners\":[{\"bind\":\"unix:/run/zgix.sock\",\"http\":{\"cluster\":\"a\"}}]," ++
             "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]," ++
             "\"pick\":{\"policy\":\"hash\",\"key\":\"source_ip\"}}}," ++
             "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
@@ -11358,7 +11358,7 @@ test "config: a unix listener refuses what needs a client address (#303)" {
         defer arena_state.deinit();
         _ = try expectParseOk(
             &arena_state,
-            "{\"listeners\":[{\"bind\":\"unix:/run/zoxy.sock\",\"http\":{\"cluster\":\"a\"}}]," ++
+            "{\"listeners\":[{\"bind\":\"unix:/run/zgix.sock\",\"http\":{\"cluster\":\"a\"}}]," ++
                 "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]," ++
                 "\"pick\":{\"policy\":\"hash\",\"key\":\"header\",\"name\":\"x-tenant\"}}}," ++
                 "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
@@ -11384,7 +11384,7 @@ test "config: a unix listener refuses what needs a client address (#303)" {
             "";
         try expectParseError(
             expected,
-            "{\"listeners\":[{\"bind\":\"unix:/run/zoxy.sock\",\"l4\":{\"routes\":[" ++
+            "{\"listeners\":[{\"bind\":\"unix:/run/zgix.sock\",\"l4\":{\"routes\":[" ++
                 "{\"sni\":\"a.example\",\"cluster\":\"plain\"}," ++
                 "{\"sni\":\"b.example\",\"cluster\":\"second\"}]}}]," ++
                 "\"clusters\":{\"plain\":{\"endpoints\":[\"127.0.0.1:2\"]}," ++
@@ -11883,7 +11883,7 @@ test "config: the cluster proxy_protocol block resolves a version, l4-reachable 
     );
 }
 
-test "config: a filter may not name the header zoxy manages" {
+test "config: a filter may not name the header zgix manages" {
     // A filter edit can only write a *constant*, so naming this header
     // encodes one fixed address for every client — it looks like client
     // forwarding and is the opposite of it. Reserved unconditionally, not

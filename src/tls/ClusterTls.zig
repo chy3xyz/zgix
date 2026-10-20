@@ -81,7 +81,7 @@ fn loadWith(
         const ca_pem = try readPem(arena, reader, ca_path);
         runtime.trust = TrustStore.load(arena, ca_pem) catch |err| {
             std.debug.print(
-                "zoxy: cannot load upstream CA bundle '{s}': {t}\n",
+                "zgix: cannot load upstream CA bundle '{s}': {t}\n",
                 .{ ca_path, err },
             );
             return err;
@@ -96,7 +96,7 @@ fn loadWith(
         // rule (§4) is enforced in one place for both directions.
         runtime.client_credentials = Credentials.load(arena, cert_pem, key_pem, .{}) catch |err| {
             std.debug.print(
-                "zoxy: cannot load upstream client certificate '{s}' and key '{s}': {t}\n",
+                "zgix: cannot load upstream client certificate '{s}' and key '{s}': {t}\n",
                 .{ cert_path, key_path, err },
             );
             return err;
@@ -121,7 +121,7 @@ fn readCwdFile(
     ) catch |err| {
         // The operator's own text, named here where the read happened —
         // the loader's error says what, not which file.
-        std.debug.print("zoxy: cannot read upstream TLS file '{s}': {t}\n", .{ path, err });
+        std.debug.print("zgix: cannot read upstream TLS file '{s}': {t}\n", .{ path, err });
         return err;
     };
 }
@@ -186,13 +186,13 @@ test "cluster tls: a CA bundle loads a trust store for the configured name" {
     } };
 
     var runtime = try ClusterTls.loadWith(arena_state.allocator(), .{
-        .server_name = "spike.zoxy.test",
+        .server_name = "spike.zgix.test",
         .ca_file = "/ca.pem",
         .verify = true,
     }, readerFor(&table));
     defer runtime.deinit();
 
-    try std.testing.expectEqualStrings("spike.zoxy.test", runtime.server_name);
+    try std.testing.expectEqualStrings("spike.zgix.test", runtime.server_name);
     try std.testing.expect(runtime.trust != null);
     try std.testing.expectEqual(@as(usize, 1), runtime.trust.?.roots.len);
     try std.testing.expect(runtime.client_credentials == null);
@@ -207,7 +207,7 @@ test "cluster tls: a client pair loads an ECDSA identity" {
     } };
 
     var runtime = try ClusterTls.loadWith(arena_state.allocator(), .{
-        .server_name = "spike.zoxy.test",
+        .server_name = "spike.zgix.test",
         .client_cert_path = "/client.pem",
         .client_key_path = "/client.key",
         .verify = false,

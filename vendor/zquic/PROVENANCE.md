@@ -92,9 +92,9 @@ coverage lives in `src/h3/native/fuzz_test.zig` under the QUIC frame tests,
 `src/h3/native/recovery_observe_test.zig` plus
 `src/h3/native/recovery_owner_test.zig` for zquic-driven lost-payload resends.
 
-## zoxy's copy
+## zgix's copy
 
-zoxy vendors the same tree under `vendor/zquic` on 2026-10-18, taken from
+zgix vendors the same tree under `vendor/zquic` on 2026-10-18, taken from
 zhttp v0.22.0's `vendor/zquic` (zquic 0.9.18 plus the hardening patch
 above). It is **not built into the proxy**: the only consumer is the
 experimental `zig build h3-check` step, which compiles `src/http/h3/root.zig`
@@ -105,7 +105,7 @@ bounded QUIC session model; neither exists yet.
 One source delta: `src/http3.zig`, `src/doq.zig` and
 `src/post_quantum.zig` imported a `zquic_core` module name that upstream's
 `build.zig` never declares (their own build worked only because those
-declarations are lazily analyzed). zoxy's modules are built by its own
+declarations are lazily analyzed). zgix's modules are built by its own
 `build.zig`, and the H3 seam references the HTTP/3 types, so the three
 imports now name `core.zig` directly. The declarations were unused at this
 commit; no behaviour changes.

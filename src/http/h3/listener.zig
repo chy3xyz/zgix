@@ -584,7 +584,7 @@ const TestClient = struct {
         self.crypto = try zquic.PacketCrypto.init(allocator, &self.ctx, null);
         self.tls = try qtls.Tls.initClient(
             allocator,
-            "spike.zoxy.test",
+            "spike.zgix.test",
             &[_]u8{0},
             .{ .insecure_skip_verify = true },
         );
@@ -832,9 +832,9 @@ fn buildE2ERequest(out: []u8, allocator: std.mem.Allocator) ![]const u8 {
     const fields = [_]qpack.HeaderField{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":scheme", .value = "https" },
-        .{ .name = ":authority", .value = "spike.zoxy.test" },
+        .{ .name = ":authority", .value = "spike.zgix.test" },
         .{ .name = ":path", .value = "/e2e" },
-        .{ .name = "user-agent", .value = "zoxy-e2e" },
+        .{ .name = "user-agent", .value = "zgix-e2e" },
     };
     const block = try qpack.encode(allocator, &fields);
     defer allocator.free(block);

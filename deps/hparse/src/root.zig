@@ -69,8 +69,10 @@ pub const uses_vectors = use_vectors;
 /// Width in bytes of the scan tier this build compiled.
 pub const vector_size: usize = vec_size;
 
-/// `vec_size` as unsigned integer type.
-const VectorInt = std.meta.Int(.unsigned, vec_size);
+/// `vec_size` as unsigned integer type. (0.17: `std.meta.Int` is gone; a
+/// comptime_int range expresses the same "exactly vec_size bits" type, and
+/// `comptime_int` shifts stay unbounded however large vec_size grows.)
+const VectorInt = std.math.IntFittingRange(0, (@as(comptime_int, 1) << @intCast(vec_size)) - 1);
 
 /// How many bytes `matchHeaderValue` scans scalar before it loads a vector chunk.
 ///

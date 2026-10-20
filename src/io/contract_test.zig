@@ -1070,7 +1070,7 @@ test "xevio: bind failures are diagnosed distinctly, not all AddressInUse" {
 }
 
 test "xevio: SO_REUSEPORT lets two listeners share one port" {
-    // Process-per-port scale-out (§1, §3): several zoxy instances bind the
+    // Process-per-port scale-out (§1, §3): several zgix instances bind the
     // same port and the kernel load-balances across them. Proven in-process
     // by binding two listeners to one concrete port — without SO_REUSEPORT
     // the second bind fails EADDRINUSE. SO_REUSEADDR alone (which libxev
@@ -1118,7 +1118,7 @@ fn loopbackSockaddr(port: u16) posix.sockaddr.in {
 }
 
 test "xevio: a port squatted without SO_REUSEPORT is AddressInUse" {
-    // The AddressInUse arm of the listen map. zoxy's own listeners share
+    // The AddressInUse arm of the listen map. zgix's own listeners share
     // ports via SO_REUSEPORT, so producing a genuine conflict needs a
     // squatter that did NOT set it — then the REUSEPORT bind fails
     // EADDRINUSE, and the diagnosis must say "in use", not "unavailable".

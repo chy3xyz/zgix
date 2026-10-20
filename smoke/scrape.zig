@@ -26,7 +26,7 @@ const assert = std.debug.assert;
 /// *said*, so a rename must show up as a scrape this harness cannot find
 /// its counters in, not as a harness that quietly renames its
 /// expectations alongside.
-const metric_prefix = "zoxy_";
+const metric_prefix = "zgix_";
 
 /// The prefix that makes a counter part of §9's gate identity, on the
 /// same terms — `Counters.shedTotal` picks it out of the field set, and
@@ -40,7 +40,7 @@ const scrape_bytes_max: u32 = 64 * 1024;
 
 pub const Scrape = struct {
     /// The exposition body, arena-owned: `# TYPE` lines and
-    /// `zoxy_<name> <value>` lines.
+    /// `zgix_<name> <value>` lines.
     body: []const u8,
 
     /// One counter's value, or null when the scrape does not carry that
@@ -84,7 +84,7 @@ const Sample = struct {
     value: u64,
 };
 
-/// One `zoxy_<name> <value>` line, or null for the `# TYPE` lines, the
+/// One `zgix_<name> <value>` line, or null for the `# TYPE` lines, the
 /// blank last line, and anything else this parser was not promised.
 fn parseSample(line: []const u8) ?Sample {
     if (!std.mem.startsWith(u8, line, metric_prefix)) return null;

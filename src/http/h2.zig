@@ -1,10 +1,10 @@
 //! HTTP/2 codec seam (§4/§7): the vendored zhttp primitives behind one
-//! import, so the rest of zoxy states "HTTP/2" once and never names the
+//! import, so the rest of zgix states "HTTP/2" once and never names the
 //! vendor.
 //!
 //! Only the pure codec is here — frame framing, HPACK/Huffman, settings,
 //! flow control, the stream registry. zhttp's server and client loops are
-//! built around `std.Io` readers and a per-request arena; zoxy's serving
+//! built around `std.Io` readers and a per-request arena; zgix's serving
 //! path is sans-I/O over a fixed pool, so the driver is ours to write.
 //! The codec is the part worth reusing: RFC-level framing is where the
 //! subtle bugs live, and none of it needs an event loop.
@@ -27,7 +27,7 @@ pub const ErrorCode = vendor.ErrorCode;
 pub const connection_preface = vendor.connection_preface;
 
 comptime {
-    // zoxy speak HTTP/1.1 externally today; this pin is the reminder that
+    // zgix speak HTTP/1.1 externally today; this pin is the reminder that
     // the moment a listener offers "h2" in ALPN, the frame cap and the
     // preface are protocol constants, not tunables.
     std.debug.assert(connection_preface.len == 24);

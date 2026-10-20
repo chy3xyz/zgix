@@ -4,17 +4,17 @@
 
 const std = @import("std");
 
-const zoxy = @import("zoxy");
+const zgix = @import("zgix");
 
 const iterations: u64 = 200_000;
-const half_bytes = zoxy.constants.relay_buffer_bytes_default;
+const half_bytes = zgix.constants.relay_buffer_bytes_default;
 const chunk_sizes = [_]u32{ 1, 128, 1460, half_bytes };
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     // The halves are slab-backed now (`limits.relay_buffer_bytes`), so the
     // bench carves its own pair rather than getting them inline.
-    const buffer = try arena.create(zoxy.RelayBuffer);
+    const buffer = try arena.create(zgix.RelayBuffer);
     buffer.client_to_upstream = try arena.alloc(u8, half_bytes);
     buffer.upstream_to_client = try arena.alloc(u8, half_bytes);
     var source: [half_bytes]u8 = undefined;

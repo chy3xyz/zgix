@@ -1,4 +1,4 @@
-//! Upstream TLS client engine (DESIGN.md §4): zoxy's sans-I/O seam over
+//! Upstream TLS client engine (DESIGN.md §4): zgix's sans-I/O seam over
 //! zssl's TLS 1.3 client. The caller owns the socket; this owns the
 //! handshake, the record buffer, the plaintext sink, and the trust
 //! decision.
@@ -289,7 +289,7 @@ fn pump(engine: *UpstreamTls, sink: *const Sink) !void {
 
 const fixture_cert_pem = @embedFile("testdata/cert.pem");
 const fixture_key_pem = @embedFile("testdata/key.pem");
-/// Inside the fixture's 2026-07-25 .. 2036-07-22 validity window.
+/// Inside the fixture's 2026-10-20 .. 2036-10-17 validity window.
 const fixture_now: i64 = 1_800_000_000;
 
 /// Collects what the sink is handed across a drive step.
@@ -325,14 +325,14 @@ test "upstream tls: the ClientHello is a handshake record for the configured nam
     var trust = TrustStore{ .roots = &roots };
     var context: TrustStore.Context = .{
         .store = &trust,
-        .server_name = "spike.zoxy.test",
+        .server_name = "spike.zgix.test",
         .now_sec = fixture_now,
     };
     var engine: UpstreamTls = undefined;
     const config: Config = .{
         .client_random = @splat(0x11),
         .x25519_private = @splat(0x22),
-        .server_name = "spike.zoxy.test",
+        .server_name = "spike.zgix.test",
         .trust = &context,
     };
     engine.init(&config);
@@ -354,20 +354,20 @@ test "upstream tls: init copies the trust context into the slot" {
     var trust = TrustStore{ .roots = &roots };
     var context: TrustStore.Context = .{
         .store = &trust,
-        .server_name = "spike.zoxy.test",
+        .server_name = "spike.zgix.test",
         .now_sec = fixture_now,
     };
     var engine: UpstreamTls = undefined;
     engine.init(&.{
         .client_random = @splat(0x11),
         .x25519_private = @splat(0x22),
-        .server_name = "spike.zoxy.test",
+        .server_name = "spike.zgix.test",
         .trust = &context,
     });
     defer engine.deinit();
 
     try std.testing.expect(engine.trust_context != null);
-    try std.testing.expectEqualStrings("spike.zoxy.test", engine.trust_context.?.server_name);
+    try std.testing.expectEqualStrings("spike.zgix.test", engine.trust_context.?.server_name);
     try std.testing.expect(engine.trust_context.?.store == &trust);
     // zssl must hold a pointer into the slot, not into `context` above:
     // that frame dies when this function's caller returns.
@@ -382,7 +382,7 @@ test "upstream tls: a full handshake verifies the chain and exchanges data" {
     var trust = TrustStore{ .roots = &roots };
     var context: TrustStore.Context = .{
         .store = &trust,
-        .server_name = "spike.zoxy.test",
+        .server_name = "spike.zgix.test",
         .now_sec = fixture_now,
     };
 
@@ -409,7 +409,7 @@ test "upstream tls: a full handshake verifies the chain and exchanges data" {
     const config: Config = .{
         .client_random = @splat(0x1a),
         .x25519_private = @as([31]u8, @splat(0x31)) ++ [_]u8{0x07},
-        .server_name = "spike.zoxy.test",
+        .server_name = "spike.zgix.test",
         .trust = &context,
     };
     engine.init(&config);
@@ -471,7 +471,7 @@ test "upstream tls: mTLS carries the client certificate and the server verifies 
     const config: Config = .{
         .client_random = @splat(0x1a),
         .x25519_private = @as([31]u8, @splat(0x31)) ++ [_]u8{0x07},
-        .server_name = "spike.zoxy.test",
+        .server_name = "spike.zgix.test",
         .client_credentials = &client_credentials,
     };
     engine.init(&config);
@@ -522,7 +522,7 @@ test "upstream tls: a server requiring mTLS rejects a client with no certificate
     const config: Config = .{
         .client_random = @splat(0x1a),
         .x25519_private = @as([31]u8, @splat(0x31)) ++ [_]u8{0x07},
-        .server_name = "spike.zoxy.test",
+        .server_name = "spike.zgix.test",
     };
     engine.init(&config);
     defer engine.deinit();
@@ -564,7 +564,7 @@ test "upstream tls: two application records in one received reach the sink in or
     const config: Config = .{
         .client_random = @splat(0x1a),
         .x25519_private = @as([31]u8, @splat(0x31)) ++ [_]u8{0x07},
-        .server_name = "spike.zoxy.test",
+        .server_name = "spike.zgix.test",
     };
     engine.init(&config);
     defer engine.deinit();
@@ -616,7 +616,7 @@ test "upstream tls: outboundSent credits a partial write without moving bytes" {
     const config: Config = .{
         .client_random = @splat(0x1a),
         .x25519_private = @as([31]u8, @splat(0x31)) ++ [_]u8{0x07},
-        .server_name = "spike.zoxy.test",
+        .server_name = "spike.zgix.test",
     };
     engine.init(&config);
     defer engine.deinit();

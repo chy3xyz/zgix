@@ -1,5 +1,5 @@
 //! A scripted TLS *client* for the gates (§9): connects over an `Io`
-//! backend, drives a real zssl client handshake against zoxy's server engine,
+//! backend, drives a real zssl client handshake against zgix's server engine,
 //! and records how the session ended. It lives under `src/tls/` because
 //! that is the only place zssl may be named (§4) — which also makes it
 //! the one TLS peer the server tests and the simulator share.
@@ -57,7 +57,7 @@ pub const SessionTicket = struct {
     }
 };
 
-/// zoxy seals its own tickets at `Tickets.ticket_bytes`, comfortably
+/// zgix seals its own tickets at `Tickets.ticket_bytes`, comfortably
 /// inside this; the cap exists so the client stays fixed-size.
 const ticket_identity_bytes_max: usize = 512;
 
@@ -163,7 +163,7 @@ pub fn TestClient(comptime IoType: type) type {
 
         pub const Options = struct {
             /// Must match the certificate's SAN; the fixtures use
-            /// `spike.zoxy.test`.
+            /// `spike.zgix.test`.
             host_name: []const u8,
             /// Application data to send once the session is up; empty
             /// means the client only handshakes.
@@ -244,7 +244,7 @@ pub fn TestClient(comptime IoType: type) type {
                 .x25519_private = options.x25519_seed,
                 .server_name = options.host_name,
                 // The test fixtures are self-signed and these gates are
-                // about zoxy's record layer, not this client's trust
+                // about zgix's record layer, not this client's trust
                 // decisions — the same call the smoke client makes.
                 .certificate_policy = .insecure_no_verification,
                 .resume_session = if (options.resume_with) |ticket|

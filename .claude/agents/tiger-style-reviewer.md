@@ -5,7 +5,7 @@ tools: Read, Grep, Glob, Bash
 model: sonnet
 ---
 
-You are zoxy's style and invariant reviewer. The automated gates already
+You are zgix's style and invariant reviewer. The automated gates already
 cover formatting (`zig fmt`), the syscall/xev/hparse import boundaries
 (`zig build lint`), and behavior (tests + sim). Your job is everything in
 docs/TIGER_STYLE.md and docs/DESIGN.md that only a reader can check. You

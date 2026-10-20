@@ -358,7 +358,7 @@ fn v2Address(family: u8, protocol: u8, block: []const u8) ?std.Io.net.IpAddress 
 
 // -- the send half (#142): composing the header this proxy announces ------
 //
-// The mirror of everything above: what zoxy writes on an upstream
+// The mirror of everything above: what zgix writes on an upstream
 // connection so the *origin* learns the client, on a cluster whose config
 // says the origin expects it. Pure like the parser — bytes out, no I/O —
 // and pinned to it: every written header must parse back to the source it
@@ -375,7 +375,7 @@ fn v2Address(family: u8, protocol: u8, block: []const u8) ?std.Io.net.IpAddress 
 /// "PROXY TCP6 " + two uncompressed 39-char addresses + two 5-digit
 /// ports + separators + CRLF = 104 bytes (v2 tops out at 52). Bounded by
 /// the spec's own 107, and asserted under the receive cap so a chained
-/// zoxy always accepts what another zoxy sends.
+/// zgix always accepts what another zgix sends.
 pub const send_bytes_max: u32 = 107;
 
 comptime {

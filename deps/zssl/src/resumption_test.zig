@@ -94,7 +94,7 @@ test "the parser reads §4's real-world ClientHello, PSK offer included" {
 }
 
 /// The embedder's half of the seam, in miniature: an opaque-ticket → PSK
-/// map standing in for zoxy's sealed tickets.
+/// map standing in for zgix's sealed tickets.
 const TicketStore = struct {
     identities: [4][64]u8,
     identity_bytes: [4]u8,
@@ -274,7 +274,7 @@ test "resumption end to end: tickets out, PSK session up, no certificate" {
     const nonces = [2][1]u8{ .{0x00}, .{0x01} };
     const identities = [2][]const u8{ "sealed-ticket-zero", "sealed-ticket-one" };
     for (nonces, identities) |nonce, identity| {
-        // The zoxy ordering: the PSK is derived before the ticket that
+        // The zgix ordering: the PSK is derived before the ticket that
         // will stand for it exists, then sealed (faked here by the map).
         var psk_buffer: [cipher_suite.hash_bytes_max]u8 = undefined;
         const psk = first.server.resumptionPsk(&nonce, &psk_buffer);
@@ -1149,7 +1149,7 @@ test "§4.2.10 end to end: our client offers 0-RTT and our server takes it" {
         .client_random = @as([32]u8, @splat(0x2c)),
         .x25519_private = client_x25519_private,
         .session_id = &@as([32]u8, @splat(0x33)),
-        .server_name = "spike.zoxy.test",
+        .server_name = "spike.zgix.test",
         .certificate_policy = .insecure_no_verification,
         .resume_session = resumption,
         .reassembly = &reassembly,
@@ -1517,7 +1517,7 @@ test "§4.2.10: an accepted offer whose keys were never built errors, not panics
         .client_random = @as([32]u8, @splat(0x2c)),
         .x25519_private = client_x25519_private,
         .session_id = &@as([32]u8, @splat(0x33)),
-        .server_name = "spike.zoxy.test",
+        .server_name = "spike.zgix.test",
         .certificate_policy = .insecure_no_verification,
         .resume_session = resumption,
         .reassembly = &reassembly,

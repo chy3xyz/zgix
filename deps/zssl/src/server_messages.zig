@@ -246,7 +246,7 @@ pub fn finished(out: []u8, verify_data: []const u8) []const u8 {
 }
 
 /// The sealed-ticket size budget shared by every encoder and buffer that
-/// touches one. zoxy's tickets are ≤ 256 bytes; 512 leaves headroom.
+/// touches one. zgix's tickets are ≤ 256 bytes; 512 leaves headroom.
 pub const ticket_bytes_max: u16 = 512;
 
 /// §4.6.1 caps `ticket_lifetime` at seven days: "Servers MUST NOT use

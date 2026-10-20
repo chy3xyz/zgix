@@ -100,13 +100,13 @@ pub const redirect_location = "https://sim/redirect";
 /// mints it at every setup — so the client oracle demands the stamp's
 /// bytes the way it demands `redirect_location`'s, and a silent remap
 /// of the mint fails the sweep instead of quietly re-homing a fleet.
-pub const sticky_cookie_name = "zoxy-sim-srv";
+pub const sticky_cookie_name = "zgix-sim-srv";
 pub const sticky_tag = "b4a7ea22f14bfcac";
 /// The whole Set-Cookie value a sticky stamp carries, attributes
 /// included — one spelling shared by the oracle so it cannot drift.
 pub const sticky_set_cookie_value =
     sticky_cookie_name ++ "=" ++ sticky_tag ++ "; Path=/; HttpOnly";
-/// The same stamp on a connection zoxy terminated (#125, #178): there the
+/// The same stamp on a connection zgix terminated (#125, #178): there the
 /// proxy knows the client-facing scheme is https, so the cookie carries
 /// `Secure` and a browser will not hand it back over plaintext. Spelled
 /// as the plaintext value plus the attribute rather than as a second

@@ -1,7 +1,7 @@
 //! Sans-I/O HTTP/2 client for the upstream leg (DESIGN.md §7).
 //!
 //! zhttp's `h2` codec supplies the RFC-level pieces — frames, HPACK,
-//! settings, flow-control arithmetic. This module is the driver zoxy's
+//! settings, flow-control arithmetic. This module is the driver zgix's
 //! serving model needs: no `std.Io` readers, no per-request arena, no
 //! threads. It encodes one request into the caller's buffer and consumes
 //! response bytes one complete frame at a time, so the exchange can keep

@@ -43,7 +43,7 @@ const Handler = struct {
             stream_id,
             200,
             &.{.{ .name = "content-type", .value = "text/plain" }},
-            "hello from zoxy h3\n",
+            "hello from zgix h3\n",
             true,
         ) catch {};
     }

@@ -1,4 +1,4 @@
-//! zoxy startup (DESIGN.md §5, §8): read config into the arena (the only
+//! zgix startup (DESIGN.md §5, §8): read config into the arena (the only
 //! allocating region), resolve it, verify the fd budget against
 //! RLIMIT_NOFILE, print the budgets, install signal handlers
 //! (the only raw syscall surface outside src/io/, held to the rlimit and
@@ -22,13 +22,13 @@
 
 const std = @import("std");
 
-const zoxy = @import("zoxy");
+const zgix = @import("zgix");
 const build_options = @import("build_options");
 const h3_runtime = @import("h3_runtime.zig");
 
-const XevIo = zoxy.Io.XevIo;
-const ServerXev = zoxy.Server(XevIo);
-const BudgetXev = zoxy.Budget(XevIo);
+const XevIo = zgix.Io.XevIo;
+const ServerXev = zgix.Server(XevIo);
+const BudgetXev = zgix.Budget(XevIo);
 
 const assert = std.debug.assert;
 
@@ -38,6 +38,7 @@ const assert = std.debug.assert;
 // comptime-known truth on every --version/--help print.
 comptime {
     assert(build_options.version.len > 0);
+    assert(build_options.version.len <= zgix.constants.version_label_bytes_max);
 }
 
 /// What this build is, when the version alone does not say it.
@@ -80,6 +81,12 @@ fn buildIdSuffix(comptime version: []const u8, comptime id: []const u8) []const 
 var global_io: XevIo = undefined;
 
 pub fn main(init: std.process.Init) !u8 {
+    // The labeled tables cannot import build_options (the library module
+    // has no such dependency — see the comment there), so the version
+    // reaches `Labeled.init` through this process-global, written once
+    // before the banner prints or `Server.init` runs.
+    zgix.counters.Labeled.build.version = build_options.version;
+
     const arena = init.arena.allocator();
 
     const args = try init.minimal.args.toSlice(arena);
@@ -224,9 +231,9 @@ fn serve(init: std.process.Init, arena: std.mem.Allocator, config_path: []const 
 fn initH3Runtime(
     arena: std.mem.Allocator,
     io: *XevIo,
-    config: *const zoxy.config.Config,
+    config: *const zgix.config.Config,
     credentials: []const h3_runtime.Credential,
-    upstream_tls: []const ?zoxy.tls.ClusterTls.Runtime,
+    upstream_tls: []const ?zgix.tls.ClusterTls.Runtime,
     server: *ServerXev,
 ) !?h3_runtime.Runtime {
     if (config.h3_listeners.len == 0) return null;
@@ -241,7 +248,7 @@ fn initH3Runtime(
         &server.counters,
         access_log,
     ) catch |err| {
-        std.debug.print("zoxy: cannot start HTTP/3 listeners: {t}\n", .{err});
+        std.debug.print("zgix: cannot start HTTP/3 listeners: {t}\n", .{err});
         return err;
     };
 }
@@ -252,14 +259,14 @@ const StartupResources = struct {
     log_sink_fd: @TypeOf(XevIo.log_sink_stdout),
     /// One slot per listener, null where the listener is plaintext —
     /// empty when nothing terminates TLS.
-    tls_credentials: []const ?zoxy.tls.CredentialSet,
+    tls_credentials: []const ?zgix.tls.CredentialSet,
     /// The bounded rotation store, absent when no listener terminates.
     /// Kept past startup because SIGHUP reloads into its next generation.
-    tls_store: ?*zoxy.tls.CredentialStore,
+    tls_store: ?*zgix.tls.CredentialStore,
     /// One runtime per cluster, in config order, null where the cluster
     /// dials plaintext — empty when no cluster carries upstream TLS.
     /// Owned here for the process's life; the serving path borrows it.
-    upstream_tls: []const ?zoxy.tls.ClusterTls.Runtime,
+    upstream_tls: []const ?zgix.tls.ClusterTls.Runtime,
     /// PEM bytes for every configured HTTP/3 listener, parallel to
     /// `config.h3_listeners`. Empty when the QUIC path is off.
     h3_credentials: []const h3_runtime.Credential,
@@ -279,7 +286,7 @@ const StartupResources = struct {
 fn openStartupResources(
     io: std.Io,
     arena: std.mem.Allocator,
-    config: *const zoxy.config.Config,
+    config: *const zgix.config.Config,
     demands: BudgetXev.Demands,
 ) !StartupResources {
     assert(config.listeners.len >= 1);
@@ -324,7 +331,7 @@ fn openStartupResources(
 fn openH3Credentials(
     io: std.Io,
     arena: std.mem.Allocator,
-    config: *const zoxy.config.Config,
+    config: *const zgix.config.Config,
 ) ![]const h3_runtime.Credential {
     if (config.h3_listeners.len == 0) return &.{};
     const credentials = try arena.alloc(h3_runtime.Credential, config.h3_listeners.len);
@@ -348,10 +355,10 @@ fn readH3Pem(
         io,
         path,
         arena,
-        .limited(zoxy.constants.tls_pem_bytes_max),
+        .limited(zgix.constants.tls_pem_bytes_max),
     ) catch |err| {
         std.debug.print(
-            "zoxy: h3 listener {d}: cannot read {s} '{s}': {t}\n",
+            "zgix: h3 listener {d}: cannot read {s} '{s}': {t}\n",
             .{ listener_index, kind, path, err },
         );
         return err;
@@ -359,14 +366,14 @@ fn readH3Pem(
 }
 
 const TlsResources = struct {
-    credentials: []const ?zoxy.tls.CredentialSet,
-    store: ?*zoxy.tls.CredentialStore,
+    credentials: []const ?zgix.tls.CredentialSet,
+    store: ?*zgix.tls.CredentialStore,
 };
 
 /// Whether this config names libcrypto at all: a listener terminating
 /// TLS or a cluster dialing it. Either direction parses credentials, and
 /// the allocator swap is refused once anything has allocated.
-fn libcryptoNeeded(config: *const zoxy.config.Config) bool {
+fn libcryptoNeeded(config: *const zgix.config.Config) bool {
     if (config.limits.tls_engines > 0) return true;
     for (config.clusters) |cluster| {
         if (cluster.tls != null) return true;
@@ -378,9 +385,9 @@ fn libcryptoNeeded(config: *const zoxy.config.Config) bool {
 /// is parsed. If it fails the zero-allocation promise (§5) is unbacked,
 /// and a proxy that cannot keep its own invariants should not start.
 fn installLibcryptoHeap() error{LibcryptoHeapUnavailable}!void {
-    if (zoxy.tls.libcrypto_heap.install(&libcrypto_heap_storage)) return;
+    if (zgix.tls.libcrypto_heap.install(&libcrypto_heap_storage)) return;
     std.debug.print(
-        "zoxy: libcrypto refused the fixed-heap install; " ++
+        "zgix: libcrypto refused the fixed-heap install; " ++
             "the zero-allocation budget (DESIGN.md §5) cannot be kept\n",
         .{},
     );
@@ -393,12 +400,12 @@ fn installLibcryptoHeap() error{LibcryptoHeapUnavailable}!void {
 fn openTlsCredentials(
     io: std.Io,
     arena: std.mem.Allocator,
-    config: *const zoxy.config.Config,
+    config: *const zgix.config.Config,
 ) !TlsResources {
     assert(config.listeners.len >= 1);
     if (config.limits.tls_engines == 0) return .{ .credentials = &.{}, .store = null };
 
-    const plans = try arena.alloc(zoxy.tls.CredentialStore.ListenerPlan, config.listeners.len);
+    const plans = try arena.alloc(zgix.tls.CredentialStore.ListenerPlan, config.listeners.len);
     var tls_listeners: usize = 0;
     for (config.listeners, 0..) |listener, index| {
         const tls = listener.tls orelse {
@@ -406,9 +413,9 @@ fn openTlsCredentials(
             continue;
         };
         assert(tls.certificates.len >= 1);
-        assert(tls.certificates.len <= zoxy.constants.tls_certificates_max);
+        assert(tls.certificates.len <= zgix.constants.tls_certificates_max);
         const paths = try arena.alloc(
-            zoxy.tls.CredentialStore.CertificatePath,
+            zgix.tls.CredentialStore.CertificatePath,
             tls.certificates.len,
         );
         for (tls.certificates, 0..) |certificate, cert_index| {
@@ -427,15 +434,15 @@ fn openTlsCredentials(
 
     const read_context = try arena.create(ReloadReadContext);
     read_context.* = .{ .io = io };
-    const reader: zoxy.tls.CredentialStore.Reader = .{
+    const reader: zgix.tls.CredentialStore.Reader = .{
         .context = read_context,
         .read = readTlsPem,
     };
-    const store = try arena.create(zoxy.tls.CredentialStore);
-    store.* = try zoxy.tls.CredentialStore.init(arena, plans, reader, .{});
+    const store = try arena.create(zgix.tls.CredentialStore);
+    store.* = try zgix.tls.CredentialStore.init(arena, plans, reader, .{});
     const credentials = store.initial() catch |err| {
         std.debug.print(
-            "zoxy: listener {d} certificate {d}: {t}\n",
+            "zgix: listener {d} certificate {d}: {t}\n",
             .{ store.last_listener, store.last_certificate, err },
         );
         return err;
@@ -443,8 +450,8 @@ fn openTlsCredentials(
     std.debug.print(
         "  tls reload  {d} KiB reserved for {d} certificate generation(s) across {d} listener(s)\n",
         .{
-            zoxy.tls.CredentialStore.reservedBytes(tls_listeners) / 1024,
-            zoxy.constants.tls_reload_generations_max,
+            zgix.tls.CredentialStore.reservedBytes(tls_listeners) / 1024,
+            zgix.constants.tls_reload_generations_max,
             tls_listeners,
         },
     );
@@ -457,15 +464,15 @@ fn openTlsCredentials(
 fn openClusterTls(
     io: std.Io,
     arena: std.mem.Allocator,
-    config: *const zoxy.config.Config,
-) ![]const ?zoxy.tls.ClusterTls.Runtime {
+    config: *const zgix.config.Config,
+) ![]const ?zgix.tls.ClusterTls.Runtime {
     var tls_clusters: usize = 0;
     for (config.clusters) |cluster| {
         if (cluster.tls != null) tls_clusters += 1;
     }
     if (tls_clusters == 0) return &.{};
 
-    const runtimes = try arena.alloc(?zoxy.tls.ClusterTls.Runtime, config.clusters.len);
+    const runtimes = try arena.alloc(?zgix.tls.ClusterTls.Runtime, config.clusters.len);
     @memset(runtimes, null);
     errdefer {
         for (runtimes) |*runtime| {
@@ -474,7 +481,7 @@ fn openClusterTls(
     }
     for (config.clusters, 0..) |cluster, index| {
         const tls = cluster.tls orelse continue;
-        runtimes[index] = try zoxy.tls.ClusterTls.load(arena, io, tls);
+        runtimes[index] = try zgix.tls.ClusterTls.load(arena, io, tls);
     }
     return runtimes;
 }
@@ -517,7 +524,7 @@ fn checkExitFor(err: anyerror) CheckExit {
 /// `--check` (#301): everything `serve` does up to the banner, and
 /// nothing that takes a port.
 ///
-/// zoxy needs this more than its peers do, because two of its virtues
+/// zgix needs this more than its peers do, because two of its virtues
 /// make a bad config expensive. Config shape is the operator's to size
 /// (§5) and a shape that does not fit is *refused*, not warned about; and
 /// config is parse-once immutable (§1), so the blast radius of a bad one
@@ -562,7 +569,7 @@ fn checkConfig(init: std.process.Init, arena: std.mem.Allocator, config_path: []
 fn checkStartFits(
     io: std.Io,
     arena: std.mem.Allocator,
-    config: *const zoxy.config.Config,
+    config: *const zgix.config.Config,
     demands: BudgetXev.Demands,
 ) CheckExit {
     assert(config.listeners.len >= 1);
@@ -583,7 +590,7 @@ fn checkStartFits(
 /// the two facts only a check has — the file it was asked about, and the
 /// `RLIMIT_NOFILE` it found on the way in.
 const CheckReport = struct {
-    config: *const zoxy.config.Config,
+    config: *const zgix.config.Config,
     demands: BudgetXev.Demands,
     config_arena_bytes: u64,
     config_path: []const u8,
@@ -662,7 +669,7 @@ fn rlimitText(value: std.posix.rlim_t, buffer: []u8) []const u8 {
 /// above still names what it tried. The seam owns the syscall
 /// (`XevIo.openLogSink`); the error report is this caller's, because the
 /// path is the operator's own text.
-fn openLogSinkFd(config: *const zoxy.config.Config) !@TypeOf(XevIo.log_sink_stdout) {
+fn openLogSinkFd(config: *const zgix.config.Config) !@TypeOf(XevIo.log_sink_stdout) {
     const sink = config.access_log_sink orelse return XevIo.log_sink_stdout;
     switch (sink) {
         .stdout => return XevIo.log_sink_stdout,
@@ -671,7 +678,7 @@ fn openLogSinkFd(config: *const zoxy.config.Config) !@TypeOf(XevIo.log_sink_stdo
             // failure here is the filesystem's answer, not a config shape.
             assert(path.len >= 1);
             return XevIo.openLogSink(path) catch |err| {
-                std.debug.print("zoxy: cannot open access log '{s}': {t}\n", .{ path, err });
+                std.debug.print("zgix: cannot open access log '{s}': {t}\n", .{ path, err });
                 return err;
             };
         },
@@ -699,7 +706,7 @@ fn readConfig(
     io: std.Io,
     arena: std.mem.Allocator,
     config_path: []const u8,
-) !zoxy.config.Config {
+) !zgix.config.Config {
     assert(config_path.len >= 1);
     const config_bytes = std.Io.Dir.cwd().readFileAlloc(
         io,
@@ -707,18 +714,18 @@ fn readConfig(
         arena,
         .unlimited,
     ) catch |err| {
-        std.debug.print("zoxy: cannot read config '{s}': {t}\n", .{ config_path, err });
+        std.debug.print("zgix: cannot read config '{s}': {t}\n", .{ config_path, err });
         return err;
     };
     // Body files (#159) are read through the loader's seam by the same
     // startup-time reader the config file itself used — the one moment
     // this process touches the filesystem for content (parse-once, §1).
     var file_context: BodyFileContext = .{ .io = io };
-    return zoxy.config.parseWithFiles(arena, config_bytes, .{
+    return zgix.config.parseWithFiles(arena, config_bytes, .{
         .context = &file_context,
         .read = readBodyFile,
     }) catch |err| {
-        std.debug.print("zoxy: invalid config '{s}': {t}\n", .{ config_path, err });
+        std.debug.print("zgix: invalid config '{s}': {t}\n", .{ config_path, err });
         return err;
     };
 }
@@ -739,7 +746,7 @@ const BodyFileContext = struct {
 /// BSS, so the pages a plaintext deployment never touches never become
 /// resident; the §5 banner prices this only when a listener terminates,
 /// which is when it is actually used.
-var libcrypto_heap_storage: [zoxy.constants.libcrypto_heap_bytes]u8 align(16) = undefined;
+var libcrypto_heap_storage: [zgix.constants.libcrypto_heap_bytes]u8 align(16) = undefined;
 
 /// Where a SIGHUP reload reads its PEMs. The Io interface is the one the
 /// process was started with; certificate reload runs in the loop, so it
@@ -756,19 +763,19 @@ fn readTlsPem(
     context: *anyopaque,
     allocator: std.mem.Allocator,
     path: []const u8,
-) zoxy.tls.CredentialStore.ReadError![]const u8 {
+) zgix.tls.CredentialStore.ReadError![]const u8 {
     assert(path.len >= 1);
     const reload: *const ReloadReadContext = @ptrCast(@alignCast(context));
     return std.Io.Dir.cwd().readFileAlloc(
         reload.io,
         path,
         allocator,
-        .limited(zoxy.constants.tls_pem_bytes_max),
+        .limited(zgix.constants.tls_pem_bytes_max),
     ) catch |err| switch (err) {
         error.StreamTooLong => error.FileTooLarge,
         error.OutOfMemory => error.OutOfMemory,
         else => |remaining| {
-            std.debug.print("zoxy: cannot read TLS file '{s}': {t}\n", .{ path, remaining });
+            std.debug.print("zgix: cannot read TLS file '{s}': {t}\n", .{ path, remaining });
             return error.FileUnreadable;
         },
     };
@@ -776,7 +783,7 @@ fn readTlsPem(
 
 const TlsReloadContext = struct {
     server: *ServerXev,
-    store: *zoxy.tls.CredentialStore,
+    store: *zgix.tls.CredentialStore,
 };
 
 /// SIGHUP's second job: load the next certificate generation and hand it
@@ -786,13 +793,13 @@ fn reloadTls(context: *anyopaque) void {
     const reload: *TlsReloadContext = @ptrCast(@alignCast(context));
     const sets = reload.store.reload() catch |err| {
         std.debug.print(
-            "zoxy: certificate reload failed at listener {d}, certificate {d}: {t}; keeping the previous set\n",
+            "zgix: certificate reload failed at listener {d}, certificate {d}: {t}; keeping the previous set\n",
             .{ reload.store.last_listener, reload.store.last_certificate, err },
         );
         return;
     };
     reload.server.setTlsCredentials(sets);
-    std.debug.print("zoxy: certificate set reloaded\n", .{});
+    std.debug.print("zgix: certificate set reloaded\n", .{});
 }
 
 /// The loader's `FileSource.read` against the real filesystem: whole
@@ -818,7 +825,7 @@ fn readBodyFile(
         else => blk: {
             // Which file and why, here where both are known: the
             // loader's error names the verdict, not the path.
-            std.debug.print("zoxy: cannot read body file '{s}': {t}\n", .{ path, err });
+            std.debug.print("zgix: cannot read body file '{s}': {t}\n", .{ path, err });
             break :blk error.FileUnreadable;
         },
     };
@@ -837,7 +844,7 @@ const Cli = union(enum) {
 
 const UsageError = enum { missing_config, extra_arguments, unknown_option };
 
-/// Classify argv without touching the world, so it is unit-testable. zoxy
+/// Classify argv without touching the world, so it is unit-testable. zgix
 /// takes exactly one positional argument — the config path — and every
 /// flag it has is a *mode* rather than an option carrying a value, so any
 /// of them may appear anywhere on the line. `--help` and `--version` win
@@ -878,16 +885,16 @@ fn flagMatches(arg: []const u8, short: []const u8, long: []const u8) bool {
 }
 
 const help_text =
-    \\zoxy {s} — a zero-allocation L4/L7 edge proxy.
+    \\zgix {s} — a zero-allocation L4/L7 edge proxy.
     \\
     \\Usage:
-    \\  zoxy <config.json>          Start the proxy with the given JSON config.
-    \\  zoxy --check <config.json>  Validate and price the config, then exit
+    \\  zgix <config.json>          Start the proxy with the given JSON config.
+    \\  zgix --check <config.json>  Validate and price the config, then exit
     \\                              without binding anything (-c).
-    \\  zoxy --help, -h             Show this message and exit.
-    \\  zoxy --version, -V          Print the version and exit.
+    \\  zgix --help, -h             Show this message and exit.
+    \\  zgix --version, -V          Print the version and exit.
     \\
-    \\zoxy reads the whole config once at startup, sizes every pool and the
+    \\zgix reads the whole config once at startup, sizes every pool and the
     \\io_uring ring from it, then serves without allocating again. The config
     \\format is documented by the JSON Schema shipped with each release and by
     \\docs/DESIGN.md.
@@ -911,7 +918,7 @@ const help_text =
     \\
 ;
 
-/// `--help`: the full usage text, to stdout (so `zoxy --help | less` works).
+/// `--help`: the full usage text, to stdout (so `zgix --help | less` works).
 fn printHelp(io: std.Io) !void {
     // The writer drains to stdout whenever this staging buffer fills, so its
     // size is a batching choice, not a cap on the help text length.
@@ -927,7 +934,7 @@ fn printVersion(io: std.Io) !void {
     var buffer: [64]u8 = undefined;
     var file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
     const writer = &file_writer.interface;
-    try writer.print("zoxy {s}{s}\n", .{ build_options.version, build_id_suffix });
+    try writer.print("zgix {s}{s}\n", .{ build_options.version, build_id_suffix });
     try writer.flush();
 }
 
@@ -938,10 +945,10 @@ fn printUsageError(reason: UsageError) void {
     const detail = switch (reason) {
         .missing_config => "missing the required <config.json> argument",
         .extra_arguments => "too many arguments; expected exactly one <config.json>",
-        .unknown_option => "unknown option; run `zoxy --help` for usage",
+        .unknown_option => "unknown option; run `zgix --help` for usage",
     };
     std.debug.print(
-        "zoxy: {s}\nusage: zoxy <config.json>  (or --check, --help, --version)\n",
+        "zgix: {s}\nusage: zgix <config.json>  (or --check, --help, --version)\n",
         .{detail},
     );
 }
@@ -960,14 +967,14 @@ fn ensureFdBudget(fds_required: u32) error{FdBudgetUnsatisfiable}!void {
     assert(fds_required > 0);
     const required: u64 = fds_required;
     var limits = std.posix.getrlimit(.NOFILE) catch |err| {
-        std.debug.print("zoxy: cannot read RLIMIT_NOFILE: {t}\n", .{err});
+        std.debug.print("zgix: cannot read RLIMIT_NOFILE: {t}\n", .{err});
         return error.FdBudgetUnsatisfiable;
     };
     assert(limits.max >= limits.cur);
     if (limits.cur >= required) return;
     if (limits.max < required) {
         std.debug.print(
-            "zoxy: RLIMIT_NOFILE hard limit {d} is below the fd budget {d} (§8)\n",
+            "zgix: RLIMIT_NOFILE hard limit {d} is below the fd budget {d} (§8)\n",
             .{ limits.max, required },
         );
         return error.FdBudgetUnsatisfiable;
@@ -975,7 +982,7 @@ fn ensureFdBudget(fds_required: u32) error{FdBudgetUnsatisfiable}!void {
     limits.cur = required;
     std.posix.setrlimit(.NOFILE, limits) catch |err| {
         std.debug.print(
-            "zoxy: cannot raise RLIMIT_NOFILE to the fd budget {d}: {t}\n",
+            "zgix: cannot raise RLIMIT_NOFILE to the fd budget {d}: {t}\n",
             .{ required, err },
         );
         return error.FdBudgetUnsatisfiable;
@@ -1009,7 +1016,7 @@ fn installSignalHandlers() void {
     // A proxy must not die because something downstream of it went away.
     // The access log writes to a pipe the operator owns (§8), and a `write`
     // to a pipe with no reader raises SIGPIPE, whose default action is to
-    // terminate — an operator closing `zoxy config.json | jq` would take
+    // terminate — an operator closing `zgix config.json | jq` would take
     // the data path with it. Ignoring it turns that into the EPIPE the
     // sink already handles by declaring itself broken. Socket sends are
     // covered too: io_uring sets MSG_NOSIGNAL for them, but a proxy
@@ -1046,7 +1053,7 @@ fn onAlarm(signal_number: std.posix.SIG) callconv(.c) void {
 /// Async-signal-safe: delegates to the seam's atomic-mask + eventfd wake
 /// (§4); nothing else is legal here.
 fn onRawSignal(signal_number: std.posix.SIG) callconv(.c) void {
-    const signal: zoxy.Io.Signal = switch (signal_number) {
+    const signal: zgix.Io.Signal = switch (signal_number) {
         .TERM, .INT => .terminate,
         .HUP => .reopen_log,
         else => return,
@@ -1057,15 +1064,15 @@ fn onRawSignal(signal_number: std.posix.SIG) callconv(.c) void {
 const testing = std.testing;
 
 test "classifyArgs: a single positional is the config path" {
-    const args = [_][]const u8{ "zoxy", "config.json" };
+    const args = [_][]const u8{ "zgix", "config.json" };
     const cli = classifyArgs(&args);
     try testing.expect(cli == .run);
     try testing.expectEqualStrings("config.json", cli.run);
 }
 
 test "classifyArgs: --help and -h request help" {
-    try testing.expect(classifyArgs(&.{ "zoxy", "--help" }) == .help);
-    try testing.expect(classifyArgs(&.{ "zoxy", "-h" }) == .help);
+    try testing.expect(classifyArgs(&.{ "zgix", "--help" }) == .help);
+    try testing.expect(classifyArgs(&.{ "zgix", "-h" }) == .help);
 }
 
 test "buildIdSuffix: a release says nothing extra, every other build says what it is" {
@@ -1097,41 +1104,41 @@ test "buildIdSuffix: a release says nothing extra, every other build says what i
 }
 
 test "classifyArgs: --version and -V request the version" {
-    try testing.expect(classifyArgs(&.{ "zoxy", "--version" }) == .version);
-    try testing.expect(classifyArgs(&.{ "zoxy", "-V" }) == .version);
+    try testing.expect(classifyArgs(&.{ "zgix", "--version" }) == .version);
+    try testing.expect(classifyArgs(&.{ "zgix", "-V" }) == .version);
 }
 
 test "classifyArgs: help wins over version, and both win appended to a config" {
     // A flag anywhere on the line is honored; help outranks version.
-    try testing.expect(classifyArgs(&.{ "zoxy", "--version", "--help" }) == .help);
-    try testing.expect(classifyArgs(&.{ "zoxy", "config.json", "--help" }) == .help);
-    try testing.expect(classifyArgs(&.{ "zoxy", "config.json", "--version" }) == .version);
+    try testing.expect(classifyArgs(&.{ "zgix", "--version", "--help" }) == .help);
+    try testing.expect(classifyArgs(&.{ "zgix", "config.json", "--help" }) == .help);
+    try testing.expect(classifyArgs(&.{ "zgix", "config.json", "--version" }) == .version);
 }
 
 test "classifyArgs: --check names the config it must not run" {
     // Either side of the path: `--check` carries no value of its own, so
     // its position on the line is not information.
-    const leading = classifyArgs(&.{ "zoxy", "--check", "config.json" });
+    const leading = classifyArgs(&.{ "zgix", "--check", "config.json" });
     try testing.expect(leading == .check);
     try testing.expectEqualStrings("config.json", leading.check);
-    const trailing = classifyArgs(&.{ "zoxy", "config.json", "-c" });
+    const trailing = classifyArgs(&.{ "zgix", "config.json", "-c" });
     try testing.expect(trailing == .check);
     try testing.expectEqualStrings("config.json", trailing.check);
     // Still exactly one positional, and still the informational modes
     // first — a `--check` with nothing to check is the same mistake a
-    // bare `zoxy` is.
+    // bare `zgix` is.
     try testing.expectEqual(
         Cli{ .usage = .missing_config },
-        classifyArgs(&.{ "zoxy", "--check" }),
+        classifyArgs(&.{ "zgix", "--check" }),
     );
     try testing.expectEqual(
         Cli{ .usage = .extra_arguments },
-        classifyArgs(&.{ "zoxy", "--check", "a.json", "b.json" }),
+        classifyArgs(&.{ "zgix", "--check", "a.json", "b.json" }),
     );
-    try testing.expect(classifyArgs(&.{ "zoxy", "--check", "a.json", "--help" }) == .help);
+    try testing.expect(classifyArgs(&.{ "zgix", "--check", "a.json", "--help" }) == .help);
     // And a config path is still a config path when nobody asked to
     // check it.
-    try testing.expect(classifyArgs(&.{ "zoxy", "config.json" }) == .run);
+    try testing.expect(classifyArgs(&.{ "zgix", "config.json" }) == .run);
 }
 
 test "checkExitFor: the box's refusals are told from the config's" {
@@ -1177,13 +1184,13 @@ test "rlimitText: an infinite limit reads as one" {
 }
 
 test "classifyArgs: usage mistakes carry their reason" {
-    try testing.expectEqual(Cli{ .usage = .missing_config }, classifyArgs(&.{"zoxy"}));
+    try testing.expectEqual(Cli{ .usage = .missing_config }, classifyArgs(&.{"zgix"}));
     try testing.expectEqual(
         Cli{ .usage = .extra_arguments },
-        classifyArgs(&.{ "zoxy", "a.json", "b.json" }),
+        classifyArgs(&.{ "zgix", "a.json", "b.json" }),
     );
     try testing.expectEqual(
         Cli{ .usage = .unknown_option },
-        classifyArgs(&.{ "zoxy", "--nope" }),
+        classifyArgs(&.{ "zgix", "--nope" }),
     );
 }

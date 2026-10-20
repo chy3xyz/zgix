@@ -2,7 +2,7 @@
 //!
 //! `discard` and `collect` are std's own `Io.Writer.Discarding` and
 //! `Io.Writer.Allocating`; the only sink zurl adds is `LineSink`, ported from
-//! the zoxy benchmark's cAdvisor scrape — a body consumed a line at a time
+//! the zgix benchmark's cAdvisor scrape — a body consumed a line at a time
 //! while never holding more than one line of it.
 
 const std = @import("std");

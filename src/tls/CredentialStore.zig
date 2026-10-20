@@ -75,7 +75,7 @@ const Generation = struct {
 };
 
 /// Enough for `tls_certificates_max` chains plus their entry/name arrays.
-/// The chain storage is zssl's own bound, not zoxy's wire bound: that is
+/// The chain storage is zssl's own bound, not zgix's wire bound: that is
 /// what `Credentials.load` allocates from the allocator it is handed.
 /// 2 KiB of slack per certificate covers the chain slice array, explicit
 /// names and SAN slices; the extra 8 KiB covers the entry array itself.

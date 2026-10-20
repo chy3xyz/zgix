@@ -5,7 +5,7 @@
 //! own ephemeral keys, checks the certificate's self-signature with its
 //! own X.509 and ECDSA, verifies our CertificateVerify and Finished with
 //! its own schedule, and then trades application bytes. Agreement here is
-//! zoxy's Tier-0.5 argument, brought forward into a unit test.
+//! zgix's Tier-0.5 argument, brought forward into a unit test.
 
 const std = @import("std");
 const testing = std.testing;

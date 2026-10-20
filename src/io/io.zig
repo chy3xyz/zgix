@@ -77,6 +77,9 @@ const constants = @import("../constants.zig");
 
 pub const SimIo = @import("SimIo.zig");
 pub const XevIo = @import("XevIo.zig");
+/// Blocking fd helpers for startup paths that have no Io (`Labeled.init`'s
+/// certificate snapshot is the one caller — see the file's doc).
+pub const blocking = @import("blocking.zig");
 
 /// Signals the loop reacts to, delivered through the seam so the
 /// simulator can inject drain as just another scheduled event (§4).

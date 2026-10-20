@@ -26,16 +26,16 @@
 //! it once. Read the numbers as a floor on the per-connection penalty, and
 //! as a scaling curve rather than an absolute.
 //!
-//!   zig build bench-micro && ./zig-out/bin/zoxy-bench-conn_touch_scaling
+//!   zig build bench-micro && ./zig-out/bin/zgix-bench-conn_touch_scaling
 
 const std = @import("std");
 const linux = std.os.linux;
 
-const zoxy = @import("zoxy");
+const zgix = @import("zgix");
 
 const assert = std.debug.assert;
 
-const ServerType = zoxy.Server(zoxy.Io.XevIo);
+const ServerType = zgix.Server(zgix.Io.XevIo);
 const ConnType = ServerType.ConnType;
 const StreamType = ServerType.StreamType;
 
@@ -60,7 +60,7 @@ const ops_per_point: u64 = 4_000_000;
 /// point, the c10k one, and the compiled ceiling (read from `constants`, so
 /// a ceiling change moves the sweep with it), with steps between so the
 /// knee is visible rather than inferred from the endpoints.
-const points = [_]u32{ 64, 256, 500, 1000, 2000, 5000, 10000, zoxy.constants.conn_slots_max };
+const points = [_]u32{ 64, 256, 500, 1000, 2000, 5000, 10000, zgix.constants.conn_slots_max };
 
 /// The point every ratio is quoted against: the connection count the
 /// Tier-1 bench actually runs at, so the column reads as "what c10k costs

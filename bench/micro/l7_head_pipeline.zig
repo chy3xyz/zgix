@@ -11,15 +11,15 @@
 //! report.
 //!
 //! Run: `zig build bench-micro` then
-//! `poop ./zig-out/bin/zoxy-bench-l7_head_pipeline` for the absolute
+//! `poop ./zig-out/bin/zgix-bench-l7_head_pipeline` for the absolute
 //! per-iteration cost, or poop two builds to A/B a candidate change.
 
 const std = @import("std");
 
-const zoxy = @import("zoxy");
+const zgix = @import("zgix");
 
-const parser = zoxy.http.parser;
-const render = zoxy.http.render;
+const parser = zgix.http.parser;
+const render = zgix.http.render;
 
 const iterations: u64 = 1_000_000;
 
@@ -38,15 +38,15 @@ const response_head =
 /// No listener filters: the unfiltered path is the one the Tier-1 bench
 /// drives, and a rule set would measure the filter engine rather than the
 /// head pipeline.
-const no_edits: []const zoxy.http.filter.AppliedHeaderEdit = &.{};
+const no_edits: []const zgix.http.filter.AppliedHeaderEdit = &.{};
 
 pub fn main() void {
     var request_storage: parser.HeaderStorage = undefined;
     var response_storage: parser.HeaderStorage = undefined;
     var head_scratch: render.HeadScratch = undefined;
-    var path_scratch: [zoxy.constants.head_buffer_bytes_default]u8 = undefined;
-    var upstream_head: [zoxy.constants.head_buffer_bytes_default]u8 = undefined;
-    var downstream_head: [zoxy.constants.head_buffer_bytes_default]u8 = undefined;
+    var path_scratch: [zgix.constants.head_buffer_bytes_default]u8 = undefined;
+    var upstream_head: [zgix.constants.head_buffer_bytes_default]u8 = undefined;
+    var downstream_head: [zgix.constants.head_buffer_bytes_default]u8 = undefined;
 
     var checksum: u64 = 0;
     var index: u64 = 0;

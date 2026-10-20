@@ -1,4 +1,4 @@
-# zoxy
+# zgix
 
 Bullet-proof L4/L7 proxy in Zig 0.17 (toolchain pinned via devenv/Nix;
 direnv activates the shell). Read before writing code:
@@ -20,7 +20,7 @@ direnv activates the shell). Read before writing code:
   `zig build sim -- <seed>` replays the exact schedule. The live gate
   (`zig build smoke` alone) runs the real binary against a real origin
   and asserts equalities on what it wrote; a failing one prints the
-  proxy's own output from `.zig-cache/zoxy-smoke/`. It runs twice — once
+  proxy's own output from `.zig-cache/zgix-smoke/`. It runs twice — once
   against the default build and once against the ReleaseSafe twin
   (`zig build smoke-release`), because the configuration release.yml
   ships has failure modes a Debug build cannot reproduce (#283).

@@ -1,6 +1,6 @@
 //! Tier-1 loopback benchmark (DESIGN.md §9): the same constant-throughput
 //! zrk load (coordinated-omission-corrected) against the origin directly,
-//! through zoxy, and through haproxy as the state-of-the-art reference,
+//! through zgix, and through haproxy as the state-of-the-art reference,
 //! printed as comparable bands — never single numbers; compare bands
 //! across runs. Also witnesses the §5 closed form from the outside: the
 //! slabs are lazily resident (IMPLEMENTATION_NOTES "lazy fault-in"), a
@@ -10,7 +10,7 @@
 //!
 //! By default an nginx origin is spawned with a generated config (the dev
 //! shell provides nginx and haproxy); pass `--origin host:port` to reuse
-//! any live HTTP origin instead. zoxy is drained with SIGTERM at the end,
+//! any live HTTP origin instead. zgix is drained with SIGTERM at the end,
 //! so every run also exercises the drain path. Core pinning is
 //! deliberately left to the caller (taskset) until the CI band policy
 //! needs it.
@@ -34,17 +34,17 @@ const spawn_path = @import("spawn_path.zig");
 
 const assert = std.debug.assert;
 
-const zoxy_port: u16 = 18180;
-const zoxy_http_port: u16 = 18181;
-const zoxy_https_port: u16 = 18182;
+const zgix_port: u16 = 18180;
+const zgix_http_port: u16 = 18181;
+const zgix_https_port: u16 = 18182;
 const origin_port: u16 = 19180;
 const haproxy_port: u16 = 17180;
 const haproxy_http_port: u16 = 17181;
 const haproxy_https_port: u16 = 17182;
 const overload_http_port: u16 = 18291;
-const work_directory = ".zig-cache/zoxy-bench";
+const work_directory = ".zig-cache/zgix-bench";
 
-/// The overload scenario's shape (§9): a second zoxy shrunk via the
+/// The overload scenario's shape (§9): a second zgix shrunk via the
 /// config `limits` block so offered load ≫ capacity is loopback-feasible,
 /// and a connection count far past its relay buffers so both §8 rungs
 /// fire — accept-RSTs at the conn wall, 503s at the relay-buffer rung.
@@ -133,7 +133,7 @@ const Flags = struct {
     connections: u32 = 32,
     duration_s: u64 = 10,
     origin: ?[]const u8 = null,
-    zoxy_path: []const u8 = "zig-out/bin/zoxy",
+    zgix_path: []const u8 = "zig-out/bin/zgix",
 };
 
 /// The one header that turns a run into the Connection: close scenario.
@@ -173,18 +173,18 @@ pub fn main(init: std.process.Init) !u8 {
 
     // Before either proxy: both configs name these paths.
     try writeCertificates(arena, io);
-    var zoxy_child = try spawnZoxy(arena, io, flags.zoxy_path, origin_address);
-    var zoxy_running = true;
-    defer if (zoxy_running) zoxy_child.kill(io);
-    // The banner is the first thing zoxy prints, so a failed bind or a
+    var zgix_child = try spawnZgix(arena, io, flags.zgix_path, origin_address);
+    var zgix_running = true;
+    defer if (zgix_running) zgix_child.kill(io);
+    // The banner is the first thing zgix prints, so a failed bind or a
     // binary that does not speak §5 surfaces here, before any load runs.
-    const banner = try readBanner(io, &zoxy_child);
+    const banner = try readBanner(io, &zgix_child);
 
     var haproxy_child = try spawnHaproxy(arena, io, environ, origin_address);
     defer haproxy_child.kill(io);
 
     if (proxy_cpu) |cpu| {
-        affinity.pinChildTo(zoxy_child.id.?, cpu);
+        affinity.pinChildTo(zgix_child.id.?, cpu);
         affinity.pinChildTo(haproxy_child.id.?, cpu);
         std.debug.print("bench: proxy under test pinned to cpu {d}; origin + load off it\n", .{cpu});
     }
@@ -194,13 +194,13 @@ pub fn main(init: std.process.Init) !u8 {
     try saturate(arena, io, &flags, banner.head_buffers);
 
     const modes =
-        try runMeasuredWindow(arena, io, direct_port, &flags, zoxy_child.id, banner.total_kb);
+        try runMeasuredWindow(arena, io, direct_port, &flags, zgix_child.id, banner.total_kb);
 
-    // The §9 overload scenario runs against its own shrunken zoxy — the
+    // The §9 overload scenario runs against its own shrunken zgix — the
     // primary is idle during it, so its RSS window stays clean.
     const overload_ok = try runOverload(arena, io, &flags, origin_address, proxy_cpu);
 
-    const drained_cleanly = try drainChild(io, &zoxy_child, &zoxy_running, "zoxy");
+    const drained_cleanly = try drainChild(io, &zgix_child, &zgix_running, "zgix");
     const passed = benchPassed(&modes, banner.total_kb, &flags, drained_cleanly) and overload_ok;
     return if (passed) 0 else 1;
 }
@@ -216,21 +216,21 @@ const MeasuredModes = struct {
 
 /// Run the full band matrix for every scenario inside one RSS window,
 /// then print the bands beside the window's climb toward the §5 budget.
-/// Both modes on both zoxy protocols run inside the window, so the
+/// Both modes on both zgix protocols run inside the window, so the
 /// ceiling is held across reconnect-heavy close load too — not just
-/// steady keep-alive. The haproxy references share the window; zoxy is
+/// steady keep-alive. The haproxy references share the window; zgix is
 /// idle during them, so they cannot inflate its resident set.
 fn runMeasuredWindow(
     arena: std.mem.Allocator,
     io: Io,
     direct_port: u16,
     flags: *const Flags,
-    zoxy_pid: ?std.process.Child.Id,
+    zgix_pid: ?std.process.Child.Id,
     budget_kb: u64,
 ) !MeasuredModes {
     assert(direct_port != 0);
     assert(budget_kb > 0);
-    const rss_before_kb = try readRssKb(arena, io, zoxy_pid);
+    const rss_before_kb = try readRssKb(arena, io, zgix_pid);
     // A live proxy always has resident pages; a zero reading means the
     // RSS probe failed, not that the process shrank to nothing.
     assert(rss_before_kb > 0);
@@ -241,12 +241,12 @@ fn runMeasuredWindow(
     const keep_alive = try runMode(arena, io, direct_port, flags, .keep_alive);
     const close_mode = try runMode(arena, io, direct_port, flags, .close);
     const large_body = try runMode(arena, io, direct_port, flags, .large_body);
-    const rss_after_kb = try readRssKb(arena, io, zoxy_pid);
+    const rss_after_kb = try readRssKb(arena, io, zgix_pid);
 
     printMode("keep-alive", &keep_alive, .keep_alive);
     printMode("Connection: close", &close_mode, .close);
     printMode("large body", &large_body, .large_body);
-    std.debug.print("zoxy RSS: {d} KiB -> {d} KiB (budget {d} KiB)\n", .{
+    std.debug.print("zgix RSS: {d} KiB -> {d} KiB (budget {d} KiB)\n", .{
         rss_before_kb,
         rss_after_kb,
         budget_kb,
@@ -297,7 +297,7 @@ fn forwardStderr(io: Io, child: *const std.process.Child) void {
         const read = file_reader.interface.readSliceShort(&chunk) catch |err| {
             // Surfaced, not gated: the dump is band-review context, and a
             // torn pipe must not turn a finished run red — but it must
-            // say so, or a missing dump reads as a zoxy bug.
+            // say so, or a missing dump reads as a zgix bug.
             std.debug.print("bench: child stderr unreadable ({t})\n", .{err});
             return;
         };
@@ -311,7 +311,7 @@ fn forwardStderr(io: Io, child: *const std.process.Child) void {
     });
 }
 
-/// The §9 overload scenario: offered load ≫ capacity against a zoxy
+/// The §9 overload scenario: offered load ≫ capacity against a zgix
 /// whose pools are shrunk via the config `limits` block. Asserts the §8
 /// promise from the outside: flat memory, admitted work served (2xx),
 /// all excess shed with a correct status (5xx and accept-RSTs — the
@@ -327,13 +327,13 @@ fn runOverload(
 ) !bool {
     assert(flags.duration_s >= 1);
     assert(flags.rate >= 1);
-    var child = try spawnOverloadZoxy(arena, io, flags.zoxy_path, origin_address);
+    var child = try spawnOverloadZgix(arena, io, flags.zgix_path, origin_address);
     var running = true;
     defer if (running) child.kill(io);
     if (proxy_cpu) |cpu| {
         affinity.pinChildTo(child.id.?, cpu);
     }
-    _ = try awaitResponsive(arena, io, overload_http_port, "zoxy overload", false);
+    _ = try awaitResponsive(arena, io, overload_http_port, "zgix overload", false);
 
     // The same saturate-then-measure discipline as the primary (§9): the
     // shrunken pools are lazily resident too, and an overload burst is
@@ -349,15 +349,15 @@ fn runOverload(
     const rss_after_kb = try readRssKb(arena, io, child.id);
 
     std.debug.print("-- overload (offered >> capacity) --\n", .{});
-    printReport("zoxy overload", &report, .keep_alive);
-    std.debug.print("zoxy overload RSS: {d} KiB -> {d} KiB\n", .{ rss_before_kb, rss_after_kb });
+    printReport("zgix overload", &report, .keep_alive);
+    std.debug.print("zgix overload RSS: {d} KiB -> {d} KiB\n", .{ rss_before_kb, rss_after_kb });
 
     // The counters this row is read against — sheds and pressure
     // engagements — are cumulative, so the drain's own exit tally carries
     // them (`drainChild` forwards it to the run log). This used to send
     // SIGUSR1 first to get them *before* the drain; that signal stopped
     // printing anything in #310, and nothing was lost with it.
-    const drained_cleanly = try drainChild(io, &child, &running, "zoxy overload");
+    const drained_cleanly = try drainChild(io, &child, &running, "zgix overload");
     return overloadPassed(rss_before_kb, rss_after_kb, &report, drained_cleanly);
 }
 
@@ -371,7 +371,7 @@ fn runOverload(
 /// observed at whichever syscall the generator happened to be in when it
 /// landed. Measured (#82): with `timeouts` at zero the three are the
 /// whole of zrk's `socketErrors()`, and on the four runs that captured
-/// zoxy's counters alongside, that total landed within 0.1% of its
+/// zgix's counters alongside, that total landed within 0.1% of its
 /// `shed_conn_slots` — one socket error per connection the wall refused.
 /// How they divide is pure race: across six runs the connect share ranged
 /// 28–54%, write 43–71%, read 1.3–3.3%. The old gate exempted the connect share
@@ -394,12 +394,12 @@ fn overloadPassed(
     assert(rss_after_kb > 0);
     const counters = &report.snapshot.counters;
     // Flatness is sound here where the primary window's gate is a
-    // ceiling instead (`benchPassed`): this zoxy's *entire* pool budget
+    // ceiling instead (`benchPassed`): this zgix's *entire* pool budget
     // (~0.75 MiB at `overload_limits`) sits inside the tolerance, so
     // lazy fault-in can never trip it — only an allocation can.
     const rss_flat = rss_after_kb <= rss_before_kb + 1024;
     if (!rss_flat) {
-        std.debug.print("FAIL: overload zoxy RSS grew under overload\n", .{});
+        std.debug.print("FAIL: overload zgix RSS grew under overload\n", .{});
     }
     // Admitted work is served AND the excess is shed with a status: both
     // ends of the §8 promise, witnessed in one run.
@@ -429,24 +429,24 @@ fn overloadPassed(
     // work, not a fault — it belongs in the log, never in the verdict.
     const refused = counters.connect_errors + counters.write_errors + counters.read_errors;
     std.debug.print(
-        "zoxy overload refused {d} at the wall (connect {d}, write {d}, read {d}); {d} timed out\n",
+        "zgix overload refused {d} at the wall (connect {d}, write {d}, read {d}); {d} timed out\n",
         .{ refused, counters.connect_errors, counters.write_errors, counters.read_errors, stalls },
     );
     if (!drained_cleanly) {
-        std.debug.print("FAIL: overload zoxy did not drain cleanly\n", .{});
+        std.debug.print("FAIL: overload zgix did not drain cleanly\n", .{});
     }
     return rss_flat and served and shed_witnessed and stalls_ok and drained_cleanly;
 }
 
-/// A second zoxy with its pools shrunk through the config `limits`
+/// A second zgix with its pools shrunk through the config `limits`
 /// block (§5) — the §8 rungs become reachable at loopback-feasible load.
-fn spawnOverloadZoxy(
+fn spawnOverloadZgix(
     arena: std.mem.Allocator,
     io: Io,
-    zoxy_path: []const u8,
+    zgix_path: []const u8,
     origin_address: []const u8,
 ) !std.process.Child {
-    const config_path = work_directory ++ "/zoxy-overload.json";
+    const config_path = work_directory ++ "/zgix-overload.json";
     const config_json = try std.fmt.allocPrint(arena,
         \\{{
         \\    "listeners": [
@@ -477,17 +477,17 @@ fn spawnOverloadZoxy(
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = config_json });
 
     return std.process.spawn(io, .{
-        .argv = &.{ zoxy_path, config_path },
+        .argv = &.{ zgix_path, config_path },
         .stdout = .inherit,
         .stderr = .inherit,
     }) catch |err| {
-        std.debug.print("bench: could not spawn overload {s} ({t})\n", .{ zoxy_path, err });
+        std.debug.print("bench: could not spawn overload {s} ({t})\n", .{ zgix_path, err });
         return err;
     };
 }
 
 /// What the harness reads off the §5 banner, from the outside — no
-/// import of zoxy's constants, so the numbers gate what the binary
+/// import of zgix's constants, so the numbers gate what the binary
 /// *said*, not what the source says it should have.
 const Banner = struct {
     /// The closed-form memory total: the RSS ceiling `benchPassed` holds.
@@ -522,11 +522,11 @@ fn readBanner(io: Io, child: *const std.process.Child) !Banner {
         // sibling stops *at* it and would yield empty lines forever);
         // null is EOF — a child that died before finishing its banner.
         const maybe_line = reader.takeDelimiter('\n') catch |err| {
-            std.debug.print("bench: zoxy banner unreadable ({t})\n", .{err});
+            std.debug.print("bench: zgix banner unreadable ({t})\n", .{err});
             return error.BannerUnreadable;
         };
         const line = maybe_line orelse {
-            std.debug.print("bench: zoxy banner ended early\n", .{});
+            std.debug.print("bench: zgix banner ended early\n", .{});
             return error.BannerUnreadable;
         };
         std.debug.print("{s}\n", .{line});
@@ -567,7 +567,7 @@ fn leadingInteger(text: []const u8) !u64 {
 /// Drive RSS toward its §5 bound before the window opens (§9). The
 /// pools are lazily resident, so an unwarmed window would hold the
 /// ceiling trivially at a fraction of the budget: every scenario runs
-/// briefly at the measured connection count on both zoxy ports, and the
+/// briefly at the measured connection count on both zgix ports, and the
 /// keep-alive leg runs long enough to cycle the whole head ring (FIFO
 /// selection walks every buffer). This makes the ceiling gate
 /// non-vacuous; it cannot make *flatness* sound — small heads fault
@@ -583,7 +583,7 @@ fn saturate(arena: std.mem.Allocator, io: Io, flags: *const Flags, head_buffers:
     const ring_seconds: u64 = (3 * head_buffers) / flags.rate + 1;
     warm_flags.duration_s = @max(saturate_duration_s, ring_seconds);
     std.debug.print(
-        "bench: saturating warmup — {d}s keep-alive + {d}s close + {d}s large-body, every zoxy port\n",
+        "bench: saturating warmup — {d}s keep-alive + {d}s close + {d}s large-body, every zgix port\n",
         .{ warm_flags.duration_s, saturate_duration_s, saturate_duration_s },
     );
     // The terminating port is here for the ceiling gate's sake, not for
@@ -591,16 +591,16 @@ fn saturate(arena: std.mem.Allocator, io: Io, flags: *const Flags, head_buffers:
     // lazily-resident pools §5 prints, and a warmup that never handshakes
     // leaves them unfaulted — which would make the RSS ceiling pass by
     // measuring memory the run never touched.
-    const zoxy_ports = [_]struct { port: u16, tls: bool }{
-        .{ .port = zoxy_port, .tls = false },
-        .{ .port = zoxy_http_port, .tls = false },
-        .{ .port = zoxy_https_port, .tls = true },
+    const zgix_ports = [_]struct { port: u16, tls: bool }{
+        .{ .port = zgix_port, .tls = false },
+        .{ .port = zgix_http_port, .tls = false },
+        .{ .port = zgix_https_port, .tls = true },
     };
-    for (zoxy_ports) |target| {
+    for (zgix_ports) |target| {
         _ = try loadTest(arena, io, target.port, &warm_flags, .keep_alive, target.tls);
     }
     warm_flags.duration_s = saturate_duration_s;
-    for (zoxy_ports) |target| {
+    for (zgix_ports) |target| {
         _ = try loadTest(arena, io, target.port, &warm_flags, .close, target.tls);
         _ = try loadTest(arena, io, target.port, &warm_flags, .large_body, target.tls);
     }
@@ -612,11 +612,11 @@ fn saturate(arena: std.mem.Allocator, io: Io, flags: *const Flags, head_buffers:
 fn warmUp(arena: std.mem.Allocator, io: Io, direct_port: u16) !void {
     assert(direct_port != 0);
     _ = try awaitResponsive(arena, io, direct_port, "origin", false);
-    _ = try awaitResponsive(arena, io, zoxy_port, "zoxy L4", false);
-    _ = try awaitResponsive(arena, io, zoxy_http_port, "zoxy L7", false);
+    _ = try awaitResponsive(arena, io, zgix_port, "zgix L4", false);
+    _ = try awaitResponsive(arena, io, zgix_http_port, "zgix L7", false);
     _ = try awaitResponsive(arena, io, haproxy_port, "haproxy tcp", false);
     _ = try awaitResponsive(arena, io, haproxy_http_port, "haproxy http", false);
-    _ = try awaitResponsive(arena, io, zoxy_https_port, "zoxy L7 TLS", true);
+    _ = try awaitResponsive(arena, io, zgix_https_port, "zgix L7 TLS", true);
     _ = try awaitResponsive(arena, io, haproxy_https_port, "haproxy https", true);
 }
 
@@ -660,7 +660,7 @@ fn benchPassed(
     const rss_bounded = rss_after_kb <= budget_kb + rss_ceiling_slack_kb;
     if (!rss_bounded) {
         std.debug.print(
-            "FAIL: zoxy RSS {d} KiB exceeds the §5 budget {d} KiB + {d} KiB slack\n",
+            "FAIL: zgix RSS {d} KiB exceeds the §5 budget {d} KiB + {d} KiB slack\n",
             .{ rss_after_kb, budget_kb, rss_ceiling_slack_kb },
         );
     }
@@ -723,7 +723,7 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
             flags.duration_s = try std.fmt.parseUnsigned(u64, args[index], 10);
         } else if (std.mem.eql(u8, arg, "--origin")) {
             index += 1;
-            // zoxy's config resolves endpoints with parseLiteral (no DNS),
+            // zgix's config resolves endpoints with parseLiteral (no DNS),
             // so a hostname would make the spawned proxy exit at config
             // parse and surface here as a misleading "never answered".
             // Reject it up front, with the port the harness relies on.
@@ -736,13 +736,13 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
                 return error.InvalidOrigin;
             };
             flags.origin = args[index];
-        } else if (std.mem.eql(u8, arg, "--zoxy")) {
+        } else if (std.mem.eql(u8, arg, "--zgix")) {
             index += 1;
-            flags.zoxy_path = args[index];
+            flags.zgix_path = args[index];
         } else {
             std.debug.print(
                 "usage: bench [--rate N] [--close-rate N] [--connections N] " ++
-                    "[--seconds N] [--origin host:port] [--zoxy path]\n",
+                    "[--seconds N] [--origin host:port] [--zgix path]\n",
                 .{},
             );
             return error.InvalidArguments;
@@ -786,7 +786,7 @@ fn spawnNginx(arena: std.mem.Allocator, io: Io, environ: std.process.Environ) !s
         \\    access_log off;
         \\    server {{
         \\        listen 127.0.0.1:{d};
-        \\        location / {{ return 200 "zoxy-bench-origin\n"; }}
+        \\        location / {{ return 200 "zgix-bench-origin\n"; }}
         \\        location = {s} {{ default_type application/octet-stream; alias {s}; }}
         \\    }}
         \\}}
@@ -809,13 +809,13 @@ fn spawnNginx(arena: std.mem.Allocator, io: Io, environ: std.process.Environ) !s
     };
 }
 
-fn spawnZoxy(
+fn spawnZgix(
     arena: std.mem.Allocator,
     io: Io,
-    zoxy_path: []const u8,
+    zgix_path: []const u8,
     origin_address: []const u8,
 ) !std.process.Child {
-    const config_path = work_directory ++ "/zoxy.json";
+    const config_path = work_directory ++ "/zgix.json";
     // Both protocols on one process (§6, §7): the L4 relay and the L7
     // reverse proxy serve the same origin, so one run bands both paths.
     // idle_ms stays below nginx's default 75 s keepalive_timeout so
@@ -840,9 +840,9 @@ fn spawnZoxy(
         \\}}
         \\
     , .{
-        zoxy_port,
-        zoxy_http_port,
-        zoxy_https_port,
+        zgix_port,
+        zgix_http_port,
+        zgix_https_port,
         work_directory ++ "/cert.pem",
         work_directory ++ "/key.pem",
         origin_address,
@@ -850,18 +850,18 @@ fn spawnZoxy(
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = config_json });
 
     // stderr is piped so `readBanner` can gate on the §5 total (the
-    // banner is diagnostics, and zoxy keeps stdout for the access log's
+    // banner is diagnostics, and zgix keeps stdout for the access log's
     // `stdout` sink). Between the banner and the drain nothing else
     // lands there, and the drain-time counter dump — a few KiB against a
     // 64 KiB pipe — is forwarded into the run log by `drainChild`, so
     // the band review keeps it and the pipe can never fill.
     return std.process.spawn(io, .{
-        .argv = &.{ zoxy_path, config_path },
+        .argv = &.{ zgix_path, config_path },
         .stdout = .inherit,
         .stderr = .pipe,
     }) catch |err| {
         std.debug.print("bench: could not spawn {s} ({t}); run `zig build` first\n", .{
-            zoxy_path,
+            zgix_path,
             err,
         });
         return err;
@@ -872,7 +872,7 @@ fn spawnZoxy(
 /// job on the production path: turn "the harness was pointed at the wrong
 /// file" into a named error rather than an arena the size of whatever was
 /// on disk. Spelled rather than imported — the bench is its own module
-/// and does not link the `zoxy` one.
+/// and does not link the `zgix` one.
 const pem_bytes_max: usize = 64 * 1024;
 
 /// Read one of the throwaway self-signed fixtures the TLS gates use
@@ -880,7 +880,7 @@ const pem_bytes_max: usize = 64 * 1024;
 ///
 /// From the tree rather than embedded: the bench is its own module, so
 /// `@embedFile` cannot reach across the package boundary, and the harness
-/// already assumes a repo-root cwd (`zig-out/bin/zoxy`, `.zig-cache/…`).
+/// already assumes a repo-root cwd (`zig-out/bin/zgix`, `.zig-cache/…`).
 /// Benchmarking the same certificate the tests use keeps the bands honest
 /// about what they measure.
 ///
@@ -901,7 +901,7 @@ fn readFixture(arena: std.mem.Allocator, io: Io, path: []const u8) ![]u8 {
     return bytes;
 }
 
-/// zoxy reads cert and key as separate files; haproxy wants them
+/// zgix reads cert and key as separate files; haproxy wants them
 /// concatenated into one. Written once, before either proxy starts —
 /// both configs name these paths, so a missing file has to fail here,
 /// where the error can say which source it came from, rather than as a
@@ -920,10 +920,10 @@ fn writeCertificates(arena: std.mem.Allocator, io: Io) !void {
 }
 
 /// haproxy is the state-of-the-art reference band, not a gate: same
-/// origin, same load, `mode tcp` to match zoxy's L4 relay and
-/// `nbthread 1` to match zoxy's single event-loop thread. Timeouts mirror
-/// the generated zoxy config so neither proxy wins by timing out earlier.
-/// Its `bench_https` listen terminates the same fixture certificate zoxy
+/// origin, same load, `mode tcp` to match zgix's L4 relay and
+/// `nbthread 1` to match zgix's single event-loop thread. Timeouts mirror
+/// the generated zgix config so neither proxy wins by timing out earlier.
+/// Its `bench_https` listen terminates the same fixture certificate zgix
 /// does, so the added pair isolates termination cost rather than
 /// comparing two different certificates.
 fn spawnHaproxy(
@@ -1078,7 +1078,7 @@ fn loadTest(
     return report;
 }
 
-/// The five bands of one persistence mode: the direct baseline, zoxy's
+/// The five bands of one persistence mode: the direct baseline, zgix's
 /// two protocols, and the haproxy references.
 /// One scenario's bands. Every field is a path the same offered load ran
 /// against, and `bandsHealthy` reflects over them — so a path added here is
@@ -1105,9 +1105,9 @@ fn runMode(
     assert(direct_port != 0);
     return .{
         .direct = try loadTest(arena, io, direct_port, flags, scenario, false),
-        .l4 = try loadTest(arena, io, zoxy_port, flags, scenario, false),
-        .l7 = try loadTest(arena, io, zoxy_http_port, flags, scenario, false),
-        .l7_tls = try loadTest(arena, io, zoxy_https_port, flags, scenario, true),
+        .l4 = try loadTest(arena, io, zgix_port, flags, scenario, false),
+        .l7 = try loadTest(arena, io, zgix_http_port, flags, scenario, false),
+        .l7_tls = try loadTest(arena, io, zgix_https_port, flags, scenario, true),
         .tcp = try loadTest(arena, io, haproxy_port, flags, scenario, false),
         .http = try loadTest(arena, io, haproxy_http_port, flags, scenario, false),
         .https = try loadTest(arena, io, haproxy_https_port, flags, scenario, true),
@@ -1205,7 +1205,7 @@ fn printOverhead(
     const tcp_p50 = reference_tcp.snapshot.hist.valueAtPercentile(50.0);
     const http_p50 = reference_http.snapshot.hist.valueAtPercentile(50.0);
     std.debug.print(
-        "hop overhead p50: zoxy L4 +{d} us, zoxy L7 +{d} us, " ++
+        "hop overhead p50: zgix L4 +{d} us, zgix L7 +{d} us, " ++
             "haproxy tcp +{d} us, haproxy http +{d} us " ++
             "(bands, not single numbers — §9)\n",
         .{
@@ -1226,9 +1226,9 @@ fn printMode(label: []const u8, runs: *const Runs, scenario: Scenario) void {
         std.debug.print("-- {s} --\n", .{label});
     }
     printReport("direct       ", &runs.direct, scenario);
-    printReport("zoxy L4      ", &runs.l4, scenario);
-    printReport("zoxy L7      ", &runs.l7, scenario);
-    printReport("zoxy L7 TLS  ", &runs.l7_tls, scenario);
+    printReport("zgix L4      ", &runs.l4, scenario);
+    printReport("zgix L7      ", &runs.l7, scenario);
+    printReport("zgix L7 TLS  ", &runs.l7_tls, scenario);
     printReport("haproxy tcp  ", &runs.tcp, scenario);
     printReport("haproxy http ", &runs.http, scenario);
     printReport("haproxy https", &runs.https, scenario);
@@ -1259,12 +1259,12 @@ fn rateHeld(
     return false;
 }
 
-/// The §9 hard invariant on the proxied bands: both zoxy protocols
+/// The §9 hard invariant on the proxied bands: both zgix protocols
 /// complete requests and keep their socket-error rate (relay stalls, not
 /// faithfully relayed 4xx/5xx) under 1%.
 fn proxiesHealthy(mode: []const u8, runs: *const Runs) bool {
     assert(mode.len > 0);
-    // Every zoxy path, TLS included: a terminated band that relays
+    // Every zgix path, TLS included: a terminated band that relays
     // garbage or stalls has to fail here rather than be read off the
     // rate line as merely slow.
     return proxyHealthy(mode, "L4", &runs.l4) and
@@ -1281,13 +1281,13 @@ fn proxyHealthy(mode: []const u8, path: []const u8, report: *const zrk.runner.Re
     assert(path.len > 0);
     const counters = &report.snapshot.counters;
     if (counters.completed == 0) {
-        std.debug.print("FAIL: zoxy {s} {s} completed zero requests\n", .{ path, mode });
+        std.debug.print("FAIL: zgix {s} {s} completed zero requests\n", .{ path, mode });
         return false;
     }
     const socket_errors = counters.socketErrors();
     if (socket_errors * 100 > counters.completed) {
         std.debug.print(
-            "FAIL: zoxy {s} {s} socket-error rate too high ({d} of {d} completed)\n",
+            "FAIL: zgix {s} {s} socket-error rate too high ({d} of {d} completed)\n",
             .{ path, mode, socket_errors, counters.completed },
         );
         return false;

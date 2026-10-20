@@ -815,7 +815,7 @@ test "filter: firstVerdict matches on method, host, path, header" {
 test "filter: an all-any match is unconditional; edit-only rules never reject" {
     const rules = [_]Rule{
         .{ .match = .{}, .actions = &.{
-            .{ .header_set = .{ .name = "X-Via", .value = "zoxy" } },
+            .{ .header_set = .{ .name = "X-Via", .value = "zgix" } },
         } },
         .{ .match = .{ .path_prefix = "/blocked" }, .actions = &.{.{ .reject = 404 }} },
     };
@@ -842,7 +842,7 @@ test "filter: a redirect is a terminal verdict, first one wins" {
     const rules = [_]Rule{
         // An edit-only rule matches first and must not terminate.
         .{ .match = .{}, .actions = &.{
-            .{ .header_set = .{ .name = "X-Via", .value = "zoxy" } },
+            .{ .header_set = .{ .name = "X-Via", .value = "zgix" } },
         } },
         .{ .match = .{ .host = "www.example" }, .actions = &.{
             .{ .redirect = .{ .status = 301, .target = .{ .composed = .{
@@ -888,7 +888,7 @@ test "filter: collectForward gathers matching rules' edits in order" {
     const rules = [_]Rule{
         // Applies to every request: stamp a via header, drop cookies.
         .{ .match = .{}, .actions = &.{
-            .{ .header_set = .{ .name = "X-Via", .value = "zoxy" } },
+            .{ .header_set = .{ .name = "X-Via", .value = "zgix" } },
             .{ .header_remove = "Cookie" },
         } },
         // Applies only under /api: add a second via, and a reject that

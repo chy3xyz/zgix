@@ -51,9 +51,9 @@ const H3Modules = struct {
 /// Seam invariant, as of upstream TLS: the h3 modules may import zssl —
 /// the h3 proxy reaches the process's own upstream TLS client engine
 /// (`src/tls/UpstreamTls.zig`, file-relatively) so a cluster's `tls` block
-/// means one thing on both protocols, and each consumer module (`zoxy`,
+/// means one thing on both protocols, and each consumer module (`zgix`,
 /// `h3-check`, `h3-serve`) declares the zssl import itself. What the seam
-/// must still not import is everything else zoxy-side that drags the
+/// must still not import is everything else zgix-side that drags the
 /// serving path: hparse, the counters/access-log modules, config, Server.
 fn createH3Modules(
     b: *std.Build,
@@ -92,7 +92,7 @@ fn createH3Modules(
     });
 
     // zquic's QUIC/HTTP-3 core plus its zcrypto dependency. It is linked
-    // into the binary only because `zoxy.http.h3` is reachable from
+    // into the binary only because `zgix.http.h3` is reachable from
     // `main`; the library's other serving paths never import it.
     const zcrypto_options = b.addOptions();
     zcrypto_options.addOption([]const u8, "version", "1.0.7");
@@ -153,11 +153,11 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // The version string is single-sourced from build.zig.zon and handed to
-    // the binary through a build-options module, so `zoxy --version` and the
+    // the binary through a build-options module, so `zgix --version` and the
     // package metadata can never drift apart.
-    const zoxy_version = @import("build.zig.zon").version;
+    const zgix_version = @import("build.zig.zon").version;
     const build_options = b.addOptions();
-    build_options.addOption([]const u8, "version", zoxy_version);
+    build_options.addOption([]const u8, "version", zgix_version);
     build_options.addOption([]const u8, "build_id", resolveBuildId(b));
 
     // Which libxev backend `XevIo` builds against, for reproducing
@@ -166,7 +166,7 @@ pub fn build(b: *std.Build) void {
     // Linux picks io_uring and macOS picks kqueue, and those are two
     // different models: io_uring *completes* operations, kqueue reports
     // *readiness* and the backend performs a synchronous syscall. Every
-    // assumption zoxy makes about when an op is delivered is therefore
+    // assumption zgix makes about when an op is delivered is therefore
     // exercised on one model per platform — and the defects that live in
     // the other one surface only on a shared macOS runner, twice in
     // thirteen runs, with no way to reproduce them locally.
@@ -198,7 +198,7 @@ pub fn build(b: *std.Build) void {
     ) orelse false;
 
     // libxev is vendored under deps/libxev at the zoxy-io fork's
-    // zoxy-ring-flags branch: the audited upstream snapshot plus the
+    // zgix-ring-flags branch: the audited upstream snapshot plus the
     // setup-flags commit (DESIGN.md §4); see build.zig.zon. The pin moves
     // only after re-audit.
     const xev_dependency = b.dependency("libxev", .{
@@ -303,7 +303,7 @@ pub fn build(b: *std.Build) void {
     const qpack_module = h3.qpack;
     const zquic_module = h3.zquic;
 
-    const zoxy_module = b.addModule("zoxy", .{
+    const zgix_module = b.addModule("zgix", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -312,7 +312,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "hparse", .module = hparse_module },
             .{ .name = "zssl", .module = zssl_module },
             .{ .name = "zhttp-h2", .module = zhttp_h2_module },
-            // HTTP/3 is reachable as `zoxy.http.h3`; the imports are
+            // HTTP/3 is reachable as `zgix.http.h3`; the imports are
             // declared here so an application can opt into it without a
             // second copy of these files. Zig analyzes the h3 seam only
             // when a build references that declaration.
@@ -321,26 +321,26 @@ pub fn build(b: *std.Build) void {
             .{ .name = "qpack", .module = qpack_module },
         },
     });
-    linkLibcrypto(zoxy_module, libcrypto);
+    linkLibcrypto(zgix_module, libcrypto);
     // The h3 seam's QUIC-TLS bridge calls libssl; attached to the module
-    // so any consumer that reaches `zoxy.http.h3` links it.
-    zoxy_module.linkLibrary(libssl);
+    // so any consumer that reaches `zgix.http.h3` links it.
+    zgix_module.linkLibrary(libssl);
     // `src/io/XevIo.zig` reads the backend choice from here.
-    zoxy_module.addOptions("io_options", io_options);
+    zgix_module.addOptions("io_options", io_options);
     // The shipped example config is embedded so tests and the fuzz corpus
     // stay in sync with the file users actually copy.
-    zoxy_module.addAnonymousImport("example_config", .{
+    zgix_module.addAnonymousImport("example_config", .{
         .root_source_file = b.path("config/example.json"),
     });
 
     const exe = b.addExecutable(.{
-        .name = "zoxy",
+        .name = "zgix",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zoxy", .module = zoxy_module },
+                .{ .name = "zgix", .module = zgix_module },
             },
         }),
         // A release binary is handed to strangers, so it needs nothing on
@@ -351,28 +351,28 @@ pub fn build(b: *std.Build) void {
         .linkage = if (static_link) .static else null,
     });
     // src/main.zig reads its version from this module (also added to the
-    // ReleaseSafe `release_zoxy` below, the other build of that same source).
+    // ReleaseSafe `release_zgix` below, the other build of that same source).
     exe.root_module.addOptions("build_options", build_options);
     b.installArtifact(exe);
 
     const run_command = b.addRunArtifact(exe);
     run_command.step.dependOn(b.getInstallStep());
     run_command.addPassthruArgs();
-    const run_step = b.step("run", "Run zoxy");
+    const run_step = b.step("run", "Run zgix");
     run_step.dependOn(&run_command.step);
 
     // The four test gates of DESIGN.md §9 exist as steps from the first
     // commit; a step whose harness has not landed yet is inert and says so
     // in its description. A feature without its gate is not done.
     const lint_exe = b.addExecutable(.{
-        .name = "zoxy-lint",
+        .name = "zgix-lint",
         .root_module = b.createModule(.{
             .root_source_file = b.path("scripts/lint.zig"),
             .target = b.graph.host,
         }),
     });
 
-    const module_tests = b.addRunArtifact(b.addTest(.{ .root_module = zoxy_module }));
+    const module_tests = b.addRunArtifact(b.addTest(.{ .root_module = zgix_module }));
     const exe_tests = b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module }));
     const lint_tests = b.addRunArtifact(b.addTest(.{ .root_module = lint_exe.root_module }));
     const test_step = b.step("test", "Run unit tests (--fuzz adds the fuzz gate)");
@@ -466,13 +466,13 @@ pub fn build(b: *std.Build) void {
     tls_heap_proof_step.dependOn(&tls_heap_proof_tests.step);
 
     const sim_exe = b.addExecutable(.{
-        .name = "zoxy-sim",
+        .name = "zgix-sim",
         .root_module = b.createModule(.{
             .root_source_file = b.path("sim/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zoxy", .module = zoxy_module },
+                .{ .name = "zgix", .module = zgix_module },
             },
         }),
     });
@@ -488,13 +488,13 @@ pub fn build(b: *std.Build) void {
     // `ci`: the emitter's own tests run under `test`; the file itself is a
     // release-only artifact, so nothing here needs to gate every change.
     const schema_exe = b.addExecutable(.{
-        .name = "zoxy-schema",
+        .name = "zgix-schema",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/schema.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zoxy", .module = zoxy_module },
+                .{ .name = "zgix", .module = zgix_module },
             },
         }),
     });
@@ -517,7 +517,7 @@ pub fn build(b: *std.Build) void {
     // and the load generator both live inside the harness (smoke/), so the
     // step needs nothing from the dev shell.
     const smoke_exe = b.addExecutable(.{
-        .name = "zoxy-smoke",
+        .name = "zgix-smoke",
         .root_module = b.createModule(.{
             .root_source_file = b.path("smoke/main.zig"),
             .target = target,
@@ -537,7 +537,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/tls/testdata/key.pem"),
     });
     const smoke_run = b.addRunArtifact(smoke_exe);
-    smoke_run.addArg("--zoxy");
+    smoke_run.addArg("--zgix");
     smoke_run.addArtifactArg(exe);
     smoke_run.addPassthruArgs();
     const smoke_step = b.step("smoke", "Tier-0.5 live gate: the real binary against a live origin");
@@ -546,7 +546,7 @@ pub fn build(b: *std.Build) void {
     // §9 Tier 1: the loopback band harness embeds zrk (vendored under
     // deps/zrk) as
     // its load generator — that role stays ReleaseFast regardless of what
-    // zoxy itself ships as; it isn't the thing under test, it just needs
+    // zgix itself ships as; it isn't the thing under test, it just needs
     // to generate load fast enough not to be the bottleneck.
     const zrk_dependency = b.dependency("zrk", .{
         .target = target,
@@ -559,11 +559,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = std.builtin.OptimizeMode.fast,
     });
-    // The zoxy under test is ReleaseSafe — matching the shipped binary
+    // The zgix under test is ReleaseSafe — matching the shipped binary
     // (release.yml) — whatever -Doptimize says for the default install.
     // ReleaseSafe still selects the LLVM backend (Zig 0.17's default for
     // every release mode, not just ReleaseFast), so hparse's SIMD paths
-    // are emitted; only a Debug/self-hosted zoxy scalarizes them and
+    // are emitted; only a Debug/self-hosted zgix scalarizes them and
     // would benchmark the wrong code. hparse_fast_dependency keeps its
     // name (distinguishing it from the module-tests' Debug hparse) even
     // though it's no longer the *fastest* build mode.
@@ -589,7 +589,7 @@ pub fn build(b: *std.Build) void {
     // together by the OpenSSL package.
     const libssl_fast = openssl_fast_dependency.artifact("ssl");
     const h3_fast = createH3Modules(b, target, .safe, zhttp_h2_fast_module, libssl_fast);
-    const zoxy_fast_module = b.createModule(.{
+    const zgix_fast_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = .safe,
@@ -603,24 +603,24 @@ pub fn build(b: *std.Build) void {
             .{ .name = "qpack", .module = h3_fast.qpack },
         },
     });
-    linkLibcrypto(zoxy_fast_module, libcrypto_fast);
-    zoxy_fast_module.linkLibrary(libssl_fast);
+    linkLibcrypto(zgix_fast_module, libcrypto_fast);
+    zgix_fast_module.linkLibrary(libssl_fast);
     // The ReleaseSafe twin of the library module needs the same backend
     // choice: it is the same `src/root.zig`, so `XevIo` asks it the same
     // question.
-    zoxy_fast_module.addOptions("io_options", io_options);
-    const release_zoxy = b.addExecutable(.{
-        .name = "zoxy-release",
+    zgix_fast_module.addOptions("io_options", io_options);
+    const release_zgix = b.addExecutable(.{
+        .name = "zgix-release",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = .safe,
             .imports = &.{
-                .{ .name = "zoxy", .module = zoxy_fast_module },
+                .{ .name = "zgix", .module = zgix_fast_module },
             },
         }),
     });
-    release_zoxy.root_module.addOptions("build_options", build_options);
+    release_zgix.root_module.addOptions("build_options", build_options);
 
     // The same Tier-0.5 harness against the ReleaseSafe twin: the gate #283
     // needed and did not have. `smoke` above drives the *default* build,
@@ -635,11 +635,11 @@ pub fn build(b: *std.Build) void {
     //
     // Ordered after the Debug leg rather than beside it: both harness runs
     // are the same program and it keeps its work directory at a fixed path
-    // (`.zig-cache/zoxy-smoke`), so left free to run in parallel they would
+    // (`.zig-cache/zgix-smoke`), so left free to run in parallel they would
     // write each other's config and logs.
     const smoke_release_run = b.addRunArtifact(smoke_exe);
-    smoke_release_run.addArg("--zoxy");
-    smoke_release_run.addArtifactArg(release_zoxy);
+    smoke_release_run.addArg("--zgix");
+    smoke_release_run.addArtifactArg(release_zgix);
     smoke_release_run.addPassthruArgs();
     smoke_release_run.step.dependOn(&smoke_run.step);
     const smoke_release_step = b.step(
@@ -648,10 +648,10 @@ pub fn build(b: *std.Build) void {
     );
     smoke_release_step.dependOn(&smoke_release_run.step);
 
-    // The harness itself (drives zrk against release_zoxy over the wire)
+    // The harness itself (drives zrk against release_zgix over the wire)
     // stays ReleaseFast for the same reason zrk/zio do above.
     const bench_exe = b.addExecutable(.{
-        .name = "zoxy-bench",
+        .name = "zgix-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("bench/run.zig"),
             .target = target,
@@ -663,11 +663,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const bench_run = b.addRunArtifact(bench_exe);
-    // Drive the ReleaseSafe zoxy, not the default-optimize install
-    // artifact — a Debug zoxy scalarizes hparse and benchmarks the wrong
-    // binary (§9). bench/run.zig takes it via --zoxy.
-    bench_run.addArg("--zoxy");
-    bench_run.addArtifactArg(release_zoxy);
+    // Drive the ReleaseSafe zgix, not the default-optimize install
+    // artifact — a Debug zgix scalarizes hparse and benchmarks the wrong
+    // binary (§9). bench/run.zig takes it via --zgix.
+    bench_run.addArg("--zgix");
+    bench_run.addArtifactArg(release_zgix);
     bench_run.addPassthruArgs();
     const bench_step = b.step(
         "bench",
@@ -677,7 +677,7 @@ pub fn build(b: *std.Build) void {
 
     // §9 Tier 0: micro binaries for manual poop A/B; installed, never run
     // in CI (counter deltas on shared runners are noise). They reuse the
-    // ReleaseSafe `zoxy_fast_module` defined above so what gets measured
+    // ReleaseSafe `zgix_fast_module` defined above so what gets measured
     // (SIMD parser included) matches the shipped binary, checks and all.
     const micro_step = b.step("bench-micro", "Build Tier-0 micro binaries for poop A/B");
     for ([_][]const u8{ "pool_acquire_release", "relay_chunking", "l7_head_pipeline", "conn_touch_scaling" }) |micro_name| {
@@ -685,29 +685,29 @@ pub fn build(b: *std.Build) void {
         // target's measurement; it has no macOS build.
         if (std.mem.eql(u8, micro_name, "conn_touch_scaling") and target.result.os.tag != .linux) continue;
         const micro_exe = b.addExecutable(.{
-            .name = b.fmt("zoxy-bench-{s}", .{micro_name}),
+            .name = b.fmt("zgix-bench-{s}", .{micro_name}),
             .root_module = b.createModule(.{
                 .root_source_file = b.path(b.fmt("bench/micro/{s}.zig", .{micro_name})),
                 .target = target,
                 .optimize = .safe,
                 .imports = &.{
-                    .{ .name = "zoxy", .module = zoxy_fast_module },
+                    .{ .name = "zgix", .module = zgix_fast_module },
                 },
             }),
         });
         micro_step.dependOn(&b.addInstallArtifact(micro_exe, .{}).step);
     }
 
-    // §9 Tier 0: pinned perf + flamegraph of zoxy under load. The zoxy
+    // §9 Tier 0: pinned perf + flamegraph of zgix under load. The zgix
     // under test is ReleaseSafe (shipped-binary fidelity); the harness
-    // (bench/profile.zig) — which spawns nginx + zoxy, pins zoxy to one
+    // (bench/profile.zig) — which spawns nginx + zgix, pins zgix to one
     // core so the PMU and LBR call-graph stay on a single core type,
     // drives zrk load, and folds perf into a flamegraph — stays
     // ReleaseFast, same reasoning as bench_exe above. Linux-only —
     // perf/flamegraph/nginx live in the dev shell. Tooling in Zig, not
     // bash (TIGER_STYLE §Tooling).
     const profile_harness = b.addExecutable(.{
-        .name = "zoxy-profile-harness",
+        .name = "zgix-profile-harness",
         .root_module = b.createModule(.{
             .root_source_file = b.path("bench/profile.zig"),
             .target = target,
@@ -716,19 +716,19 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zrk", .module = zrk_dependency.module("zrk") },
                 .{ .name = "zio", .module = zio_dependency.module("zio") },
                 // For `constants` alone: the harness sizes the conn-slot
-                // limit it writes into zoxy's config against the compiled
+                // limit it writes into zgix's config against the compiled
                 // ceiling. Duplicating that number here would track a
                 // *lowered* ceiling loudly (the config is rejected at
                 // startup) but a *raised* one silently — a profile aimed at
                 // the new maximum would cap below it and say nothing.
                 //
                 // `src/constants.zig` directly rather than the whole
-                // `zoxy` module, which imports zssl. Two reasons, and the
+                // `zgix` module, which imports zssl. Two reasons, and the
                 // second is newer than the first.
                 //
                 // One: this executable also imports zrk, and the two
                 // instantiations differ in optimize mode — ReleaseSafe for
-                // the zoxy under test, ReleaseFast for the load generator.
+                // the zgix under test, ReleaseFast for the load generator.
                 // Where both sides reach one TLS package, Zig treats that
                 // as two modules rooted at one file and refuses to
                 // compile:
@@ -750,7 +750,7 @@ pub fn build(b: *std.Build) void {
                 // possible to hit once libcrypto stopped being one
                 // system-wide shared object and became a per-configuration
                 // artifact (#279).
-                .{ .name = "zoxy_constants", .module = b.createModule(.{
+                .{ .name = "zgix_constants", .module = b.createModule(.{
                     .root_source_file = b.path("src/constants.zig"),
                     .target = target,
                     .optimize = .fast,
@@ -759,11 +759,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const profile_run = b.addRunArtifact(profile_harness);
-    profile_run.addArtifactArg(release_zoxy);
+    profile_run.addArtifactArg(release_zgix);
     profile_run.addPassthruArgs();
     const profile_step = b.step(
         "profile",
-        "Pinned perf + flamegraph of zoxy under load (Linux; needs the dev shell)",
+        "Pinned perf + flamegraph of zgix under load (Linux; needs the dev shell)",
     );
     profile_step.dependOn(&profile_run.step);
 
@@ -797,7 +797,7 @@ pub fn build(b: *std.Build) void {
     // acceptance test — kqueue's failure modes only surface at runtime.
     ci_step.dependOn(smoke_step);
     // And once more against the configuration that ships. This list ran
-    // green on the change that gave zoxy a Zig-built libcrypto (#279) and
+    // green on the change that gave zgix a Zig-built libcrypto (#279) and
     // on every change after it, while the release those changes produced
     // had no working TLS at all (#283) — because every gate above builds
     // at `-Doptimize`'s default and the artifact does not.
@@ -826,7 +826,7 @@ pub fn build(b: *std.Build) void {
     // could not resolve.
     const cov_tests = b.addTest(.{
         .name = "coverage-tests",
-        .root_module = zoxy_module,
+        .root_module = zgix_module,
         .use_llvm = true,
     });
     const cov_sim = b.addExecutable(.{
@@ -837,7 +837,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zoxy", .module = zoxy_module },
+                .{ .name = "zgix", .module = zgix_module },
             },
         }),
     });
@@ -897,8 +897,8 @@ pub fn build(b: *std.Build) void {
 /// Which build this binary is, beyond its release version.
 ///
 /// A release binary's version already names one commit — the tag points at
-/// exactly one — so this is empty there and `zoxy --version` stays the bare
-/// `zoxy 0.0.7`. What it exists for is every *other* build: one made from
+/// exactly one — so this is empty there and `zgix --version` stays the bare
+/// `zgix 0.0.7`. What it exists for is every *other* build: one made from
 /// `main` five commits later reports the same version string as the release
 /// unless something says otherwise, which turns a bug report's "0.0.7" into
 /// a claim that is not true. `git describe` answers exactly that question —
@@ -949,7 +949,7 @@ fn resolveBuildId(b: *std.Build) []const u8 {
 /// pkg-config deciding which libcrypto that meant, which cost twice over.
 /// A *release* binary handed to strangers must not want a musl-ABI
 /// `libcrypto.so.3` at runtime — that shipped unnoticed the moment TLS
-/// termination (#125) gave zoxy a C dependency. And pkg-config answers only
+/// termination (#125) gave zgix a C dependency. And pkg-config answers only
 /// for the host, so every other target failed to link, which is why
 /// release.yml builds natively on one runner per target and why
 /// x86_64-macos has been absent since 0.2.0.

@@ -35,7 +35,7 @@ const fixture_cert_pem = @embedFile("tls/testdata/cert.pem");
 const fixture_key_pem = @embedFile("tls/testdata/key.pem");
 /// The fixture certificate's SAN. A client that offered any other name
 /// would fail verification for a reason unrelated to what is under test.
-const fixture_host_name = "spike.zoxy.test";
+const fixture_host_name = "spike.zgix.test";
 const TlsClient = @import("tls/TestClient.zig").TestClient(SimIo);
 
 /// Winds a TLS scenario down once every client is done: drains the
@@ -1665,7 +1665,7 @@ test "proxy protocol send: the origin hears who connected, and only the payload 
             try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l4_proxy_header_sent"));
             try std.testing.expectEqual(@as(u32, 1), bed.scenario.origin.proxy_header_conns);
             try std.testing.expectEqual(@as(u32, 0), bed.scenario.origin.proxy_header_violations);
-            // The announced client is the peer zoxy observed: SimIo's
+            // The announced client is the peer zgix observed: SimIo's
             // synthetic dialer address.
             const observed: std.Io.net.IpAddress =
                 .{ .ip4 = .{ .bytes = .{ 198, 51, 100, 1 }, .port = 50_000 } };
@@ -1678,7 +1678,7 @@ test "proxy protocol send: the origin hears who connected, and only the payload 
 test "proxy protocol: the received identity is the sent identity — the chain holds" {
     // Both halves of #142 on one connection: the client announces
     // 203.0.113.7:4711 through the require listener, and the sending
-    // cluster's origin must hear exactly that — zoxy in the middle of a
+    // cluster's origin must hear exactly that — zgix in the middle of a
     // PROXY protocol chain, believing inward and announcing outward.
     var bed: TestBed = undefined;
     try bed.setUp(std.testing.allocator, .{

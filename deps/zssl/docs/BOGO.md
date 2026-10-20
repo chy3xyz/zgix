@@ -287,7 +287,7 @@ name.
    `checkEncryptedExtensions` looked at ALPN and skipped everything
    else, so a server could hand our client any extension it liked and we
    took it. §4.2 makes that `unsupported_extension`, and it is the half
-   of the library zoxy uses to originate.
+   of the library zgix uses to originate.
 
    The fix is an allow-list rather than a deny-list: of everything zssl
    offers, only `server_name`, `supported_groups` and ALPN are legal in
@@ -1270,6 +1270,6 @@ The ztls differential stays out, deliberately. A differential against
 ztls proves we agree with one other implementation that shares our
 *assumptions*; BoGo proves we refuse what the protocol says to refuse,
 which is the question a proxy's TLS terminator actually gets asked by the
-internet. The differential belongs with zoxy's engine swap anyway — that
+internet. The differential belongs with zgix's engine swap anyway — that
 is where the two run side by side and disagreement is diagnosable against
 a live proxy.

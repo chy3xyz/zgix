@@ -8,7 +8,7 @@
 //! `ServerHandshake` and `ClientHandshake` are the entry points, and
 //! README.md shows what driving them looks like. Scope and design live
 //! in docs/DESIGN.md; the style contract is docs/TIGER_STYLE.md
-//! (zoxy's, adopted verbatim).
+//! (zgix's, adopted verbatim).
 
 pub const ClientHandshake = @import("ClientHandshake.zig");
 pub const Credentials = @import("Credentials.zig");
@@ -37,7 +37,7 @@ pub const transcript = @import("transcript.zig");
 pub const wire = @import("wire.zig");
 
 /// The libcrypto boundary, exported for embedders that need the raw
-/// primitives (zoxy's spike tests do); everything above it is pure Zig.
+/// primitives (zgix's spike tests do); everything above it is pure Zig.
 pub const backend = @import("crypto/backend_openssl.zig");
 
 test {

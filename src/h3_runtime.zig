@@ -1,6 +1,6 @@
 //! Application-side wiring for the experimental HTTP/3 listeners.
 //!
-//! The library module exports the h3 stack as `zoxy.http.h3`; this file is
+//! The library module exports the h3 stack as `zgix.http.h3`; this file is
 //! what turns a resolved `config.h3_listeners` entry into a bound UDP
 //! listener plus its buffered plaintext origin proxy. It lives beside
 //! `main` rather than in `Server` because the QUIC path uses its own
@@ -35,14 +35,14 @@ const std = @import("std");
 
 const assert = std.debug.assert;
 
-const zoxy = @import("zoxy");
+const zgix = @import("zgix");
 
-const h3 = zoxy.http.h3;
-const constants = zoxy.constants;
+const h3 = zgix.http.h3;
+const constants = zgix.constants;
 
-const XevIo = zoxy.Io.XevIo;
+const XevIo = zgix.Io.XevIo;
 
-const AccessLogXev = zoxy.access_log.AccessLog(XevIo);
+const AccessLogXev = zgix.access_log.AccessLog(XevIo);
 
 /// Everything one listener's witness hook needs on the h3 side of the
 /// seam: the process counter set (always — the counters ride the same
@@ -51,7 +51,7 @@ const AccessLogXev = zoxy.access_log.AccessLog(XevIo);
 /// listener: the names are parallel to the seam cluster table the
 /// proxy's `details.cluster_index` indexes.
 const Witness = struct {
-    counters: *zoxy.counters.Counters,
+    counters: *zgix.counters.Counters,
     io: *XevIo,
     log: ?*AccessLogXev,
     /// Parallel to the listener's seam cluster table: the configured
@@ -124,11 +124,11 @@ fn buildRecord(
     event: h3.proxy.Counters.Event,
     details: *const h3.proxy.Details,
     now_ns: u64,
-) zoxy.access_log.Record {
+) zgix.access_log.Record {
     // The event, not the status, picks the outcome: an origin's own 503
-    // rides `.response` and stays `ok`; only zoxy's shed is `shed`, and
+    // rides `.response` and stays `ok`; only zgix's shed is `shed`, and
     // telling those two apart is most of what the outcome field is for.
-    const outcome: zoxy.access_log.Outcome = switch (event) {
+    const outcome: zgix.access_log.Outcome = switch (event) {
         .response => .ok,
         .bad_gateway => .upstream_failed,
         .gateway_timeout => .timed_out,
@@ -210,8 +210,8 @@ const SeamTable = struct {
 /// store and client credentials the returned config points at live in
 /// it for the process's life.
 fn seamClusterTls(
-    tls: ?zoxy.config.Config.Cluster.Tls,
-    runtime: ?*const zoxy.tls.ClusterTls.Runtime,
+    tls: ?zgix.config.Config.Cluster.Tls,
+    runtime: ?*const zgix.tls.ClusterTls.Runtime,
 ) !?h3.proxy.Tls {
     const config = tls orelse return null;
     const loaded = runtime orelse return error.H3ClusterTlsMissing;
@@ -231,9 +231,9 @@ fn seamClusterTls(
 /// themselves give); the returned slices cover the used prefix.
 fn buildSeamTable(
     arena: std.mem.Allocator,
-    clusters: []const zoxy.config.Config.Cluster,
-    cluster_tls: []const ?zoxy.tls.ClusterTls.Runtime,
-    listener_routes: []const zoxy.http.router.Route,
+    clusters: []const zgix.config.Config.Cluster,
+    cluster_tls: []const ?zgix.tls.ClusterTls.Runtime,
+    listener_routes: []const zgix.http.router.Route,
 ) !SeamTable {
     const route_count = listener_routes.len;
     const seam_routes = try arena.alloc(h3.proxy.Route, route_count);
@@ -256,7 +256,7 @@ fn buildSeamTable(
                     .unix => return error.H3UnixEndpoint,
                 };
             }
-            const runtime: ?*const zoxy.tls.ClusterTls.Runtime =
+            const runtime: ?*const zgix.tls.ClusterTls.Runtime =
                 if (route.cluster_index < cluster_tls.len)
                     if (cluster_tls[route.cluster_index]) |*loaded| loaded else null
                 else
@@ -333,10 +333,10 @@ pub const Runtime = struct {
     pub fn init(
         arena: std.mem.Allocator,
         io: *XevIo,
-        config: *const zoxy.config.Config,
+        config: *const zgix.config.Config,
         credentials: []const Credential,
-        cluster_tls: []const ?zoxy.tls.ClusterTls.Runtime,
-        counters: ?*zoxy.counters.Counters,
+        cluster_tls: []const ?zgix.tls.ClusterTls.Runtime,
+        counters: ?*zgix.counters.Counters,
         access_log: ?*AccessLogXev,
     ) !Runtime {
         if (config.h3_listeners.len != credentials.len) return error.H3CredentialCountMismatch;
@@ -438,10 +438,10 @@ pub const Runtime = struct {
         // widest rendering), so a NoSpaceLeft here is a bug in the
         // bound, and the unreachable says so.
         writer.writeAll(
-            "# TYPE zoxy_h3_listener_connections gauge\n" ++
-                "# TYPE zoxy_h3_listener_requests counter\n" ++
-                "# TYPE zoxy_h3_listener_responses counter\n" ++
-                "# TYPE zoxy_h3_listener_parked gauge\n",
+            "# TYPE zgix_h3_listener_connections gauge\n" ++
+                "# TYPE zgix_h3_listener_requests counter\n" ++
+                "# TYPE zgix_h3_listener_responses counter\n" ++
+                "# TYPE zgix_h3_listener_parked gauge\n",
         ) catch unreachable;
         for (runtime.bindings, runtime.witnesses) |*binding, *witness| {
             var bind_buf: [64]u8 = undefined;
@@ -449,19 +449,19 @@ pub const Runtime = struct {
                 binding.listener.boundAddress(),
             }) catch unreachable;
             writer.print(
-                "zoxy_h3_listener_connections{{bind=\"{s}\"}} {d}\n",
+                "zgix_h3_listener_connections{{bind=\"{s}\"}} {d}\n",
                 .{ bind, binding.listener.connectionCount() },
             ) catch unreachable;
             writer.print(
-                "zoxy_h3_listener_requests{{bind=\"{s}\"}} {d}\n",
+                "zgix_h3_listener_requests{{bind=\"{s}\"}} {d}\n",
                 .{ bind, witness.count_requests },
             ) catch unreachable;
             writer.print(
-                "zoxy_h3_listener_responses{{bind=\"{s}\"}} {d}\n",
+                "zgix_h3_listener_responses{{bind=\"{s}\"}} {d}\n",
                 .{ bind, witness.count_responses },
             ) catch unreachable;
             writer.print(
-                "zoxy_h3_listener_parked{{bind=\"{s}\"}} {d}\n",
+                "zgix_h3_listener_parked{{bind=\"{s}\"}} {d}\n",
                 .{ bind, binding.proxy.parkedCount() },
             ) catch unreachable;
         }
@@ -528,8 +528,8 @@ test "h3 runtime: a relayed answer builds one http record, payload bytes and all
     const details = testDetails();
     const entry = buildRecord(&witness, .response, &details, details.started_mono_ns + 2_500);
 
-    try testing.expectEqual(zoxy.access_log.Kind.http, entry.kind);
-    try testing.expectEqual(zoxy.access_log.Outcome.ok, entry.outcome);
+    try testing.expectEqual(zgix.access_log.Kind.http, entry.kind);
+    try testing.expectEqual(zgix.access_log.Outcome.ok, entry.outcome);
     try testing.expectEqual(details.started_wall_ns, entry.started_wall_ns);
     try testing.expectEqual(@as(u64, 2_500), entry.duration_ns);
     try testing.expectEqual(details.peer, entry.client.?);
@@ -549,7 +549,7 @@ test "h3 runtime: a relayed answer builds one http record, payload bytes and all
     try testing.expectEqual(@as(usize, 0), entry.response_headers.len());
 
     var buffer: [constants.access_log_line_bytes_max]u8 = undefined;
-    const line = try zoxy.access_log.renderLine(&entry, &buffer);
+    const line = try zgix.access_log.renderLine(&entry, &buffer);
     try testing.expect(std.mem.indexOf(u8, line, "\"kind\":\"http\"") != null);
     try testing.expect(std.mem.indexOf(u8, line, "\"outcome\":\"ok\"") != null);
     try testing.expect(std.mem.indexOf(u8, line, "\"method\":\"GET\"") != null);
@@ -583,20 +583,20 @@ test "h3 runtime: each failure verdict maps to its outcome" {
     var details = testDetails();
     details.status = 502;
     const bad_gateway = buildRecord(&witness, .bad_gateway, &details, details.started_mono_ns);
-    try testing.expectEqual(zoxy.access_log.Outcome.upstream_failed, bad_gateway.outcome);
+    try testing.expectEqual(zgix.access_log.Outcome.upstream_failed, bad_gateway.outcome);
     try testing.expectEqual(@as(u16, 502), bad_gateway.status);
 
     details.status = 504;
     const gateway_timeout = buildRecord(&witness, .gateway_timeout, &details, details.started_mono_ns);
-    try testing.expectEqual(zoxy.access_log.Outcome.timed_out, gateway_timeout.outcome);
+    try testing.expectEqual(zgix.access_log.Outcome.timed_out, gateway_timeout.outcome);
     try testing.expectEqual(@as(u16, 504), gateway_timeout.status);
 
-    // A shed never picked an endpoint, and its 503 is zoxy's own answer —
+    // A shed never picked an endpoint, and its 503 is zgix's own answer —
     // the outcome must not read as the origin's.
     details.status = 503;
     details.endpoint = null;
     const shed = buildRecord(&witness, .shed_busy, &details, details.started_mono_ns);
-    try testing.expectEqual(zoxy.access_log.Outcome.shed, shed.outcome);
+    try testing.expectEqual(zgix.access_log.Outcome.shed, shed.outcome);
     try testing.expectEqual(@as(u16, 503), shed.status);
     try testing.expect(shed.upstream == null);
 }
