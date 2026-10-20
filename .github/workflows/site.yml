@@ -6,10 +6,11 @@
 #   3. `zdoc docs`   — Chinese docs tree  -> /docs/zh
 # Deploy via the official Pages actions (OIDC, no tokens in repo settings).
 #
-# Zig comes from the repo's own devenv (Nix), same toolchain as CI:
-# setup-zig actions lag behind the 0.17 dev builds index, and the official
-# download URL is not always populated yet — devenv.lock is the one pin
-# that has never drifted.
+# Zig comes from zigup (the same installer the local toolchain uses):
+# setup-zig actions lag behind the 0.17 builds index, the official
+# download URL is not always populated yet, and the repo's devenv pin
+# predates nixpkgs' zig_0_17 attribute. zigup resolves "0.17.0" from
+# ziglang.org/builds on the runner's clean network.
 
 name: site
 
@@ -41,31 +42,24 @@ jobs:
           repository: chy3xyz/zdoc
           path: zdoc
 
-      # Same provisioning as ci.yml: single-user Nix + prebuilt devenv.
-      - name: Install Nix
-        uses: nixbuild/nix-quick-install-action@v35
-        with:
-          nix_conf: |
-            experimental-features = nix-command flakes
-
-      - name: Set up devenv binary cache
-        uses: cachix/cachix-action@v17
-        with:
-          name: devenv
-          skipPush: true
-
-      - name: Install devenv
-        run: nix profile install --accept-flake-config github:cachix/devenv/v2.1.2
+      # zigup installs to $XDG_DATA_HOME/zigup (default ~/.local/share/zigup).
+      - name: Install zig (zigup, same installer as the local toolchain)
+        run: |
+          curl -sSfL -o /tmp/zigup.tgz \
+            https://github.com/marler8997/zigup/releases/latest/download/zigup-x86_64-linux.tar.gz
+          tar -xzf /tmp/zigup.tgz -C /usr/local/bin zigup
+          zigup fetch 0.17.0
+          echo "$HOME/.local/share/zigup/0.17.0/files" >> "$GITHUB_PATH"
+          zig version
 
       # -Dno-git-version: zdoc's build refuses zon versions not ahead of
       # its last git tag without it (its maintainers' bump ritual).
-      # Everything runs from the repo root so devenv finds its devenv.yaml.
       - name: Build zdoc
-        run: devenv shell -- sh -c 'cd zdoc && zig build -Doptimize=ReleaseSafe -Dno-git-version'
+        run: sh -c 'cd zdoc && zig build -Doptimize=ReleaseSafe -Dno-git-version'
 
       - name: Build landing + docs (en, zh)
         run: |
-          devenv shell -- sh -c '
+          sh -c '
             cd website
             ZDOC=../zdoc/zig-out/bin/zdoc
             "$ZDOC" site    -f
